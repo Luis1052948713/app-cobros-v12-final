@@ -1,0 +1,30 @@
+PASOS PARA PONER LOS ICONOS EN TU APP
+
+1. Copia la carpeta assets dentro de tu proyecto:
+   C:\Users\luisf\app-cobros\assets
+
+2. Reemplaza tu main.py por el main.py incluido aquí.
+
+3. Reemplaza o ajusta buildozer.spec.
+   Debe tener:
+   icon.filename = assets/icon.png
+   source.include_exts = py,png,jpg,jpeg,kv,atlas,db,ttf
+
+4. Sube cambios:
+   git add .
+   git commit -m "Agregar iconos a la app"
+   git push origin main
+
+5. En GitHub Actions ejecuta Build APK otra vez.
+
+6. Desinstala la APK anterior del celular e instala la nueva.
+
+Iconos incluidos:
+- assets/icon.png        Icono de la APK
+- assets/clientes.png    Botón Clientes
+- assets/nuevo.png       Botón Nuevo
+- assets/caja.png        Botón Caja
+- assets/resumen.png     Resumen
+- assets/historial.png   Historial
+- assets/guardar.png     Guardar
+- assets/nube.png        Carga nube
