@@ -1,14 +1,20 @@
 # ============================================================
-# Cobros V12 Mobile
-# App móvil Python Offline/Online - Gestión de Créditos y Cobros
-# Proyecto: app-cobros-v12-final
-# Framework: Kivy
+# APP-COBROS-V12-FINAL - MAIN.PY PRODUCCIÓN
+# Python + Kivy + SQLite
 #
-# Instalación:
-#   pip install kivy
-#
-# Ejecución:
-#   python main.py
+# Características:
+# - Base SQLite persistente real.
+# - En PC guarda la DB junto al proyecto.
+# - En Android guarda la DB en user_data_dir.
+# - No carga datos demo automáticamente.
+# - Interfaz mobile-first.
+# - Nuevo cliente por pasos.
+# - Cálculo automático de total, cuota y saldo del crédito.
+# - CRUD cliente/préstamo.
+# - Cobros: Cuota, Aporte, No Pago, Siguiente Día.
+# - Estados visuales: verde, amarillo, rojo.
+# - Movimientos de caja.
+# - Resumen del día.
 # ============================================================
 
 from datetime import datetime, timedelta
@@ -21,11 +27,10 @@ from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.graphics import Color, Rectangle, RoundedRectangle
 from kivy.metrics import dp
-from kivy.properties import NumericProperty, ObjectProperty, StringProperty
+from kivy.properties import ObjectProperty, NumericProperty, StringProperty
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
-from kivy.uix.gridlayout import GridLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
@@ -49,13 +54,13 @@ Window.clearcolor = (0.06, 0.07, 0.10, 1)
 BLUE = (0.117, 0.227, 0.541, 1)
 BLUE_DARK = (0.08, 0.16, 0.36, 1)
 GOLD = (0.93, 0.69, 0.13, 1)
-BG = (0.95, 0.96, 0.98, 1)
 WHITE = (1, 1, 1, 1)
 TEXT = (0.10, 0.12, 0.16, 1)
 MUTED = (0.43, 0.47, 0.54, 1)
 DARK = (0.12, 0.14, 0.18, 1)
 SUCCESS = (0.12, 0.62, 0.32, 1)
 DANGER = (0.83, 0.18, 0.18, 1)
+LIGHT_BG = (0.95, 0.96, 0.98, 1)
 
 STATUS_GREEN = (0.86, 0.98, 0.89, 1)
 STATUS_YELLOW = (1.00, 0.96, 0.78, 1)
@@ -64,88 +69,10 @@ STATUS_BORDER_GREEN = (0.12, 0.62, 0.32, 1)
 STATUS_BORDER_YELLOW = (0.93, 0.69, 0.13, 1)
 STATUS_BORDER_RED = (0.83, 0.18, 0.18, 1)
 
-# Caja base del cobrador al iniciar la ruta.
-CAJA_INICIAL_BASE = 350000
-
 
 # ============================================================
-# DATOS DEMO
+# MEMORIA DE LA APP
 # ============================================================
-
-CLIENTES_DEMO = [
-    {
-        "nombre": "MARISOL CARDOZO",
-        "telefono": "+57 300 456 1122",
-        "cuota": 20000,
-        "saldo": 480000,
-        "pagadas": 6,
-        "pendientes": 24,
-        "estado": "pendiente",
-        "ultimo_tipo": "Pendiente por cobrar",
-        "documento": "100000001",
-        "direccion": "Sin dirección",
-    },
-    {
-        "nombre": "JORGE ALFONSO PEREZ",
-        "telefono": "+57 301 778 2211",
-        "cuota": 15000,
-        "saldo": 315000,
-        "pagadas": 9,
-        "pendientes": 21,
-        "estado": "pendiente",
-        "ultimo_tipo": "Pendiente por cobrar",
-        "documento": "100000002",
-        "direccion": "Sin dirección",
-    },
-    {
-        "nombre": "KAREN JULIANA TORRES",
-        "telefono": "+57 310 998 4433",
-        "cuota": 25000,
-        "saldo": 625000,
-        "pagadas": 5,
-        "pendientes": 25,
-        "estado": "pendiente",
-        "ultimo_tipo": "Pendiente por cobrar",
-        "documento": "100000003",
-        "direccion": "Sin dirección",
-    },
-    {
-        "nombre": "LUIS MIGUEL BARRIOS",
-        "telefono": "+57 320 111 9090",
-        "cuota": 18000,
-        "saldo": 396000,
-        "pagadas": 8,
-        "pendientes": 22,
-        "estado": "pendiente",
-        "ultimo_tipo": "Pendiente por cobrar",
-        "documento": "100000004",
-        "direccion": "Sin dirección",
-    },
-    {
-        "nombre": "ANA MILENA GOMEZ",
-        "telefono": "+57 315 555 1212",
-        "cuota": 30000,
-        "saldo": 720000,
-        "pagadas": 6,
-        "pendientes": 24,
-        "estado": "pendiente",
-        "ultimo_tipo": "Pendiente por cobrar",
-        "documento": "100000005",
-        "direccion": "Sin dirección",
-    },
-    {
-        "nombre": "CARLOS EDUARDO DIAZ",
-        "telefono": "+57 300 999 4444",
-        "cuota": 12000,
-        "saldo": 240000,
-        "pagadas": 10,
-        "pendientes": 20,
-        "estado": "pendiente",
-        "ultimo_tipo": "Pendiente por cobrar",
-        "documento": "100000006",
-        "direccion": "Sin dirección",
-    },
-]
 
 CLIENTES = []
 TRANSACCIONES = []
@@ -160,130 +87,204 @@ def today_text():
     return datetime.now().strftime("%d/%m/%Y")
 
 
-def today_iso():
-    """
-    Fecha estándar para filtrar registros diarios.
-    """
+def now_text():
+    return datetime.now().strftime("%d/%m/%Y %H:%M")
+
+
+def iso_today():
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def frequency_days(frecuencia):
-    """Convierte frecuencia de cobro a días."""
-    value = str(frecuencia or "Diario").strip().lower()
-    if value == "semanal":
-        return 7
-    if value == "quincenal":
-        return 15
-    if value == "mensual":
-        return 30
-    return 1
+def display_date_from_iso(value):
+    try:
+        if not value:
+            return "No definido"
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        return "No definido"
 
 
-def next_due_date(frecuencia, base_date=None):
-    """Calcula próxima fecha de cobro en formato YYYY-MM-DD."""
-    if base_date is None:
-        base = datetime.now()
-    elif isinstance(base_date, datetime):
-        base = base_date
+def next_due_date(cobro):
+    """
+    Calcula la próxima fecha de cobro.
+    Diario: mañana.
+    Semanal: dentro de 7 días.
+    Quincenal: dentro de 15 días.
+    Mensual: dentro de 30 días.
+    """
+    today = datetime.now().date()
+    cobro = (cobro or "Diario").strip().lower()
+
+    if cobro == "semanal":
+        delta = 7
+    elif cobro == "quincenal":
+        delta = 15
+    elif cobro == "mensual":
+        delta = 30
     else:
-        base = datetime.strptime(str(base_date), "%Y-%m-%d")
-    return (base + timedelta(days=frequency_days(frecuencia))).strftime("%Y-%m-%d")
+        delta = 1
+
+    return (today + timedelta(days=delta)).strftime("%Y-%m-%d")
 
 
-def format_date_for_user(iso_date):
-    """Convierte YYYY-MM-DD a DD/MM/YYYY para mostrar."""
+def detach_widget(widget):
+    """
+    Evita el cierre de la app cuando se vuelve a la pantalla Nuevo.
+    Kivy no permite agregar el mismo TextInput a dos padres distintos.
+    Si el campo ya tenía padre, se separa antes de volver a usarlo.
+    """
     try:
-        return datetime.strptime(str(iso_date), "%Y-%m-%d").strftime("%d/%m/%Y")
+        if widget is not None and widget.parent is not None:
+            widget.parent.remove_widget(widget)
     except Exception:
-        return str(iso_date or "")
-
-
-def is_due_today_or_before(iso_date):
-    """True si la fecha ya llegó o está vencida."""
-    if not iso_date:
-        return True
-    try:
-        return str(iso_date) <= today_iso()
-    except Exception:
-        return True
-
-
-def is_client_due(cliente):
-    return is_due_today_or_before(cliente.get("fecha_proximo_cobro", today_iso()))
+        pass
 
 
 def money(value):
     try:
-        return "$ {:,.0f}".format(float(value)).replace(",", ".")
+        value = int(float(value or 0))
     except Exception:
-        return "$ 0"
+        value = 0
+    return "$ {:,.0f}".format(value).replace(",", ".")
 
 
-def parse_money_value(text):
-    if text is None:
-        return 0
-
-    clean = str(text)
-    clean = clean.replace("$", "")
-    clean = clean.replace(" ", "")
-    clean = clean.replace(".", "")
-    clean = clean.replace(",", ".")
-
+def format_thousands(value):
+    """
+    Devuelve números con separador de miles colombiano:
+    500000 -> 500.000
+    """
     try:
+        value = int(float(value or 0))
+    except Exception:
+        value = 0
+    return "{:,.0f}".format(value).replace(",", ".")
+
+
+def to_int(value, default=0):
+    try:
+        clean = str(value or "").replace("$", "").replace(".", "").replace(",", "").strip()
+        if clean == "":
+            return default
         return int(float(clean))
     except Exception:
-        return 0
+        return default
 
 
-def format_miles(value):
+def to_float(value, default=0.0):
     try:
-        return f"{int(float(value)):,}".replace(",", ".")
-    except Exception:
-        return "0"
-
-
-def parse_percent_value(text):
-    if text is None:
-        return 0.0
-
-    clean = str(text).replace("%", "").replace(" ", "").replace(",", ".")
-
-    try:
+        clean = str(value or "").replace("%", "").replace(",", ".").strip()
+        if clean == "":
+            return default
         return float(clean)
     except Exception:
-        return 0.0
+        return default
 
 
 def asset_path(filename):
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = Path(__file__).resolve().parent
     candidates = [
-        os.path.join(base_dir, "assets", filename),
-        os.path.join(os.getcwd(), "assets", filename),
+        base_dir / "assets" / filename,
+        Path(os.getcwd()) / "assets" / filename,
+        base_dir / filename,
     ]
-
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-
+    for path in candidates:
+        if path.exists():
+            return str(path)
     return ""
 
 
-def is_today_record(item):
-    """
-    Permite filtrar registros del día.
-    Soporta fecha nueva YYYY-MM-DD y fecha anterior DD/MM/YYYY.
-    """
-    value = str(item.get("fecha", "")).strip()
-    return value in [today_iso(), today_text()]
+def show_popup(title, message, height=240):
+    content = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(12))
+
+    label = Label(
+        text=message,
+        color=TEXT,
+        font_size="14sp",
+        halign="center",
+        valign="middle",
+    )
+    label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+    btn = Button(
+        text="Aceptar",
+        background_normal="",
+        background_color=BLUE,
+        color=WHITE,
+        bold=True,
+        size_hint_y=None,
+        height=dp(46),
+    )
+
+    content.add_widget(label)
+    content.add_widget(btn)
+
+    popup = Popup(
+        title=title,
+        content=content,
+        size_hint=(0.88, None),
+        height=dp(height),
+        auto_dismiss=False,
+    )
+
+    btn.bind(on_release=popup.dismiss)
+    popup.open()
 
 
-def get_estado_cliente(cliente):
-    return cliente.get("estado", "pendiente")
+def confirm_popup(title, message, on_confirm):
+    content = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(12))
+
+    label = Label(
+        text=message,
+        color=TEXT,
+        font_size="14sp",
+        halign="center",
+        valign="middle",
+    )
+    label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+    buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(46), spacing=dp(8))
+
+    cancel = Button(
+        text="Cancelar",
+        background_normal="",
+        background_color=(0.55, 0.58, 0.63, 1),
+        color=WHITE,
+        bold=True,
+    )
+
+    accept = Button(
+        text="Confirmar",
+        background_normal="",
+        background_color=DANGER,
+        color=WHITE,
+        bold=True,
+    )
+
+    buttons.add_widget(cancel)
+    buttons.add_widget(accept)
+
+    content.add_widget(label)
+    content.add_widget(buttons)
+
+    popup = Popup(
+        title=title,
+        content=content,
+        size_hint=(0.88, None),
+        height=dp(245),
+        auto_dismiss=False,
+    )
+
+    cancel.bind(on_release=popup.dismiss)
+
+    def do_confirm(*_):
+        popup.dismiss()
+        on_confirm()
+
+    accept.bind(on_release=do_confirm)
+    popup.open()
 
 
-def estado_texto(cliente):
-    estado = get_estado_cliente(cliente)
-
+def estado_texto(estado):
     if estado == "pagado":
         return "PAGADO"
     if estado == "aporte":
@@ -291,84 +292,55 @@ def estado_texto(cliente):
     if estado == "no_pago":
         return "NO PAGO"
     if estado == "siguiente":
-        return "SIGUIENTE DIA"
-
+        return "SIG. DIA"
     return "PENDIENTE"
 
 
-def estado_colores(cliente):
-    estado = get_estado_cliente(cliente)
-
-    if estado == "pagado":
-        return STATUS_GREEN, STATUS_BORDER_GREEN, "PAGADO"
-
-    if estado == "aporte":
-        return STATUS_GREEN, STATUS_BORDER_GREEN, "APORTE"
-
+def estado_colores(estado):
+    if estado in ("pagado", "aporte"):
+        return STATUS_GREEN, STATUS_BORDER_GREEN, estado_texto(estado)
     if estado == "no_pago":
         return STATUS_RED, STATUS_BORDER_RED, "NO PAGO"
-
-    if estado == "siguiente":
-        return STATUS_YELLOW, STATUS_BORDER_YELLOW, "SIG. DIA"
-
-    return STATUS_YELLOW, STATUS_BORDER_YELLOW, "PENDIENTE"
-
-
-def make_popup(title, message):
-    content = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(12))
-
-    label = Label(
-        text=message,
-        color=TEXT,
-        font_size="15sp",
-        halign="center",
-        valign="middle",
-    )
-    label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-    button = Button(
-        text="Aceptar",
-        size_hint_y=None,
-        height=dp(46),
-        background_normal="",
-        background_color=BLUE,
-        color=WHITE,
-        bold=True,
-    )
-
-    content.add_widget(label)
-    content.add_widget(button)
-
-    popup = Popup(
-        title=title,
-        content=content,
-        size_hint=(0.88, None),
-        height=dp(230),
-        auto_dismiss=False,
-    )
-    button.bind(on_release=popup.dismiss)
-    popup.open()
+    return STATUS_YELLOW, STATUS_BORDER_YELLOW, estado_texto(estado)
 
 
 # ============================================================
-# SQLITE
+# BASE DE DATOS SQLITE
 # ============================================================
 
 def get_db_path():
-    try:
-        app = App.get_running_app()
-        if app and getattr(app, "user_data_dir", None):
-            db_dir = Path(app.user_data_dir)
-            db_dir.mkdir(parents=True, exist_ok=True)
-            return str(db_dir / "cobros_v12.db")
-    except Exception:
-        pass
+    """
+    Ruta corregida:
+    - En Android/iOS: directorio privado de la app.
+    - En PC: junto a main.py dentro del proyecto app-cobros-v12-final.
+    """
+    if platform in ("android", "ios"):
+        try:
+            app = App.get_running_app()
+            if app and getattr(app, "user_data_dir", None):
+                db_dir = Path(app.user_data_dir)
+                db_dir.mkdir(parents=True, exist_ok=True)
+                return str(db_dir / "cobros_v12.db")
+        except Exception:
+            pass
 
-    return "cobros_v12.db"
+    return str(Path(__file__).resolve().parent / "cobros_v12.db")
 
 
 def get_connection():
-    return sqlite3.connect(get_db_path())
+    conn = sqlite3.connect(get_db_path())
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def column_exists(cursor, table_name, column_name):
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    return column_name in [row[1] for row in cursor.fetchall()]
+
+
+def ensure_column(cursor, table_name, column_name, column_definition):
+    if not column_exists(cursor, table_name, column_name):
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
 
 
 def init_database():
@@ -378,21 +350,88 @@ def init_database():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS clientes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            documento TEXT,
             nombre TEXT NOT NULL,
             telefono TEXT,
+            direccion TEXT,
+            producto TEXT NOT NULL DEFAULT '5 - CREDITO EN EFECTIVO',
+            valor_credito INTEGER NOT NULL DEFAULT 0,
+            interes REAL NOT NULL DEFAULT 0,
+            total_credito INTEGER NOT NULL DEFAULT 0,
             cuota INTEGER NOT NULL DEFAULT 0,
+            numero_cuotas INTEGER NOT NULL DEFAULT 1,
             saldo INTEGER NOT NULL DEFAULT 0,
             pagadas INTEGER NOT NULL DEFAULT 0,
             pendientes INTEGER NOT NULL DEFAULT 0,
+            cobro TEXT NOT NULL DEFAULT 'Diario',
             estado TEXT NOT NULL DEFAULT 'pendiente',
-            ultimo_tipo TEXT NOT NULL DEFAULT 'Pendiente',
-            documento TEXT,
-            direccion TEXT,
-            frecuencia_cobro TEXT NOT NULL DEFAULT 'Diario',
-            fecha_proximo_cobro TEXT,
-            created_at TEXT NOT NULL
+            ultimo_tipo TEXT NOT NULL DEFAULT 'Pendiente por cobrar',
+            codeudor_documento TEXT,
+            codeudor_nombre TEXT,
+            codeudor_movil TEXT,
+            valor_seguro INTEGER NOT NULL DEFAULT 0,
+            beneficiario TEXT,
+            obs_seguro TEXT,
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            proximo_cobro TEXT,
+            ultima_fecha_pago TEXT
         )
     """)
+
+    # Migración automática para bases viejas
+    columns = [
+        ("documento", "TEXT"),
+        ("telefono", "TEXT"),
+        ("direccion", "TEXT"),
+        ("producto", "TEXT NOT NULL DEFAULT '5 - CREDITO EN EFECTIVO'"),
+        ("valor_credito", "INTEGER NOT NULL DEFAULT 0"),
+        ("interes", "REAL NOT NULL DEFAULT 0"),
+        ("total_credito", "INTEGER NOT NULL DEFAULT 0"),
+        ("cuota", "INTEGER NOT NULL DEFAULT 0"),
+        ("numero_cuotas", "INTEGER NOT NULL DEFAULT 1"),
+        ("saldo", "INTEGER NOT NULL DEFAULT 0"),
+        ("pagadas", "INTEGER NOT NULL DEFAULT 0"),
+        ("pendientes", "INTEGER NOT NULL DEFAULT 0"),
+        ("cobro", "TEXT NOT NULL DEFAULT 'Diario'"),
+        ("estado", "TEXT NOT NULL DEFAULT 'pendiente'"),
+        ("ultimo_tipo", "TEXT NOT NULL DEFAULT 'Pendiente por cobrar'"),
+        ("codeudor_documento", "TEXT"),
+        ("codeudor_nombre", "TEXT"),
+        ("codeudor_movil", "TEXT"),
+        ("valor_seguro", "INTEGER NOT NULL DEFAULT 0"),
+        ("beneficiario", "TEXT"),
+        ("obs_seguro", "TEXT"),
+        ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+        ("proximo_cobro", "TEXT"),
+        ("ultima_fecha_pago", "TEXT"),
+    ]
+
+    for name, definition in columns:
+        ensure_column(cursor, "clientes", name, definition)
+
+    # Compatibilidad con versiones viejas que tenían saldo/cuota pero no valor_credito/total_credito
+    cursor.execute("""
+        UPDATE clientes
+        SET valor_credito = saldo
+        WHERE (valor_credito IS NULL OR valor_credito = 0) AND saldo > 0
+    """)
+
+    cursor.execute("""
+        UPDATE clientes
+        SET total_credito = saldo
+        WHERE (total_credito IS NULL OR total_credito = 0) AND saldo > 0
+    """)
+
+    cursor.execute("""
+        UPDATE clientes
+        SET numero_cuotas = pendientes
+        WHERE (numero_cuotas IS NULL OR numero_cuotas = 0) AND pendientes > 0
+    """)
+
+    cursor.execute("UPDATE clientes SET created_at = ? WHERE created_at IS NULL OR created_at = ''", (now_text(),))
+    cursor.execute("UPDATE clientes SET updated_at = ? WHERE updated_at IS NULL OR updated_at = ''", (now_text(),))
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transacciones (
@@ -407,6 +446,17 @@ def init_database():
         )
     """)
 
+    for name, definition in [
+        ("cliente_id", "INTEGER"),
+        ("cliente", "TEXT NOT NULL DEFAULT ''"),
+        ("tipo", "TEXT NOT NULL DEFAULT ''"),
+        ("valor", "INTEGER NOT NULL DEFAULT 0"),
+        ("metodo", "TEXT"),
+        ("fecha", "TEXT NOT NULL DEFAULT ''"),
+        ("synced", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        ensure_column(cursor, "transacciones", name, definition)
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS movimientos_caja (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -419,62 +469,15 @@ def init_database():
         )
     """)
 
-    conn.commit()
-    conn.close()
-
-
-def ensure_client_schedule_columns():
-    """Migra bases existentes agregando programación de cobro."""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("PRAGMA table_info(clientes)")
-    columns = {row[1] for row in cursor.fetchall()}
-
-    if "frecuencia_cobro" not in columns:
-        cursor.execute("ALTER TABLE clientes ADD COLUMN frecuencia_cobro TEXT NOT NULL DEFAULT 'Diario'")
-
-    if "fecha_proximo_cobro" not in columns:
-        cursor.execute("ALTER TABLE clientes ADD COLUMN fecha_proximo_cobro TEXT")
-
-    cursor.execute("""
-        UPDATE clientes
-        SET frecuencia_cobro = COALESCE(NULLIF(frecuencia_cobro, ''), 'Diario'),
-            fecha_proximo_cobro = COALESCE(NULLIF(fecha_proximo_cobro, ''), ?)
-    """, (today_iso(),))
-
-    conn.commit()
-    conn.close()
-
-
-def seed_database_if_empty():
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT COUNT(*) FROM clientes")
-    total = cursor.fetchone()[0]
-
-    if total == 0:
-        for cliente in CLIENTES_DEMO:
-            cursor.execute("""
-                INSERT INTO clientes
-                (nombre, telefono, cuota, saldo, pagadas, pendientes, estado, ultimo_tipo, documento, direccion, frecuencia_cobro, fecha_proximo_cobro, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                cliente.get("nombre", ""),
-                cliente.get("telefono", ""),
-                int(cliente.get("cuota", 0)),
-                int(cliente.get("saldo", 0)),
-                int(cliente.get("pagadas", 0)),
-                int(cliente.get("pendientes", 0)),
-                cliente.get("estado", "pendiente"),
-                cliente.get("ultimo_tipo", "Pendiente por cobrar"),
-                cliente.get("documento", ""),
-                cliente.get("direccion", ""),
-                cliente.get("frecuencia_cobro", "Diario"),
-                cliente.get("fecha_proximo_cobro", today_iso()),
-                today_text(),
-            ))
+    for name, definition in [
+        ("tipo", "TEXT NOT NULL DEFAULT ''"),
+        ("concepto", "TEXT"),
+        ("valor", "INTEGER NOT NULL DEFAULT 0"),
+        ("observaciones", "TEXT"),
+        ("fecha", "TEXT NOT NULL DEFAULT ''"),
+        ("synced", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        ensure_column(cursor, "movimientos_caja", name, definition)
 
     conn.commit()
     conn.close()
@@ -482,13 +485,17 @@ def seed_database_if_empty():
 
 def load_clients_from_db():
     global CLIENTES
-
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT id, nombre, telefono, cuota, saldo, pagadas, pendientes, estado, ultimo_tipo, documento, direccion, frecuencia_cobro, fecha_proximo_cobro
+        SELECT id, documento, nombre, telefono, direccion, producto,
+               valor_credito, interes, total_credito, cuota, numero_cuotas,
+               saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
+               codeudor_documento, codeudor_nombre, codeudor_movil,
+               valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
+               proximo_cobro, ultima_fecha_pago
         FROM clientes
         ORDER BY nombre ASC
     """)
@@ -499,13 +506,12 @@ def load_clients_from_db():
 
 def load_transacciones_from_db():
     global TRANSACCIONES
-
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT cliente_id, cliente, tipo, valor, metodo, fecha, synced
+        SELECT id, cliente_id, cliente, tipo, valor, metodo, fecha, synced
         FROM transacciones
         ORDER BY id ASC
     """)
@@ -516,13 +522,12 @@ def load_transacciones_from_db():
 
 def load_movimientos_from_db():
     global MOVIMIENTOS_CAJA
-
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT tipo, concepto, valor, observaciones, fecha, synced
+        SELECT id, tipo, concepto, valor, observaciones, fecha, synced
         FROM movimientos_caja
         ORDER BY id ASC
     """)
@@ -531,30 +536,115 @@ def load_movimientos_from_db():
     conn.close()
 
 
-def update_due_clients_from_db():
-    """
-    Si llega la fecha de próximo cobro, vuelve el cliente a pendiente.
-    Diario: mañana, semanal: 7 días, quincenal: 15, mensual: 30.
-    """
+def refresh_memory_from_db():
+    update_due_statuses()
+    load_clients_from_db()
+    load_transacciones_from_db()
+    load_movimientos_from_db()
+
+
+def insert_client_db(cliente):
     conn = get_connection()
     cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO clientes (
+            documento, nombre, telefono, direccion, producto,
+            valor_credito, interes, total_credito, cuota, numero_cuotas,
+            saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
+            codeudor_documento, codeudor_nombre, codeudor_movil,
+            valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
+            proximo_cobro, ultima_fecha_pago
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        cliente.get("documento", ""),
+        cliente.get("nombre", "SIN NOMBRE"),
+        cliente.get("telefono", ""),
+        cliente.get("direccion", ""),
+        cliente.get("producto", "5 - CREDITO EN EFECTIVO"),
+        int(cliente.get("valor_credito", 0)),
+        float(cliente.get("interes", 0)),
+        int(cliente.get("total_credito", 0)),
+        int(cliente.get("cuota", 0)),
+        int(cliente.get("numero_cuotas", 1)),
+        int(cliente.get("saldo", 0)),
+        int(cliente.get("pagadas", 0)),
+        int(cliente.get("pendientes", 0)),
+        cliente.get("cobro", "Diario"),
+        cliente.get("estado", "pendiente"),
+        cliente.get("ultimo_tipo", "Pendiente por cobrar"),
+        cliente.get("codeudor_documento", ""),
+        cliente.get("codeudor_nombre", ""),
+        cliente.get("codeudor_movil", ""),
+        int(cliente.get("valor_seguro", 0)),
+        cliente.get("beneficiario", ""),
+        cliente.get("obs_seguro", ""),
+        now_text(),
+        now_text(),
+        cliente.get("proximo_cobro", iso_today()),
+        cliente.get("ultima_fecha_pago", ""),
+    ))
+
+    new_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
+
+
+def update_client_db(cliente):
+    conn = get_connection()
+    cursor = conn.cursor()
+
     cursor.execute("""
         UPDATE clientes
-        SET estado = 'pendiente',
-            ultimo_tipo = 'Pendiente por cobrar'
-        WHERE estado IN ('pagado', 'aporte', 'siguiente', 'no_pago')
-          AND fecha_proximo_cobro IS NOT NULL
-          AND fecha_proximo_cobro <= ?
-    """, (today_iso(),))
+        SET documento = ?, nombre = ?, telefono = ?, direccion = ?, producto = ?,
+            valor_credito = ?, interes = ?, total_credito = ?, cuota = ?, numero_cuotas = ?,
+            saldo = ?, pagadas = ?, pendientes = ?, cobro = ?, estado = ?, ultimo_tipo = ?,
+            codeudor_documento = ?, codeudor_nombre = ?, codeudor_movil = ?,
+            valor_seguro = ?, beneficiario = ?, obs_seguro = ?, updated_at = ?,
+            proximo_cobro = ?, ultima_fecha_pago = ?
+        WHERE id = ?
+    """, (
+        cliente.get("documento", ""),
+        cliente.get("nombre", "SIN NOMBRE"),
+        cliente.get("telefono", ""),
+        cliente.get("direccion", ""),
+        cliente.get("producto", "5 - CREDITO EN EFECTIVO"),
+        int(cliente.get("valor_credito", 0)),
+        float(cliente.get("interes", 0)),
+        int(cliente.get("total_credito", 0)),
+        int(cliente.get("cuota", 0)),
+        int(cliente.get("numero_cuotas", 1)),
+        int(cliente.get("saldo", 0)),
+        int(cliente.get("pagadas", 0)),
+        int(cliente.get("pendientes", 0)),
+        cliente.get("cobro", "Diario"),
+        cliente.get("estado", "pendiente"),
+        cliente.get("ultimo_tipo", "Pendiente por cobrar"),
+        cliente.get("codeudor_documento", ""),
+        cliente.get("codeudor_nombre", ""),
+        cliente.get("codeudor_movil", ""),
+        int(cliente.get("valor_seguro", 0)),
+        cliente.get("beneficiario", ""),
+        cliente.get("obs_seguro", ""),
+        now_text(),
+        cliente.get("proximo_cobro", ""),
+        cliente.get("ultima_fecha_pago", ""),
+        int(cliente.get("id")),
+    ))
+
     conn.commit()
     conn.close()
 
 
-def refresh_memory_from_db():
-    load_transacciones_from_db()
-    load_movimientos_from_db()
-    update_due_clients_from_db()
-    load_clients_from_db()
+def delete_client_db(cliente_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM transacciones WHERE cliente_id = ?", (int(cliente_id),))
+    cursor.execute("DELETE FROM clientes WHERE id = ?", (int(cliente_id),))
+    conn.commit()
+    conn.close()
 
 
 def get_client_by_id(cliente_id):
@@ -563,130 +653,27 @@ def get_client_by_id(cliente_id):
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT id, nombre, telefono, cuota, saldo, pagadas, pendientes, estado, ultimo_tipo, documento, direccion, frecuencia_cobro, fecha_proximo_cobro
+        SELECT id, documento, nombre, telefono, direccion, producto,
+               valor_credito, interes, total_credito, cuota, numero_cuotas,
+               saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
+               codeudor_documento, codeudor_nombre, codeudor_movil,
+               valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
+               proximo_cobro, ultima_fecha_pago
         FROM clientes
         WHERE id = ?
-    """, (cliente_id,))
+    """, (int(cliente_id),))
 
     row = cursor.fetchone()
     conn.close()
-
     return dict(row) if row else None
 
 
-def insert_client_db(cliente):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO clientes
-        (nombre, telefono, cuota, saldo, pagadas, pendientes, estado, ultimo_tipo, documento, direccion, frecuencia_cobro, fecha_proximo_cobro, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        cliente.get("nombre", ""),
-        cliente.get("telefono", ""),
-        int(cliente.get("cuota", 0)),
-        int(cliente.get("saldo", 0)),
-        int(cliente.get("pagadas", 0)),
-        int(cliente.get("pendientes", 0)),
-        cliente.get("estado", "pendiente"),
-        cliente.get("ultimo_tipo", "Pendiente por cobrar"),
-        cliente.get("documento", ""),
-        cliente.get("direccion", ""),
-        cliente.get("frecuencia_cobro", "Diario"),
-        cliente.get("fecha_proximo_cobro", today_iso()),
-        today_text(),
-    ))
-
-    new_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-
-    refresh_financial_state()
-
-    return new_id
-
-
-def update_client_in_db(cliente):
-    if not cliente.get("id"):
-        return
-
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        UPDATE clientes
-        SET nombre = ?,
-            telefono = ?,
-            cuota = ?,
-            saldo = ?,
-            pagadas = ?,
-            pendientes = ?,
-            estado = ?,
-            ultimo_tipo = ?,
-            documento = ?,
-            direccion = ?,
-            frecuencia_cobro = ?,
-            fecha_proximo_cobro = ?
-        WHERE id = ?
-    """, (
-        cliente.get("nombre", ""),
-        cliente.get("telefono", ""),
-        int(cliente.get("cuota", 0)),
-        int(cliente.get("saldo", 0)),
-        int(cliente.get("pagadas", 0)),
-        int(cliente.get("pendientes", 0)),
-        cliente.get("estado", "pendiente"),
-        cliente.get("ultimo_tipo", "Pendiente por cobrar"),
-        cliente.get("documento", ""),
-        cliente.get("direccion", ""),
-        cliente.get("frecuencia_cobro", "Diario"),
-        cliente.get("fecha_proximo_cobro", today_iso()),
-        int(cliente.get("id")),
-    ))
-
-    conn.commit()
-    conn.close()
-
-    refresh_financial_state()
-
-
-def delete_client_db(cliente_id):
-    """
-    Elimina completamente un cliente/prestamo y sus transacciones asociadas.
-    Esto impacta el Resumen del Día porque:
-    - Reduce Número Clientes.
-    - Reduce Recaudo Esperado.
-    - Quita pagos/no pagos/aplazados asociados al cliente eliminado.
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("DELETE FROM transacciones WHERE cliente_id = ?", (cliente_id,))
-    cursor.execute("DELETE FROM clientes WHERE id = ?", (cliente_id,))
-
-    conn.commit()
-    conn.close()
-
-    refresh_financial_state()
-
-
 def reset_client_status_db(cliente_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        UPDATE clientes
-        SET estado = 'pendiente',
-            ultimo_tipo = 'Pendiente por cobrar',
-            fecha_proximo_cobro = ?
-        WHERE id = ?
-    """, (today_iso(), cliente_id,))
-
-    conn.commit()
-    conn.close()
-
-    refresh_financial_state()
+    cliente = get_client_by_id(cliente_id)
+    if cliente:
+        cliente["estado"] = "pendiente"
+        cliente["ultimo_tipo"] = "Pendiente por cobrar"
+        update_client_db(cliente)
 
 
 def insert_transaction_db(transaccion):
@@ -703,14 +690,12 @@ def insert_transaction_db(transaccion):
         transaccion.get("tipo", ""),
         int(transaccion.get("valor", 0)),
         transaccion.get("metodo", ""),
-        transaccion.get("fecha", today_iso()),
+        transaccion.get("fecha", today_text()),
         int(transaccion.get("synced", 0)),
     ))
 
     conn.commit()
     conn.close()
-
-    refresh_financial_state()
 
 
 def insert_movement_db(movimiento):
@@ -726,117 +711,91 @@ def insert_movement_db(movimiento):
         movimiento.get("concepto", ""),
         int(movimiento.get("valor", 0)),
         movimiento.get("observaciones", ""),
-        movimiento.get("fecha", today_iso()),
+        movimiento.get("fecha", today_text()),
         int(movimiento.get("synced", 0)),
     ))
 
     conn.commit()
     conn.close()
 
-    refresh_financial_state()
+
+def clear_all_data_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM transacciones")
+    cursor.execute("DELETE FROM movimientos_caja")
+    cursor.execute("DELETE FROM clientes")
+    conn.commit()
+    conn.close()
+    refresh_memory_from_db()
 
 
 def mark_all_as_synced():
     conn = get_connection()
     cursor = conn.cursor()
-
     cursor.execute("UPDATE transacciones SET synced = 1")
     cursor.execute("UPDATE movimientos_caja SET synced = 1")
-
     conn.commit()
     conn.close()
-
-    refresh_financial_state()
-
-
-def calculate_cash_balance():
-    """
-    Calcula el saldo disponible en caja para el día actual.
-
-    Fórmula diaria:
-    saldo = caja inicial
-            + recaudos de hoy por cuotas/aportes
-            + ingresos de caja de hoy
-            - egresos/gastos de caja de hoy
-
-    Los préstamos creados se registran como egresos,
-    porque son dinero entregado al cliente.
-    """
-    recaudos = sum(
-        item.get("valor", 0)
-        for item in TRANSACCIONES
-        if item.get("tipo") in ["Cuota", "Aporte"] and is_today_record(item)
-    )
-
-    ingresos = sum(
-        item.get("valor", 0)
-        for item in MOVIMIENTOS_CAJA
-        if item.get("tipo") == "Ingreso" and is_today_record(item)
-    )
-
-    egresos = sum(
-        item.get("valor", 0)
-        for item in MOVIMIENTOS_CAJA
-        if item.get("tipo") == "Egreso" and is_today_record(item)
-    )
-
-    saldo = CAJA_INICIAL_BASE + recaudos + ingresos - egresos
-
-    return max(saldo, 0)
-
-
-def calculate_cash_balance_raw():
-    """
-    Saldo matemático sin forzar mínimo de cero.
-    Útil para auditoría y depuración.
-    """
-    recaudos = sum(
-        item.get("valor", 0)
-        for item in TRANSACCIONES
-        if item.get("tipo") in ["Cuota", "Aporte"] and is_today_record(item)
-    )
-
-    ingresos = sum(
-        item.get("valor", 0)
-        for item in MOVIMIENTOS_CAJA
-        if item.get("tipo") == "Ingreso" and is_today_record(item)
-    )
-
-    egresos = sum(
-        item.get("valor", 0)
-        for item in MOVIMIENTOS_CAJA
-        if item.get("tipo") == "Egreso" and is_today_record(item)
-    )
-
-    return CAJA_INICIAL_BASE + recaudos + ingresos - egresos
-
-
-def refresh_financial_state():
-    """
-    Refresca los datos críticos que alimentan el resumen del día.
-    Esta función se llama después de crear, editar o eliminar clientes/prestamos,
-    registrar pagos, movimientos y sincronización.
-    """
     refresh_memory_from_db()
 
 
 def count_pending_sync():
     conn = get_connection()
     cursor = conn.cursor()
-
     cursor.execute("SELECT COUNT(*) FROM transacciones WHERE synced = 0")
     tx = cursor.fetchone()[0]
-
     cursor.execute("SELECT COUNT(*) FROM movimientos_caja WHERE synced = 0")
     mv = cursor.fetchone()[0]
-
     conn.close()
-
     return tx + mv
 
 
+def current_cash_balance():
+    """
+    Calcula el saldo real disponible en caja:
+    ingresos + recaudos de clientes - egresos.
+    Los desembolsos de préstamos se registran como egresos.
+    """
+    try:
+        refresh_only = False
+        # No llamamos refresh_memory_from_db aquí para evitar recursión.
+        ingresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Ingreso")
+        egresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Egreso")
+        recaudos = sum(int(t.get("valor", 0)) for t in TRANSACCIONES if t.get("tipo") in ("Cuota", "Aporte"))
+        return ingresos + recaudos - egresos
+    except Exception:
+        return 0
+
+
+def update_due_statuses():
+    """
+    Si un cliente ya pagó y llega su próxima fecha de cobro,
+    vuelve automáticamente a PENDIENTE para que salga amarillo.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    today = iso_today()
+
+    try:
+        cursor.execute("""
+            UPDATE clientes
+            SET estado = 'pendiente',
+                ultimo_tipo = 'Pendiente por cobrar',
+                updated_at = ?
+            WHERE estado IN ('pagado', 'aporte')
+              AND proximo_cobro IS NOT NULL
+              AND proximo_cobro <> ''
+              AND proximo_cobro <= ?
+              AND pendientes > 0
+        """, (now_text(), today))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ============================================================
-# COMPONENTES BASE
+# WIDGETS BASE
 # ============================================================
 
 class RoundedBox(BoxLayout):
@@ -845,17 +804,14 @@ class RoundedBox(BoxLayout):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-
-        self.padding = kwargs.get("padding", dp(12))
-        self.spacing = kwargs.get("spacing", dp(8))
+        if "padding" not in kwargs:
+            self.padding = dp(12)
+        if "spacing" not in kwargs:
+            self.spacing = dp(8)
 
         with self.canvas.before:
             Color(*self.bg_color)
-            self.rect = RoundedRectangle(
-                pos=self.pos,
-                size=self.size,
-                radius=[self.radius],
-            )
+            self.rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[self.radius])
 
         self.bind(pos=self._update_rect, size=self._update_rect, bg_color=self._update_rect)
 
@@ -866,19 +822,14 @@ class RoundedBox(BoxLayout):
 
 class Header(BoxLayout):
     def __init__(self, title, show_back=False, on_back=None, **kwargs):
-        super().__init__(orientation="vertical", size_hint_y=None, height=dp(64), **kwargs)
+        super().__init__(orientation="horizontal", size_hint_y=None, height=dp(66), **kwargs)
+        self.padding = [dp(12), dp(8), dp(12), dp(8)]
+        self.spacing = dp(8)
 
         with self.canvas.before:
             Color(*BLUE)
             self.bg = Rectangle(pos=self.pos, size=self.size)
-
         self.bind(pos=self._update_bg, size=self._update_bg)
-
-        row = BoxLayout(
-            orientation="horizontal",
-            padding=[dp(14), dp(8), dp(14), dp(8)],
-            spacing=dp(8),
-        )
 
         if show_back:
             back = Button(
@@ -888,43 +839,107 @@ class Header(BoxLayout):
                 background_normal="",
                 background_color=BLUE_DARK,
                 color=WHITE,
-                font_size="22sp",
                 bold=True,
+                font_size="18sp",
             )
             if on_back:
                 back.bind(on_release=lambda *_: on_back())
-            row.add_widget(back)
+            self.add_widget(back)
 
-        label = Label(
-            text=title,
-            color=WHITE,
-            bold=True,
-            font_size="17sp",
-            halign="left",
-            valign="middle",
-        )
+        label = Label(text=title, color=WHITE, bold=True, font_size="17sp", halign="left", valign="middle")
         label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        row.add_widget(label)
-        self.add_widget(row)
+        self.add_widget(label)
 
     def _update_bg(self, *args):
         self.bg.pos = self.pos
         self.bg.size = self.size
 
 
+class FieldLabel(Label):
+    def __init__(self, text, **kwargs):
+        super().__init__(
+            text=text,
+            color=MUTED,
+            size_hint_y=None,
+            height=dp(20),
+            font_size="12sp",
+            halign="left",
+            valign="middle",
+            **kwargs
+        )
+        self.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+
+class AppTextInput(TextInput):
+    def __init__(self, hint_text="", text="", multiline=False, readonly=False, **kwargs):
+        super().__init__(
+            hint_text=hint_text,
+            text=text,
+            multiline=multiline,
+            readonly=readonly,
+            size_hint_y=None,
+            height=dp(44) if not multiline else dp(88),
+            background_normal="",
+            background_color=(0.93, 0.95, 0.98, 1) if readonly else WHITE,
+            foreground_color=TEXT,
+            cursor_color=BLUE,
+            padding=[dp(10), dp(10), dp(10), dp(10)],
+            font_size="14sp",
+            **kwargs
+        )
+
+
+class MoneyTextInput(AppTextInput):
+    """
+    Campo para valores monetarios.
+    Permite escribir 500000 y lo convierte a 500.000 automáticamente.
+    to_int() ya entiende puntos, así que no rompe los cálculos.
+    """
+    def __init__(self, hint_text="", text="", readonly=False, **kwargs):
+        super().__init__(
+            hint_text=hint_text,
+            text=str(text) if text not in (None, "") else "",
+            readonly=readonly,
+            **kwargs
+        )
+        self._formatting = False
+        self.bind(text=self._on_money_text)
+        if self.text:
+            Clock.schedule_once(lambda *_: self._format_current_text(), 0)
+
+    def _on_money_text(self, *_):
+        if self._formatting:
+            return
+        self._format_current_text()
+
+    def _format_current_text(self):
+        raw = str(self.text or "")
+        digits = "".join(ch for ch in raw if ch.isdigit())
+
+        if digits == "":
+            return
+
+        formatted = format_thousands(int(digits))
+
+        if formatted != raw:
+            self._formatting = True
+            self.text = formatted
+            self.cursor = (len(self.text), 0)
+            self._formatting = False
+
+
 class SmallButton(Button):
-    def __init__(self, text, bg_color=BLUE, **kwargs):
+    def __init__(self, text, bg_color=BLUE, text_color=WHITE, **kwargs):
         super().__init__(
             text=text,
             size_hint_y=None,
-            height=dp(44),
+            height=dp(46),
             background_normal="",
             background_color=bg_color,
-            color=WHITE,
+            color=text_color,
             bold=True,
-            font_size="13sp",
-            **kwargs,
+            font_size="12sp",
+            **kwargs
         )
 
 
@@ -938,112 +953,43 @@ class PillButton(Button):
             background_color=bg_color,
             color=WHITE,
             bold=True,
-            font_size="13sp",
-            **kwargs,
-        )
-
-
-class FieldLabel(Label):
-    def __init__(self, text, **kwargs):
-        super().__init__(
-            text=text,
-            color=MUTED,
-            size_hint_y=None,
-            height=dp(20),
             font_size="12sp",
-            halign="left",
-            valign="middle",
-            **kwargs,
-        )
-        self.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-
-class AppTextInput(TextInput):
-    def __init__(self, hint_text="", text="", multiline=False, **kwargs):
-        super().__init__(
-            hint_text=hint_text,
-            text=text,
-            multiline=multiline,
-            size_hint_y=None,
-            height=dp(44) if not multiline else dp(88),
-            background_normal="",
-            background_color=WHITE,
-            foreground_color=TEXT,
-            cursor_color=BLUE,
-            padding=[dp(10), dp(10), dp(10), dp(10)],
-            font_size="14sp",
-            **kwargs,
+            **kwargs
         )
 
 
-class AutoMoneyInput(AppTextInput):
-    def __init__(self, hint_text="", text="", **kwargs):
-        super().__init__(hint_text=hint_text, text=text, multiline=False, **kwargs)
-        self.bind(focus=self._format_on_blur)
+class DetailRow(BoxLayout):
+    def __init__(self, label, value, **kwargs):
+        super().__init__(orientation="horizontal", size_hint_y=None, height=dp(30), spacing=dp(6), **kwargs)
 
-    def _format_on_blur(self, instance, focused):
-        if not focused:
-            value = parse_money_value(self.text)
-            if value > 0:
-                self.text = format_miles(value)
+        left = Label(text=label, color=MUTED, bold=True, font_size="12sp", halign="left", valign="middle", size_hint_x=0.42)
+        right = Label(text=str(value), color=TEXT, font_size="12sp", halign="right", valign="middle", size_hint_x=0.58)
+        left.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        right.bind(size=lambda instance, value: setattr(instance, "text_size", value))
 
-
-class AutoNumberInput(AppTextInput):
-    def __init__(self, hint_text="", text="", **kwargs):
-        super().__init__(hint_text=hint_text, text=text, multiline=False, **kwargs)
+        self.add_widget(left)
+        self.add_widget(right)
 
 
 class NavItem(BoxLayout):
     def __init__(self, app, label, screen, icon_name, active=False, **kwargs):
-        super().__init__(
-            orientation="vertical",
-            padding=[dp(6), dp(5), dp(6), dp(5)],
-            spacing=dp(2),
-            **kwargs,
-        )
-
+        super().__init__(orientation="vertical", padding=[dp(6), dp(4), dp(6), dp(4)], spacing=dp(2), **kwargs)
         self.app = app
         self.screen = screen
-        self.bg_color = GOLD if active else (0.91, 0.93, 0.96, 1)
+        bg_color = GOLD if active else (0.91, 0.93, 0.96, 1)
 
         with self.canvas.before:
-            Color(*self.bg_color)
+            Color(*bg_color)
             self.bg = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(6)])
-
         self.bind(pos=self._update_bg, size=self._update_bg)
 
-        icon_source = asset_path(icon_name)
-
-        if icon_source:
-            icon = Image(
-                source=icon_source,
-                size_hint_y=None,
-                height=dp(30),
-                allow_stretch=True,
-                keep_ratio=True,
-            )
+        source = asset_path(icon_name)
+        if source:
+            icon = Image(source=source, size_hint_y=None, height=dp(24), allow_stretch=True, keep_ratio=True)
         else:
-            icon = Label(
-                text=label[:2].upper(),
-                color=DARK,
-                bold=True,
-                font_size="14sp",
-                size_hint_y=None,
-                height=dp(30),
-                halign="center",
-                valign="middle",
-            )
+            icon = Label(text=label[:2].upper(), color=DARK, bold=True, font_size="13sp", size_hint_y=None, height=dp(24))
 
-        text = Label(
-            text=label,
-            color=DARK if active else (0.20, 0.24, 0.30, 1),
-            bold=active,
-            font_size="12sp",
-            size_hint_y=None,
-            height=dp(24),
-            halign="center",
-            valign="middle",
-        )
+        text = Label(text=label, color=DARK, bold=active, font_size="11sp", size_hint_y=None, height=dp(22), halign="center")
         text.bind(size=lambda instance, value: setattr(instance, "text_size", value))
 
         self.add_widget(icon)
@@ -1055,7 +1001,7 @@ class NavItem(BoxLayout):
 
     def on_touch_down(self, touch):
         if self.collide_point(*touch.pos):
-            self.app.go(self.screen, remember=False)
+            self.app.go(self.screen)
             return True
         return super().on_touch_down(touch)
 
@@ -1065,34 +1011,24 @@ class BottomNav(BoxLayout):
         super().__init__(
             orientation="horizontal",
             size_hint_y=None,
-            height=dp(76),
+            height=dp(66),
             padding=[dp(8), dp(7), dp(8), dp(7)],
             spacing=dp(8),
-            **kwargs,
+            **kwargs
         )
+        self.app = app
 
         with self.canvas.before:
             Color(*WHITE)
             self.bg = Rectangle(pos=self.pos, size=self.size)
-
         self.bind(pos=self._update_bg, size=self._update_bg)
 
-        items = [
+        for key, label, screen, icon_name in [
             ("clientes", "Clientes", "clientes", "clientes.png"),
             ("nuevo", "Nuevo", "nuevo_cliente", "nuevo.png"),
             ("caja", "Caja", "movimientos", "caja.png"),
-        ]
-
-        for key, label, screen, icon_name in items:
-            self.add_widget(
-                NavItem(
-                    app=app,
-                    label=label,
-                    screen=screen,
-                    icon_name=icon_name,
-                    active=(key == active),
-                )
-            )
+        ]:
+            self.add_widget(NavItem(self.app, label, screen, icon_name, active=(key == active)))
 
     def _update_bg(self, *args):
         self.bg.pos = self.pos
@@ -1100,20 +1036,21 @@ class BottomNav(BoxLayout):
 
 
 # ============================================================
-# PANTALLA: CLIENTES
+# CLIENTES
 # ============================================================
 
 class ClienteCard(RoundedBox):
     def __init__(self, cliente, on_click, **kwargs):
-        bg_status, border_color, badge_text = estado_colores(cliente)
+        estado = cliente.get("estado", "pendiente")
+        bg_status, border_color, badge_text = estado_colores(estado)
 
         super().__init__(
             orientation="horizontal",
             size_hint_y=None,
-            height=dp(118),
+            height=dp(116),
             padding=[dp(0), dp(0), dp(12), dp(0)],
             spacing=dp(0),
-            **kwargs,
+            **kwargs
         )
         self.bg_color = bg_status
         self.cliente = cliente
@@ -1123,124 +1060,72 @@ class ClienteCard(RoundedBox):
         with side.canvas.before:
             Color(*border_color)
             side.rect = RoundedRectangle(pos=side.pos, size=side.size, radius=[dp(14), 0, 0, dp(14)])
-        side.bind(pos=lambda widget, *_: setattr(widget.rect, "pos", widget.pos))
-        side.bind(size=lambda widget, *_: setattr(widget.rect, "size", widget.size))
+        side.bind(pos=lambda w, *_: setattr(w.rect, "pos", w.pos))
+        side.bind(size=lambda w, *_: setattr(w.rect, "size", w.size))
 
-        body = BoxLayout(
-            orientation="vertical",
-            padding=[dp(12), dp(9), dp(0), dp(9)],
-            spacing=dp(5),
-        )
+        body = BoxLayout(orientation="vertical", padding=[dp(12), dp(9), dp(0), dp(9)], spacing=dp(5))
 
-        top = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(34), spacing=dp(8))
+        top = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(32), spacing=dp(8))
+        initial = cliente.get("nombre", "C")[0].upper()
 
-        name_value = cliente.get("nombre", "SIN NOMBRE")
-        initial = name_value[0].upper() if name_value else "C"
-
-        avatar = Label(
-            text=initial,
-            size_hint_x=None,
-            width=dp(34),
-            color=WHITE,
-            bold=True,
-            font_size="16sp",
-            halign="center",
-            valign="middle",
-        )
+        avatar = Label(text=initial, size_hint_x=None, width=dp(34), color=WHITE, bold=True, font_size="16sp")
         with avatar.canvas.before:
             Color(*border_color)
             avatar.bg = RoundedRectangle(pos=avatar.pos, size=avatar.size, radius=[dp(17)])
-        avatar.bind(pos=lambda widget, *_: setattr(widget.bg, "pos", widget.pos))
-        avatar.bind(size=lambda widget, *_: setattr(widget.bg, "size", widget.size))
+        avatar.bind(pos=lambda w, *_: setattr(w.bg, "pos", w.pos))
+        avatar.bind(size=lambda w, *_: setattr(w.bg, "size", w.size))
 
-        name = Label(
-            text=name_value,
-            color=TEXT,
-            bold=True,
-            font_size="13sp",
-            halign="left",
-            valign="middle",
-        )
+        name = Label(text=cliente.get("nombre", "SIN NOMBRE"), color=TEXT, bold=True, font_size="13sp", halign="left", valign="middle")
         name.bind(size=lambda instance, value: setattr(instance, "text_size", value))
 
         badge = Label(
             text=badge_text,
             size_hint_x=None,
-            width=dp(88),
+            width=dp(84),
             color=WHITE if badge_text != "PENDIENTE" else DARK,
             bold=True,
             font_size="9sp",
             halign="center",
             valign="middle",
         )
-        badge_bg = GOLD if badge_text == "PENDIENTE" else border_color
+        badge_bg = border_color if badge_text != "PENDIENTE" else GOLD
         with badge.canvas.before:
             Color(*badge_bg)
             badge.bg = RoundedRectangle(pos=badge.pos, size=badge.size, radius=[dp(12)])
-        badge.bind(pos=lambda widget, *_: setattr(widget.bg, "pos", widget.pos))
-        badge.bind(size=lambda widget, *_: setattr(widget.bg, "size", widget.size))
+        badge.bind(pos=lambda w, *_: setattr(w.bg, "pos", w.pos))
+        badge.bind(size=lambda w, *_: setattr(w.bg, "size", w.size))
 
         top.add_widget(avatar)
         top.add_widget(name)
         top.add_widget(badge)
 
-        amounts = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(26))
-
-        cuota = Label(
-            text=f"Cuota: [b]{money(cliente.get('cuota', 0))}[/b]",
-            markup=True,
-            color=TEXT,
-            font_size="12sp",
-            halign="left",
-        )
+        amounts = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(28), spacing=dp(8))
+        cuota = Label(text=f"Cuota: [b]{money(cliente.get('cuota', 0))}[/b]", markup=True, color=TEXT, font_size="12sp", halign="left")
+        saldo = Label(text=f"Saldo: [b]{money(cliente.get('saldo', 0))}[/b]", markup=True, color=TEXT, font_size="12sp", halign="right")
         cuota.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        saldo = Label(
-            text=f"Saldo: [b]{money(cliente.get('saldo', 0))}[/b]",
-            markup=True,
-            color=TEXT,
-            font_size="12sp",
-            halign="right",
-        )
         saldo.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
         amounts.add_widget(cuota)
         amounts.add_widget(saldo)
 
-        detail = Label(
-            text=f"Tel: {cliente.get('telefono', '')} | Pend: {cliente.get('pendientes', 0)} | Próx: {format_date_for_user(cliente.get('fecha_proximo_cobro', ''))}",
-            color=MUTED,
-            font_size="10sp",
-            halign="left",
-            size_hint_y=None,
-            height=dp(18),
-        )
-        detail.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        hint = Label(
-            text="Tocar para gestionar",
-            color=BLUE,
-            bold=True,
-            font_size="10sp",
-            halign="left",
-            size_hint_y=None,
-            height=dp(18),
-        )
+        extra = Label(text=f"Tel: {cliente.get('telefono', '')} | Pendientes: {cliente.get('pendientes', 0)}", color=MUTED, font_size="10sp", halign="left", size_hint_y=None, height=dp(18))
+        hint = Label(text="Tocar para gestionar", color=BLUE, bold=True, font_size="10sp", halign="left", size_hint_y=None, height=dp(18))
+        extra.bind(size=lambda instance, value: setattr(instance, "text_size", value))
         hint.bind(size=lambda instance, value: setattr(instance, "text_size", value))
 
         body.add_widget(top)
         body.add_widget(amounts)
-        body.add_widget(detail)
+        body.add_widget(extra)
         body.add_widget(hint)
 
         self.add_widget(side)
         self.add_widget(body)
+        self.bind(on_touch_down=self._pressed)
 
-    def on_touch_down(self, touch):
+    def _pressed(self, widget, touch):
         if self.collide_point(*touch.pos):
             self.on_click(self.cliente)
             return True
-        return super().on_touch_down(touch)
+        return False
 
 
 class ClientesScreen(Screen):
@@ -1248,23 +1133,14 @@ class ClientesScreen(Screen):
         super().__init__(name="clientes", **kwargs)
         self.app_ref = None
 
-        root = BoxLayout(orientation="vertical", spacing=0)
+        root = BoxLayout(orientation="vertical")
+        root.add_widget(Header("::V12:: Lista de Clientes"))
 
-        header_area = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(140))
-        header_area.add_widget(Header("::V12:: Lista de Clientes"))
-
-        tools = BoxLayout(
-            orientation="vertical",
-            padding=[dp(12), dp(8), dp(12), dp(8)],
-            spacing=dp(8),
-            size_hint_y=None,
-            height=dp(76),
-        )
-
+        tools = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(72), padding=[dp(12), dp(9), dp(12), dp(9)])
         row = BoxLayout(orientation="horizontal", spacing=dp(8))
 
         self.search = TextInput(
-            hint_text="Buscar cliente por nombre, documento o telefono...",
+            hint_text="Buscar cliente...",
             multiline=False,
             background_normal="",
             background_color=WHITE,
@@ -1275,73 +1151,56 @@ class ClientesScreen(Screen):
         )
         self.search.bind(text=lambda *_: self.render_clients())
 
-        self.summary_btn = Button(
-            text="RES",
-            size_hint_x=None,
-            width=dp(56),
-            background_normal="",
-            background_color=GOLD,
-            color=DARK,
-            bold=True,
-            font_size="12sp",
-        )
-        self.summary_btn.bind(on_release=lambda *_: self.app_ref.go("resumen", remember=True))
+        summary = Button(text="RES", size_hint_x=None, width=dp(54), background_normal="", background_color=GOLD, color=DARK, bold=True, font_size="12sp")
+        summary.bind(on_release=lambda *_: self.app_ref.go("resumen"))
 
-        self.exit_btn = Button(
-            text="SALIR",
-            size_hint_x=None,
-            width=dp(64),
-            background_normal="",
-            background_color=DANGER,
-            color=WHITE,
-            bold=True,
-            font_size="11sp",
-        )
-        self.exit_btn.bind(on_release=lambda *_: self.app_ref.confirm_exit())
+        clean = Button(text="LIMPIAR", size_hint_x=None, width=dp(76), background_normal="", background_color=DANGER, color=WHITE, bold=True, font_size="10sp")
+        clean.bind(on_release=lambda *_: self.confirm_clear())
 
         row.add_widget(self.search)
-        row.add_widget(self.summary_btn)
-        row.add_widget(self.exit_btn)
-
+        row.add_widget(summary)
+        row.add_widget(clean)
         tools.add_widget(row)
-        header_area.add_widget(tools)
-
-        root.add_widget(header_area)
+        root.add_widget(tools)
 
         self.scroll = ScrollView()
         self.client_list = BoxLayout(
             orientation="vertical",
-            padding=[dp(12), dp(10), dp(12), dp(88)],
+            padding=[dp(12), dp(10), dp(12), dp(80)],
             spacing=dp(10),
             size_hint_y=None,
         )
         self.client_list.bind(minimum_height=self.client_list.setter("height"))
-
         self.scroll.add_widget(self.client_list)
         root.add_widget(self.scroll)
 
-        self.nav_container = BoxLayout(size_hint_y=None, height=dp(76))
+        self.nav_container = BoxLayout(size_hint_y=None, height=dp(66))
         root.add_widget(self.nav_container)
 
         self.add_widget(root)
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        try:
-            refresh_memory_from_db()
-        except Exception as error:
-            print("ERROR refresh clientes:", error)
-
+        refresh_memory_from_db()
         self.nav_container.clear_widgets()
         self.nav_container.add_widget(BottomNav(self.app_ref, active="clientes"))
         self.render_clients()
+
+    def confirm_clear(self):
+        confirm_popup("Limpiar datos", "Esto borrará clientes, pagos y movimientos.\nLa app quedará vacía para uso personal.", self.clear_all)
+
+    def clear_all(self):
+        clear_all_data_db()
+        self.search.text = ""
+        self.render_clients()
+        show_popup("Datos limpiados", "La app quedó vacía para uso personal.")
 
     def render_clients(self):
         if not self.app_ref:
             return
 
+        query = (self.search.text or "").strip().lower()
         self.client_list.clear_widgets()
-        query = self.search.text.strip().lower() if hasattr(self, "search") else ""
 
         filtered = [
             cliente for cliente in CLIENTES
@@ -1351,12 +1210,17 @@ class ClientesScreen(Screen):
         ]
 
         if not filtered:
-            self.client_list.add_widget(Label(
-                text="No se encontraron clientes.",
-                color=MUTED,
-                size_hint_y=None,
-                height=dp(60),
-            ))
+            empty_box = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(160), padding=dp(14), spacing=dp(8))
+            title = Label(text="No hay clientes registrados", color=TEXT, bold=True, font_size="15sp", halign="center", size_hint_y=None, height=dp(30))
+            msg = Label(text="Presiona NUEVO para crear tu primer cliente real.", color=MUTED, font_size="12sp", halign="center", valign="middle")
+            btn = SmallButton("Crear primer cliente", bg_color=BLUE)
+            btn.bind(on_release=lambda *_: self.app_ref.go("nuevo_cliente"))
+            title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            msg.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            empty_box.add_widget(title)
+            empty_box.add_widget(msg)
+            empty_box.add_widget(btn)
+            self.client_list.add_widget(empty_box)
             return
 
         for cliente in filtered:
@@ -1364,11 +1228,11 @@ class ClientesScreen(Screen):
 
     def open_client(self, cliente):
         self.app_ref.selected_client = cliente
-        self.app_ref.go("gestion_cliente", remember=True)
+        self.app_ref.go("gestion_cliente")
 
 
 # ============================================================
-# PANTALLA: GESTION CLIENTE
+# GESTIÓN CLIENTE
 # ============================================================
 
 class GestionClienteScreen(Screen):
@@ -1379,180 +1243,65 @@ class GestionClienteScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        self.cliente = self.app_ref.selected_client
-
-        if not self.cliente:
-            self.app_ref.go("clientes", remember=False)
-            return
-
+        self.cliente = get_client_by_id(self.app_ref.selected_client.get("id")) if self.app_ref.selected_client else None
         self.build()
-
-    def info_row(self, label, value):
-        row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(30), spacing=dp(8))
-
-        left = Label(
-            text=label,
-            color=MUTED,
-            font_size="12sp",
-            halign="left",
-            valign="middle",
-            size_hint_x=0.45,
-        )
-        left.bind(size=lambda instance, value_size: setattr(instance, "text_size", value_size))
-
-        right = Label(
-            text=str(value),
-            color=TEXT,
-            bold=True,
-            font_size="12sp",
-            halign="right",
-            valign="middle",
-            size_hint_x=0.55,
-        )
-        right.bind(size=lambda instance, value_size: setattr(instance, "text_size", value_size))
-
-        row.add_widget(left)
-        row.add_widget(right)
-
-        return row
 
     def build(self):
         self.root.clear_widgets()
-        self.root.add_widget(Header("Gestion del Cliente", show_back=True, on_back=lambda: self.app_ref.safe_back()))
+        self.root.add_widget(Header("Gestión del Cliente", show_back=True, on_back=lambda: self.app_ref.go("clientes")))
+
+        if not self.cliente:
+            self.root.add_widget(Label(text="Cliente no encontrado", color=WHITE))
+            return
 
         scroll = ScrollView()
-        content = BoxLayout(
-            orientation="vertical",
-            padding=[dp(14), dp(14), dp(14), dp(24)],
-            spacing=dp(12),
-            size_hint_y=None,
-        )
+        content = BoxLayout(orientation="vertical", padding=[dp(14), dp(14), dp(14), dp(20)], spacing=dp(12), size_hint_y=None)
         content.bind(minimum_height=content.setter("height"))
 
-        bg_status, border_color, badge_text = estado_colores(self.cliente)
-
-        card = RoundedBox(
-            orientation="vertical",
-            size_hint_y=None,
-            height=dp(370),
-            padding=[dp(14), dp(12), dp(14), dp(12)],
-            spacing=dp(7),
-        )
+        bg_status, border_color, badge_text = estado_colores(self.cliente.get("estado", "pendiente"))
+        card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(360), padding=[dp(14), dp(12), dp(14), dp(12)], spacing=dp(8))
         card.bg_color = bg_status
 
-        top = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(46), spacing=dp(8))
-
-        initial = self.cliente.get("nombre", "C")[0].upper()
-        avatar = Label(
-            text=initial,
-            size_hint_x=None,
-            width=dp(44),
-            color=WHITE,
-            bold=True,
-            font_size="18sp",
-            halign="center",
-            valign="middle",
-        )
-        with avatar.canvas.before:
-            Color(*border_color)
-            avatar.bg = RoundedRectangle(pos=avatar.pos, size=avatar.size, radius=[dp(22)])
-        avatar.bind(pos=lambda widget, *_: setattr(widget.bg, "pos", widget.pos))
-        avatar.bind(size=lambda widget, *_: setattr(widget.bg, "size", widget.size))
-
-        name_box = BoxLayout(orientation="vertical")
-
-        title = Label(
-            text=self.cliente.get("nombre", "SIN NOMBRE"),
-            color=TEXT,
-            bold=True,
-            font_size="16sp",
-            halign="left",
-            valign="bottom",
-        )
+        title = Label(text=self.cliente.get("nombre", "SIN NOMBRE"), color=TEXT, bold=True, font_size="17sp", halign="left", size_hint_y=None, height=dp(30))
         title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        status = Label(
-            text=f"Estado: {badge_text}",
-            color=TEXT,
-            bold=True,
-            font_size="12sp",
-            halign="left",
-            valign="top",
-        )
-        status.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        name_box.add_widget(title)
-        name_box.add_widget(status)
-
-        top.add_widget(avatar)
-        top.add_widget(name_box)
-
-        card.add_widget(top)
-        card.add_widget(self.info_row("Documento", self.cliente.get("documento", "Sin documento")))
-        card.add_widget(self.info_row("Telefono", self.cliente.get("telefono", "")))
-        card.add_widget(self.info_row("Direccion", self.cliente.get("direccion", "Sin direccion")))
-        card.add_widget(self.info_row("Cuota", money(self.cliente.get("cuota", 0))))
-        card.add_widget(self.info_row("Saldo", money(self.cliente.get("saldo", 0))))
-        card.add_widget(self.info_row("Pendientes", self.cliente.get("pendientes", 0)))
-        card.add_widget(self.info_row("Frecuencia", self.cliente.get("frecuencia_cobro", "Diario")))
-        card.add_widget(self.info_row("Proximo cobro", format_date_for_user(self.cliente.get("fecha_proximo_cobro", ""))))
-        card.add_widget(self.info_row("Ultimo", self.cliente.get("ultimo_tipo", "Pendiente")))
+        card.add_widget(title)
+        card.add_widget(DetailRow("Estado", badge_text))
+        card.add_widget(DetailRow("Documento", self.cliente.get("documento") or "No registrado"))
+        card.add_widget(DetailRow("Teléfono", self.cliente.get("telefono") or "No registrado"))
+        card.add_widget(DetailRow("Producto", self.cliente.get("producto") or "Crédito"))
+        card.add_widget(DetailRow("Valor Crédito", money(self.cliente.get("valor_credito", 0))))
+        card.add_widget(DetailRow("Total Crédito", money(self.cliente.get("total_credito", 0))))
+        card.add_widget(DetailRow("Cuota", money(self.cliente.get("cuota", 0))))
+        card.add_widget(DetailRow("Saldo", money(self.cliente.get("saldo", 0))))
+        card.add_widget(DetailRow("Pendientes", str(self.cliente.get("pendientes", 0))))
+        card.add_widget(DetailRow("Próx. cobro", display_date_from_iso(self.cliente.get("proximo_cobro", ""))))
 
         content.add_widget(card)
 
-        cobrar = SmallButton("COBRAR CUOTA / APORTE", bg_color=BLUE)
-        cobrar.bind(on_release=lambda *_: self.go_cobrar())
+        btn_cobrar = SmallButton("COBRAR CUOTA / APORTE", bg_color=BLUE)
+        btn_editar = SmallButton("EDITAR CLIENTE Y PRÉSTAMO", bg_color=GOLD, text_color=DARK)
+        btn_reset = SmallButton("REINICIAR ESTADO A PENDIENTE", bg_color=(0.45, 0.48, 0.55, 1))
+        btn_borrar = SmallButton("ELIMINAR CLIENTE", bg_color=DANGER)
 
-        editar = SmallButton("EDITAR CLIENTE Y PRESTAMO", bg_color=GOLD)
-        editar.color = DARK
-        editar.bind(on_release=lambda *_: self.go_editar())
+        btn_cobrar.bind(on_release=lambda *_: self.go_cobrar())
+        btn_editar.bind(on_release=lambda *_: self.go_editar())
+        btn_reset.bind(on_release=lambda *_: self.reset_estado())
+        btn_borrar.bind(on_release=lambda *_: self.confirm_delete())
 
-        reiniciar = SmallButton("REINICIAR ESTADO A PENDIENTE", bg_color=(0.45, 0.48, 0.55, 1))
-        reiniciar.bind(on_release=lambda *_: self.reset_estado())
+        content.add_widget(btn_cobrar)
+        content.add_widget(btn_editar)
+        content.add_widget(btn_reset)
+        content.add_widget(btn_borrar)
 
-        eliminar = SmallButton("ELIMINAR CLIENTE", bg_color=DANGER)
-        eliminar.bind(on_release=lambda *_: self.confirm_delete())
-
-        content.add_widget(cobrar)
-        content.add_widget(editar)
-        content.add_widget(reiniciar)
-        content.add_widget(eliminar)
-
-        help_card = RoundedBox(
-            orientation="vertical",
-            size_hint_y=None,
-            height=dp(145),
-            padding=[dp(12), dp(10), dp(12), dp(10)],
-            spacing=dp(6),
-        )
-
-        help_title = Label(
-            text="Regla del sistema",
-            color=TEXT,
-            bold=True,
-            font_size="14sp",
-            halign="left",
-            size_hint_y=None,
-            height=dp(24),
-        )
-        help_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        help_text = Label(
-            text=(
-                "Verde: cliente pagado o con aporte.\n"
-                "Amarillo: pendiente o siguiente dia.\n"
-                "Rojo: no pago.\n"
-                "Si esta en verde, no se cobra otra cuota; solo aporte."
-            ),
-            color=MUTED,
-            font_size="12sp",
-            halign="left",
-            valign="top",
-        )
-        help_text.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        help_card.add_widget(help_title)
-        help_card.add_widget(help_text)
+        help_card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(154), padding=[dp(14), dp(12), dp(14), dp(12)])
+        help_card.add_widget(Label(text="Regla del sistema", color=TEXT, bold=True, font_size="14sp", halign="center", size_hint_y=None, height=dp(24)))
+        for label, value in [
+            ("Verde", "Pagó cuota o realizó aporte."),
+            ("Amarillo", "Pendiente o siguiente día."),
+            ("Rojo", "Cliente marcado como no pago."),
+            ("Bloqueo", "Si ya está verde, solo permite aporte."),
+        ]:
+            help_card.add_widget(DetailRow(label, value))
 
         content.add_widget(help_card)
         scroll.add_widget(content)
@@ -1560,87 +1309,30 @@ class GestionClienteScreen(Screen):
 
     def go_cobrar(self):
         self.app_ref.selected_client = self.cliente
-        self.app_ref.go("cuota", remember=True)
+        self.app_ref.go("cuota")
 
     def go_editar(self):
         self.app_ref.selected_client = self.cliente
-        self.app_ref.go("editar_cliente", remember=True)
+        self.app_ref.go("editar_cliente")
 
     def reset_estado(self):
         reset_client_status_db(self.cliente.get("id"))
         refresh_memory_from_db()
-
-        updated = get_client_by_id(self.cliente.get("id"))
-        if updated:
-            self.cliente = updated
-            self.app_ref.selected_client = updated
-
-        make_popup("Estado reiniciado", "El cliente quedo pendiente por cobrar.")
-        Clock.schedule_once(lambda *_: self.app_ref.go("clientes", remember=False), 0.5)
+        show_popup("Estado reiniciado", "El cliente quedó pendiente por cobrar.")
+        Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.7)
 
     def confirm_delete(self):
-        content = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(10))
+        confirm_popup("Eliminar cliente", f"¿Eliminar a {self.cliente.get('nombre', 'este cliente')}?\nTambién se borrarán sus transacciones.", self.delete_client)
 
-        msg = Label(
-            text=f"Eliminar a {self.cliente.get('nombre', 'este cliente')}?\nTambien se borraran sus transacciones.",
-            color=TEXT,
-            font_size="14sp",
-            halign="center",
-            valign="middle",
-        )
-        msg.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        buttons = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
-
-        cancel = Button(
-            text="Cancelar",
-            background_normal="",
-            background_color=(0.55, 0.58, 0.63, 1),
-            color=WHITE,
-            bold=True,
-        )
-
-        accept = Button(
-            text="Eliminar",
-            background_normal="",
-            background_color=DANGER,
-            color=WHITE,
-            bold=True,
-        )
-
-        buttons.add_widget(cancel)
-        buttons.add_widget(accept)
-        content.add_widget(msg)
-        content.add_widget(buttons)
-
-        popup = Popup(
-            title="Eliminar cliente",
-            content=content,
-            size_hint=(0.88, None),
-            height=dp(240),
-            auto_dismiss=False,
-        )
-
-        cancel.bind(on_release=popup.dismiss)
-
-        def do_delete(*_):
-            popup.dismiss()
-            delete_client_db(self.cliente.get("id"))
-            refresh_financial_state()
-            self.app_ref.selected_client = None
-            make_popup(
-                "Cliente eliminado",
-                "El cliente fue eliminado correctamente.\n"
-                "El resumen del dia fue recalculado."
-            )
-            Clock.schedule_once(lambda *_: self.app_ref.go("clientes", remember=False), 0.5)
-
-        accept.bind(on_release=do_delete)
-        popup.open()
+    def delete_client(self):
+        delete_client_db(self.cliente.get("id"))
+        refresh_memory_from_db()
+        show_popup("Cliente eliminado", "El cliente fue eliminado correctamente.")
+        Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.7)
 
 
 # ============================================================
-# PANTALLA: COBRO
+# COBRO
 # ============================================================
 
 class CuotaScreen(Screen):
@@ -1651,83 +1343,37 @@ class CuotaScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        self.cliente = self.app_ref.selected_client
-
-        if not self.cliente:
-            self.app_ref.go("clientes", remember=False)
-            return
-
+        self.cliente = get_client_by_id(self.app_ref.selected_client.get("id")) if self.app_ref.selected_client else None
         self.build()
 
     def build(self):
         self.root.clear_widgets()
-        self.root.add_widget(Header("Cuota Cliente / Ingreso Cuota", show_back=True, on_back=lambda: self.app_ref.safe_back()))
+        self.root.add_widget(Header("Cuota Cliente / Ingreso Cuota", show_back=True, on_back=lambda: self.app_ref.go("gestion_cliente")))
+
+        if not self.cliente:
+            self.root.add_widget(Label(text="Cliente no encontrado", color=WHITE))
+            return
 
         scroll = ScrollView()
-        content = BoxLayout(
-            orientation="vertical",
-            padding=[dp(12), dp(12), dp(12), dp(20)],
-            spacing=dp(12),
-            size_hint_y=None,
-        )
+        content = BoxLayout(orientation="vertical", padding=[dp(12), dp(12), dp(12), dp(20)], spacing=dp(12), size_hint_y=None)
         content.bind(minimum_height=content.setter("height"))
 
-        summary = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(158))
-        summary.add_widget(Label(
-            text=self.cliente.get("nombre", "").lower(),
-            color=TEXT,
-            bold=True,
-            font_size="18sp",
-            halign="left",
-            size_hint_y=None,
-            height=dp(28),
-        ))
-        summary.add_widget(Label(
-            text=f"Telefono: {self.cliente.get('telefono', '')}",
-            color=MUTED,
-            font_size="13sp",
-            halign="left",
-            size_hint_y=None,
-            height=dp(24),
-        ))
-        summary.add_widget(Label(
-            text=f"Pagadas: {self.cliente.get('pagadas', 0)} | Pendientes: {self.cliente.get('pendientes', 0)}",
-            color=MUTED,
-            font_size="13sp",
-            halign="left",
-            size_hint_y=None,
-            height=dp(24),
-        ))
-        summary.add_widget(Label(
-            text=f"Saldo actual: [b]{money(self.cliente.get('saldo', 0))}[/b] | Estado: [b]{estado_texto(self.cliente)}[/b]",
-            markup=True,
-            color=TEXT,
-            font_size="14sp",
-            halign="left",
-            size_hint_y=None,
-            height=dp(28),
-        ))
-        summary.add_widget(Label(
-            text=f"Frecuencia: {self.cliente.get('frecuencia_cobro', 'Diario')} | Proximo cobro: {format_date_for_user(self.cliente.get('fecha_proximo_cobro', ''))}",
-            color=MUTED,
-            font_size="12sp",
-            halign="left",
-            size_hint_y=None,
-            height=dp(24),
-        ))
+        summary = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(160), padding=dp(12), spacing=dp(6))
+        summary.add_widget(Label(text=self.cliente.get("nombre", "").lower(), color=TEXT, bold=True, font_size="18sp", halign="left", size_hint_y=None, height=dp(30)))
+        summary.add_widget(DetailRow("Teléfono", self.cliente.get("telefono", "")))
+        summary.add_widget(DetailRow("Pagadas", str(self.cliente.get("pagadas", 0))))
+        summary.add_widget(DetailRow("Pendientes", str(self.cliente.get("pendientes", 0))))
+        summary.add_widget(DetailRow("Saldo", money(self.cliente.get("saldo", 0))))
         content.add_widget(summary)
 
-        action_box = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(132))
-        action_box.add_widget(FieldLabel("Tipo de transaccion"))
-
+        action = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(132), padding=dp(12), spacing=dp(8))
+        action.add_widget(FieldLabel("Tipo de transacción"))
         row = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint_y=None, height=dp(44))
         self.tipo_buttons = []
 
-        tipos = ["Cuota", "Aporte", "No Pago", "Siguiente Dia"]
-
-        for index, tipo in enumerate(tipos):
-            button = ToggleButton(
-                text=tipo,
+        for index, option in enumerate(["Cuota", "Aporte", "No Pago", "Siguiente Día"]):
+            btn = ToggleButton(
+                text=option,
                 group="tipo_cuota",
                 state="down" if index == 0 else "normal",
                 background_normal="",
@@ -1736,694 +1382,417 @@ class CuotaScreen(Screen):
                 font_size="10sp",
                 bold=True,
             )
-            button.bind(on_release=self.update_tipo_colors)
-            self.tipo_buttons.append(button)
-            row.add_widget(button)
+            btn.bind(on_release=self.update_tipo_colors)
+            self.tipo_buttons.append(btn)
+            row.add_widget(btn)
 
-        action_box.add_widget(row)
+        action.add_widget(row)
 
-        warning = self.get_warning_text()
-        self.warning_label = Label(
-            text=warning,
-            color=DANGER if get_estado_cliente(self.cliente) in ["pagado", "aporte", "no_pago"] else MUTED,
-            font_size="11sp",
-            halign="left",
-            valign="middle",
-            size_hint_y=None,
-            height=dp(30),
-        )
-        self.warning_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        action_box.add_widget(self.warning_label)
+        self.warning = Label(text="Seleccione el resultado del cobro.", color=MUTED, font_size="11sp", halign="left", valign="middle", size_hint_y=None, height=dp(28))
+        self.warning.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        action.add_widget(self.warning)
+        content.add_widget(action)
 
         self.apply_payment_rules()
 
-        content.add_widget(action_box)
+        form = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(360), padding=dp(12), spacing=dp(8))
 
-        form = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(350))
-        grid = GridLayout(cols=2, spacing=dp(10), size_hint_y=None, height=dp(258))
+        self.valor_cuota = MoneyTextInput(text=format_thousands(self.cliente.get("cuota", 0)), readonly=True)
+        self.saldo_actual = MoneyTextInput(text=format_thousands(self.cliente.get("saldo", 0)), readonly=True)
+        self.valor_pagar = MoneyTextInput(text=format_thousands(self.cliente.get("cuota", 0)))
+        self.numero_cuotas = AppTextInput(text="1")
+        self.nuevo_saldo = MoneyTextInput(text=format_thousands(max(int(self.cliente.get("saldo", 0)) - int(self.cliente.get("cuota", 0)), 0)), readonly=True)
+        self.metodo_pago = Spinner(text="Efectivo", values=["Efectivo", "Transferencia"], size_hint_y=None, height=dp(44), background_normal="", background_color=WHITE, color=TEXT)
 
-        self.valor_cuota = AutoMoneyInput(text=format_miles(self.cliente.get("cuota", 0)))
-        self.saldo_actual = AutoMoneyInput(text=format_miles(self.cliente.get("saldo", 0)))
-        self.valor_pagar = AutoMoneyInput(text=format_miles(self.cliente.get("cuota", 0)))
-        self.numero_cuotas = AutoNumberInput(text="1")
-        self.nuevo_saldo = AutoMoneyInput(text=format_miles(max(self.cliente.get("saldo", 0) - self.cliente.get("cuota", 0), 0)))
-        self.metodo_pago = Spinner(
-            text="Efectivo",
-            values=["Efectivo", "Transferencia"],
-            size_hint_y=None,
-            height=dp(44),
-            background_normal="",
-            background_color=WHITE,
-            color=TEXT,
-        )
-
-        fields = [
+        for label, widget in [
             ("Valor Cuota", self.valor_cuota),
             ("Saldo Actual", self.saldo_actual),
             ("Valor a Pagar", self.valor_pagar),
-            ("No. Cuotas", self.numero_cuotas),
+            ("Número de Cuotas", self.numero_cuotas),
             ("Nuevo Saldo", self.nuevo_saldo),
-            ("Metodo Pago", self.metodo_pago),
-        ]
-
-        for label, widget in fields:
-            box = BoxLayout(orientation="vertical", spacing=dp(3))
+            ("Método de Pago", self.metodo_pago),
+        ]:
+            box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(48), spacing=dp(3))
             box.add_widget(FieldLabel(label))
             box.add_widget(widget)
-            grid.add_widget(box)
+            form.add_widget(box)
 
         self.valor_pagar.bind(text=lambda *_: self.recalculate_balance())
+        self.numero_cuotas.bind(text=lambda *_: self.recalculate_balance())
 
-        form.add_widget(grid)
-
-        registrar = SmallButton("Registrar Transaccion", bg_color=BLUE)
-        registrar.bind(on_release=lambda *_: self.register_transaction())
-        form.add_widget(registrar)
+        register = SmallButton("Registrar Transacción", bg_color=BLUE)
+        register.bind(on_release=lambda *_: self.register_transaction())
+        form.add_widget(register)
 
         content.add_widget(form)
         scroll.add_widget(content)
         self.root.add_widget(scroll)
 
-    def get_warning_text(self):
-        estado = get_estado_cliente(self.cliente)
-
-        if not is_client_due(self.cliente):
-            return f"No corresponde cobrar hasta {format_date_for_user(self.cliente.get('fecha_proximo_cobro', ''))}. Solo aporte voluntario."
-
-        if estado in ["pagado", "aporte"]:
-            return "Cliente en verde. No se permite otra cuota; solo aporte."
-
-        if estado == "no_pago":
-            return "Cliente en rojo. Si entrega dinero, registre aporte."
-
-        return "Seleccione el resultado del cobro."
-
     def apply_payment_rules(self):
-        estado = get_estado_cliente(self.cliente)
-
-        if not is_client_due(self.cliente):
-            for button in self.tipo_buttons:
-                if button.text == "Aporte":
-                    button.disabled = False
-                    button.state = "down"
-                    button.background_color = GOLD
+        estado = self.cliente.get("estado", "pendiente")
+        if estado in ("pagado", "aporte"):
+            self.warning.text = "Cliente en verde. No se permite otra cuota; solo aporte."
+            self.warning.color = DANGER
+            for btn in self.tipo_buttons:
+                if btn.text == "Aporte":
+                    btn.disabled = False
+                    btn.state = "down"
+                    btn.background_color = GOLD
+                    btn.color = DARK
                 else:
-                    button.disabled = True
-                    button.state = "normal"
-                    button.background_color = (0.75, 0.75, 0.78, 1)
-            return
-
-        if estado in ["pagado", "aporte"]:
-            for button in self.tipo_buttons:
-                if button.text == "Aporte":
-                    button.disabled = False
-                    button.state = "down"
-                    button.background_color = GOLD
-                else:
-                    button.disabled = True
-                    button.state = "normal"
-                    button.background_color = (0.75, 0.75, 0.78, 1)
-
+                    btn.disabled = True
+                    btn.background_color = (0.78, 0.80, 0.84, 1)
+                    btn.color = (0.40, 0.40, 0.40, 1)
         elif estado == "no_pago":
-            for button in self.tipo_buttons:
-                if button.text == "Cuota":
-                    button.disabled = True
-                    button.state = "normal"
-                    button.background_color = (0.75, 0.75, 0.78, 1)
-                elif button.text == "Aporte":
-                    button.disabled = False
-                    button.state = "down"
-                    button.background_color = GOLD
-                else:
-                    button.disabled = False
+            self.warning.text = "Cliente en rojo. Si entrega dinero, registre Aporte."
+            self.warning.color = DANGER
+            for btn in self.tipo_buttons:
+                if btn.text == "Cuota":
+                    btn.disabled = True
+                    btn.background_color = (0.78, 0.80, 0.84, 1)
+                    btn.color = (0.40, 0.40, 0.40, 1)
+                elif btn.text == "Aporte":
+                    btn.disabled = False
+                    btn.state = "down"
+                    btn.background_color = GOLD
+                    btn.color = DARK
 
     def update_tipo_colors(self, *_):
-        for button in self.tipo_buttons:
-            if button.disabled:
+        for btn in self.tipo_buttons:
+            if btn.disabled:
                 continue
-            button.background_color = GOLD if button.state == "down" else (0.88, 0.90, 0.94, 1)
+            btn.background_color = GOLD if btn.state == "down" else (0.88, 0.90, 0.94, 1)
+            btn.color = DARK
 
-    def recalculate_balance(self):
-        saldo = parse_money_value(self.saldo_actual.text)
-        pago = parse_money_value(self.valor_pagar.text)
-        self.nuevo_saldo.text = format_miles(max(saldo - pago, 0))
-
-    def get_selected_tipo(self):
-        for button in self.tipo_buttons:
-            if button.state == "down":
-                return button.text
+    def selected_tipo(self):
+        for btn in self.tipo_buttons:
+            if btn.state == "down":
+                return btn.text
         return "Cuota"
 
+    def recalculate_balance(self):
+        saldo = to_int(self.saldo_actual.text, 0)
+        pago = to_int(self.valor_pagar.text, 0)
+        self.nuevo_saldo.text = format_thousands(max(saldo - pago, 0))
+
     def register_transaction(self):
-        tipo = self.get_selected_tipo()
-        pago = parse_money_value(self.valor_pagar.text)
-        estado_actual = get_estado_cliente(self.cliente)
+        tipo = self.selected_tipo()
+        pago = to_int(self.valor_pagar.text, 0)
+        estado_actual = self.cliente.get("estado", "pendiente")
 
-        if estado_actual in ["pagado", "aporte"] and tipo != "Aporte":
-            make_popup("Cobro bloqueado", "Este cliente ya pago. Solo se permite registrar aporte.")
+        if estado_actual in ("pagado", "aporte") and tipo != "Aporte":
+            show_popup("Cobro bloqueado", "Este cliente ya está en verde.\nSolo se permite registrar Aporte.")
             return
-
         if estado_actual == "no_pago" and tipo == "Cuota":
-            make_popup("Cobro bloqueado", "Este cliente esta en no pago. Si entrega dinero, registre aporte.")
+            show_popup("Cobro bloqueado", "Este cliente está en rojo.\nSi entrega dinero, registre Aporte.")
             return
-
-        nuevo_saldo = max(int(self.cliente.get("saldo", 0)) - pago, 0)
-        frecuencia = self.cliente.get("frecuencia_cobro", "Diario")
-        proximo_cobro = next_due_date(frecuencia)
+        if tipo in ("Cuota", "Aporte") and pago <= 0:
+            show_popup("Valor inválido", "Ingrese un valor mayor a cero.")
+            return
 
         if tipo == "Cuota":
-            self.cliente["saldo"] = nuevo_saldo
+            self.cliente["saldo"] = max(int(self.cliente.get("saldo", 0)) - pago, 0)
             self.cliente["pagadas"] = int(self.cliente.get("pagadas", 0)) + 1
             self.cliente["pendientes"] = max(int(self.cliente.get("pendientes", 0)) - 1, 0)
             self.cliente["estado"] = "pagado"
-            self.cliente["fecha_proximo_cobro"] = proximo_cobro
-            self.cliente["ultimo_tipo"] = f"Cuota pagada. Proximo cobro: {format_date_for_user(proximo_cobro)}"
-
+            self.cliente["ultimo_tipo"] = "Cuota pagada"
+            self.cliente["ultima_fecha_pago"] = iso_today()
+            self.cliente["proximo_cobro"] = next_due_date(self.cliente.get("cobro", "Diario"))
         elif tipo == "Aporte":
-            self.cliente["saldo"] = nuevo_saldo
+            self.cliente["saldo"] = max(int(self.cliente.get("saldo", 0)) - pago, 0)
             self.cliente["estado"] = "aporte"
-            self.cliente["fecha_proximo_cobro"] = proximo_cobro
-            self.cliente["ultimo_tipo"] = f"Aporte. Proximo cobro: {format_date_for_user(proximo_cobro)}"
-
+            self.cliente["ultimo_tipo"] = "Aporte"
+            self.cliente["ultima_fecha_pago"] = iso_today()
+            self.cliente["proximo_cobro"] = next_due_date(self.cliente.get("cobro", "Diario"))
         elif tipo == "No Pago":
             pago = 0
             self.cliente["estado"] = "no_pago"
-            self.cliente["fecha_proximo_cobro"] = proximo_cobro
-            self.cliente["ultimo_tipo"] = f"No pago. Proximo intento: {format_date_for_user(proximo_cobro)}"
-
-        elif tipo == "Siguiente Dia":
+            self.cliente["ultimo_tipo"] = "No pago"
+        elif tipo == "Siguiente Día":
             pago = 0
             self.cliente["estado"] = "siguiente"
-            self.cliente["fecha_proximo_cobro"] = proximo_cobro
-            self.cliente["ultimo_tipo"] = f"Siguiente cobro: {format_date_for_user(proximo_cobro)}"
+            self.cliente["ultimo_tipo"] = "Siguiente día"
+            self.cliente["proximo_cobro"] = next_due_date("Diario")
 
-        transaccion = {
+        update_client_db(self.cliente)
+
+        insert_transaction_db({
             "cliente_id": self.cliente.get("id"),
             "cliente": self.cliente.get("nombre", ""),
             "tipo": tipo,
             "valor": pago,
             "metodo": self.metodo_pago.text,
-            "fecha": today_iso(),
+            "fecha": today_text(),
             "synced": 0,
-        }
+        })
 
-        update_client_in_db(self.cliente)
-        insert_transaction_db(transaccion)
         refresh_memory_from_db()
-
-        updated = get_client_by_id(self.cliente.get("id"))
-        if updated:
-            self.app_ref.selected_client = updated
-
-        make_popup("Transaccion registrada", f"{tipo} registrado correctamente.")
-        Clock.schedule_once(lambda *_: self.app_ref.go("gestion_cliente", remember=False), 0.6)
+        show_popup("Transacción registrada", "Registro guardado correctamente.")
+        Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.7)
 
 
 # ============================================================
-# PANTALLA: NUEVO CLIENTE
+# NUEVO CLIENTE WIZARD
 # ============================================================
 
 class NuevoClienteScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(name="nuevo_cliente", **kwargs)
-        self.current_step = 1
-        self.form_data = {}
+        self.step = 1
+        self.root = BoxLayout(orientation="vertical")
+        self.add_widget(self.root)
 
-        root = BoxLayout(orientation="vertical")
-        root.add_widget(Header("Registro de Nuevo Cliente"))
+        self.documento = AppTextInput(hint_text="Número de documento")
+        self.nombre = AppTextInput(hint_text="Nombre completo")
+        self.movil = AppTextInput(hint_text="3000000000")
+        self.direccion = AppTextInput(hint_text="Dirección del cliente")
 
-        self.main_area = BoxLayout(orientation="vertical")
-        root.add_widget(self.main_area)
+        self.producto = AppTextInput(text="5 - CREDITO EN EFECTIVO")
+        self.valor_credito = MoneyTextInput(hint_text="Ej: 500.000")
+        self.interes = AppTextInput(hint_text="Ej: 20")
+        self.numero_cuotas = AppTextInput(hint_text="Ej: 30")
+        self.total_credito = MoneyTextInput(text="0", readonly=True)
+        self.valor_cuota = MoneyTextInput(text="0", readonly=True)
+        self.cobro = Spinner(text="Diario", values=["Diario", "Semanal", "Quincenal", "Mensual"], size_hint_y=None, height=dp(44), background_normal="", background_color=WHITE, color=TEXT)
 
-        self.nav_container = BoxLayout(size_hint_y=None, height=dp(76))
-        root.add_widget(self.nav_container)
+        self.valor_credito.bind(text=lambda *_: self.calculate_credit())
+        self.interes.bind(text=lambda *_: self.calculate_credit())
+        self.numero_cuotas.bind(text=lambda *_: self.calculate_credit())
 
-        self.add_widget(root)
+        self.documento_codeudor = AppTextInput(hint_text="Opcional")
+        self.nombre_codeudor = AppTextInput(hint_text="Opcional")
+        self.movil_codeudor = AppTextInput(hint_text="Opcional")
+
+        self.valor_seguro = MoneyTextInput(hint_text="Ej: 10.000")
+        self.beneficiario = AppTextInput(hint_text="Nombre beneficiario")
+        self.obs_seguro = AppTextInput(hint_text="Observaciones", multiline=True)
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        self.current_step = 1
-        self.form_data = self.empty_form_data()
+        self.step = 1
+        self.build()
 
-        self.nav_container.clear_widgets()
-        self.nav_container.add_widget(BottomNav(self.app_ref, active="nuevo"))
+    def calculate_credit(self):
+        base = to_int(self.valor_credito.text, 0)
+        interes = to_float(self.interes.text, 0)
+        cuotas = to_int(self.numero_cuotas.text, 0)
 
-        self.render_step()
+        total = int(round(base * (1 + (interes / 100))))
+        cuota = int(round(total / cuotas)) if cuotas > 0 else 0
 
-    def empty_form_data(self):
-        return {
-            "documento": "",
-            "nombre": "",
-            "movil": "",
-            "direccion": "",
-            "documento_codeudor": "",
-            "nombre_codeudor": "",
-            "movil_codeudor": "",
-            "valor_prestar": "",
-            "interes": "",
-            "numero_cuotas": "",
-            "frecuencia": "Diario",
-            "total_pagar": "0",
-            "valor_cuota": "0",
-            "valor_seguro": "",
-            "beneficiario": "",
-            "obs_seguro": "",
-        }
+        self.total_credito.text = format_thousands(total)
+        self.valor_cuota.text = format_thousands(cuota)
 
-    def save_current_step_values(self):
-        if not hasattr(self, "active_inputs"):
-            return
+    def build(self):
+        self.root.clear_widgets()
+        self.root.add_widget(Header("Nuevo Cliente y Crédito"))
 
-        for key, widget in self.active_inputs.items():
-            self.form_data[key] = widget.text
+        body = BoxLayout(orientation="vertical", padding=[dp(12), dp(12), dp(12), dp(8)], spacing=dp(10))
 
-    def calculate_credit_values(self):
-        valor = parse_money_value(self.form_data.get("valor_prestar", ""))
-        interes = parse_percent_value(self.form_data.get("interes", ""))
+        body.add_widget(self.progress_card())
 
-        try:
-            cuotas = int(float(str(self.form_data.get("numero_cuotas", "")).replace(",", ".")))
-        except Exception:
-            cuotas = 0
+        scroll = ScrollView(size_hint_y=1)
+        card_wrap = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(10))
+        card_wrap.bind(minimum_height=card_wrap.setter("height"))
 
-        if valor <= 0 or cuotas <= 0:
-            self.form_data["total_pagar"] = "0"
-            self.form_data["valor_cuota"] = "0"
-            return {"valor": valor, "interes": interes, "cuotas": cuotas, "total_interes": 0, "total": 0, "cuota": 0}
+        if self.step == 1:
+            card_wrap.add_widget(self.form_card("1", "DATOS DEL CLIENTE", [
+                ("Documento", self.documento),
+                ("Nombre", self.nombre),
+                ("Móvil +57", self.movil),
+                ("Dirección", self.direccion),
+            ], height=dp(382)))
+        elif self.step == 2:
+            card_wrap.add_widget(self.form_card("2", "DATOS DEL CRÉDITO", [
+                ("Producto", self.producto),
+                ("Valor Crédito", self.valor_credito),
+                ("Interés %", self.interes),
+                ("Número de Cuotas", self.numero_cuotas),
+                ("Total Crédito", self.total_credito),
+                ("Valor Cuota Calculada", self.valor_cuota),
+                ("Cobro", self.cobro),
+            ], height=dp(536)))
+        elif self.step == 3:
+            card_wrap.add_widget(self.form_card("3", "CODEUDOR", [
+                ("Documento Codeudor", self.documento_codeudor),
+                ("Nombre Codeudor", self.nombre_codeudor),
+                ("Móvil Codeudor", self.movil_codeudor),
+            ], height=dp(322)))
+        else:
+            card_wrap.add_widget(self.form_card("4", "SEGURO", [
+                ("Valor Seguro", self.valor_seguro),
+                ("Beneficiario", self.beneficiario),
+                ("Observaciones", self.obs_seguro),
+            ], height=dp(370)))
 
-        total_interes = round(valor * (interes / 100))
-        total = valor + total_interes
-        cuota = round(total / cuotas)
+        scroll.add_widget(card_wrap)
+        body.add_widget(scroll)
 
-        self.form_data["total_pagar"] = format_miles(total)
-        self.form_data["valor_cuota"] = format_miles(cuota)
+        nav = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(52), spacing=dp(8))
 
-        return {"valor": valor, "interes": interes, "cuotas": cuotas, "total_interes": total_interes, "total": total, "cuota": cuota}
+        back = SmallButton("Atrás", bg_color=(0.45, 0.48, 0.55, 1))
+        back.disabled = self.step == 1
+        back.bind(on_release=lambda *_: self.previous_step())
 
-    def live_credit_update(self, *_):
-        if not hasattr(self, "active_inputs"):
-            return
+        if self.step < 4:
+            next_btn = SmallButton("Siguiente", bg_color=BLUE)
+            next_btn.bind(on_release=lambda *_: self.next_step())
+        else:
+            next_btn = SmallButton("Crear Cliente", bg_color=SUCCESS)
+            next_btn.bind(on_release=lambda *_: self.create_client())
 
-        for key, widget in self.active_inputs.items():
-            self.form_data[key] = widget.text
+        nav.add_widget(back)
+        nav.add_widget(next_btn)
+        body.add_widget(nav)
 
-        calc = self.calculate_credit_values()
+        self.root.add_widget(body)
 
-        if "total_pagar" in self.active_inputs:
-            self.active_inputs["total_pagar"].text = self.form_data["total_pagar"]
+        nav_container = BoxLayout(size_hint_y=None, height=dp(66))
+        nav_container.add_widget(BottomNav(self.app_ref, active="nuevo"))
+        self.root.add_widget(nav_container)
 
-        if "valor_cuota" in self.active_inputs:
-            self.active_inputs["valor_cuota"].text = self.form_data["valor_cuota"]
+    def progress_card(self):
+        card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(72), padding=[dp(12), dp(8), dp(12), dp(8)], spacing=dp(2))
+        card.bg_color = (0.94, 0.97, 1, 1)
+        title = Label(text=f"Paso {self.step} de 4", color=TEXT, bold=True, font_size="16sp", halign="left", size_hint_y=None, height=dp(26))
+        msg = Label(text="Formulario de producción. Los datos se guardan offline.", color=MUTED, font_size="11sp", halign="left", size_hint_y=None, height=dp(24))
+        title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        msg.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        card.add_widget(title)
+        card.add_widget(msg)
+        return card
 
-        if hasattr(self, "resumen_credito_label"):
-            disponible = calculate_cash_balance()
-            estado_caja = "Disponible" if calc["valor"] <= disponible else "Fondos insuficientes"
+    def form_card(self, number, title, fields, height):
+        card = RoundedBox(orientation="vertical", size_hint_y=None, height=height, padding=[dp(12), dp(10), dp(12), dp(12)], spacing=dp(7))
+        header = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
+        circle = Label(text=number, color=WHITE, bold=True, font_size="15sp", size_hint_x=None, width=dp(34))
+        with circle.canvas.before:
+            Color(*BLUE)
+            circle.bg = RoundedRectangle(pos=circle.pos, size=circle.size, radius=[dp(17)])
+        circle.bind(pos=lambda w, *_: setattr(w.bg, "pos", w.pos))
+        circle.bind(size=lambda w, *_: setattr(w.bg, "size", w.size))
+        lbl = Label(text=title, color=TEXT, bold=True, font_size="14sp", halign="left", valign="middle")
+        lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        header.add_widget(circle)
+        header.add_widget(lbl)
+        card.add_widget(header)
 
-            self.resumen_credito_label.text = (
-                f"Saldo disponible en caja: {money(disponible)}\n"
-                f"Valor a prestar: {money(calc['valor'])}\n"
-                f"Estado de caja: {estado_caja}\n"
-                f"Interes aplicado: {calc['interes']:.2f}% = {money(calc['total_interes'])}\n"
-                f"Total a pagar: {money(calc['total'])}\n"
-                f"Valor cuota: {money(calc['cuota'])}"
-            )
-
-    def step_header(self, title, subtitle):
-        wrapper = BoxLayout(
-            orientation="vertical",
-            size_hint_y=None,
-            height=dp(96),
-            padding=[dp(12), dp(10), dp(12), dp(6)],
-            spacing=dp(6),
-        )
-
-        progress = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(32), spacing=dp(6))
-
-        labels = ["1 Cliente", "2 Codeudor", "3 Credito", "4 Seguro"]
-
-        for index, label in enumerate(labels, start=1):
-            active = index == self.current_step
-            done = index < self.current_step
-
-            item = Label(
-                text=label,
-                color=WHITE if active else TEXT,
-                bold=active or done,
-                font_size="10sp",
-                halign="center",
-                valign="middle",
-            )
-
-            with item.canvas.before:
-                Color(*(BLUE if active else (GOLD if done else (0.88, 0.90, 0.94, 1))))
-                item.bg = RoundedRectangle(pos=item.pos, size=item.size, radius=[dp(12)])
-
-            item.bind(pos=lambda widget, *_: setattr(widget.bg, "pos", widget.pos))
-            item.bind(size=lambda widget, *_: setattr(widget.bg, "size", widget.size))
-
-            progress.add_widget(item)
-
-        title_label = Label(
-            text=title,
-            color=TEXT,
-            bold=True,
-            font_size="17sp",
-            halign="left",
-            valign="middle",
-            size_hint_y=None,
-            height=dp(28),
-        )
-        title_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        subtitle_label = Label(
-            text=subtitle,
-            color=MUTED,
-            font_size="12sp",
-            halign="left",
-            valign="middle",
-            size_hint_y=None,
-            height=dp(22),
-        )
-        subtitle_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        wrapper.add_widget(progress)
-        wrapper.add_widget(title_label)
-        wrapper.add_widget(subtitle_label)
-
-        return wrapper
-
-    def field_box(self, label, widget, multiline=False):
-        box = BoxLayout(
-            orientation="vertical",
-            size_hint_y=None,
-            height=dp(76) if not multiline else dp(124),
-            spacing=dp(5),
-        )
-        box.add_widget(FieldLabel(label))
-        box.add_widget(widget)
-        return box
-
-    def make_card(self, widgets):
-        height = dp(28)
-        for widget in widgets:
-            height += widget.height + dp(8)
-
-        card = RoundedBox(
-            orientation="vertical",
-            size_hint_y=None,
-            height=height,
-            padding=[dp(14), dp(14), dp(14), dp(14)],
-            spacing=dp(8),
-        )
-        card.bg_color = WHITE
-
-        for widget in widgets:
-            card.add_widget(widget)
+        for label, widget in fields:
+            field_box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(66) if not (isinstance(widget, TextInput) and widget.multiline) else dp(108), spacing=dp(3))
+            field_box.add_widget(FieldLabel(label))
+            detach_widget(widget)
+            field_box.add_widget(widget)
+            card.add_widget(field_box)
 
         return card
 
-    def make_input(self, key, hint="", money_field=False, number_field=False, readonly=False, multiline=False):
-        if money_field:
-            widget = AutoMoneyInput(hint_text=hint, text=self.form_data.get(key, ""))
-        elif number_field:
-            widget = AutoNumberInput(hint_text=hint, text=self.form_data.get(key, ""))
-        else:
-            widget = AppTextInput(hint_text=hint, text=self.form_data.get(key, ""), multiline=multiline)
-
-        widget.readonly = readonly
-        self.active_inputs[key] = widget
-        return widget
-
-    def render_step(self):
-        self.main_area.clear_widgets()
-        self.active_inputs = {}
-
-        scroll = ScrollView()
-        content = BoxLayout(
-            orientation="vertical",
-            padding=[dp(12), dp(8), dp(12), dp(18)],
-            spacing=dp(12),
-            size_hint_y=None,
-        )
-        content.bind(minimum_height=content.setter("height"))
-
-        if self.current_step == 1:
-            content.add_widget(self.step_header("Datos del cliente", "Informacion basica del cliente."))
-
-            fields = [
-                self.field_box("Documento", self.make_input("documento", "Numero de documento")),
-                self.field_box("Nombre completo", self.make_input("nombre", "Nombre completo")),
-                self.field_box("Movil +57", self.make_input("movil", "3000000000")),
-                self.field_box("Direccion", self.make_input("direccion", "Direccion del cliente")),
-            ]
-            content.add_widget(self.make_card(fields))
-
-        elif self.current_step == 2:
-            content.add_widget(self.step_header("Datos del codeudor", "Informacion opcional."))
-
-            fields = [
-                self.field_box("Documento codeudor", self.make_input("documento_codeudor", "Opcional")),
-                self.field_box("Nombre codeudor", self.make_input("nombre_codeudor", "Opcional")),
-                self.field_box("Movil codeudor", self.make_input("movil_codeudor", "Opcional")),
-            ]
-            content.add_widget(self.make_card(fields))
-
-        elif self.current_step == 3:
-            calc = self.calculate_credit_values()
-            content.add_widget(self.step_header("Credito en efectivo", "Total y cuota se calculan automaticamente."))
-
-            producto = AppTextInput(text="5 - CREDITO EN EFECTIVO")
-            producto.readonly = True
-
-            frecuencia = Spinner(
-                text=self.form_data.get("frecuencia", "Diario"),
-                values=["Diario", "Semanal", "Quincenal", "Mensual"],
-                size_hint_y=None,
-                height=dp(44),
-                background_normal="",
-                background_color=WHITE,
-                color=TEXT,
-            )
-            self.active_inputs["frecuencia"] = frecuencia
-
-            valor_input = self.make_input("valor_prestar", "Ej: 500.000", money_field=True)
-            interes_input = self.make_input("interes", "Ej: 20", number_field=True)
-            cuotas_input = self.make_input("numero_cuotas", "Ej: 25", number_field=True)
-            total_input = self.make_input("total_pagar", "0", money_field=True, readonly=True)
-            cuota_input = self.make_input("valor_cuota", "0", money_field=True, readonly=True)
-
-            valor_input.bind(text=self.live_credit_update)
-            interes_input.bind(text=self.live_credit_update)
-            cuotas_input.bind(text=self.live_credit_update)
-            frecuencia.bind(text=self.live_credit_update)
-
-            fields = [
-                self.field_box("Producto", producto),
-                self.field_box("Valor a prestar", valor_input),
-                self.field_box("Interes %", interes_input),
-                self.field_box("Numero de cuotas", cuotas_input),
-                self.field_box("Frecuencia de cobro", frecuencia),
-                self.field_box("Total a pagar", total_input),
-                self.field_box("Valor de cada cuota", cuota_input),
-            ]
-            content.add_widget(self.make_card(fields))
-
-            disponible = calculate_cash_balance()
-            estado_caja = "Disponible" if calc["valor"] <= disponible else "Fondos insuficientes"
-
-            resumen = Label(
-                text=(
-                    f"Saldo disponible en caja: {money(disponible)}\n"
-                    f"Valor a prestar: {money(calc['valor'])}\n"
-                    f"Estado de caja: {estado_caja}\n"
-                    f"Interes aplicado: {calc['interes']:.2f}% = {money(calc['total_interes'])}\n"
-                    f"Total a pagar: {money(calc['total'])}\n"
-                    f"Valor cuota: {money(calc['cuota'])}"
-                ),
-                color=MUTED,
-                font_size="12sp",
-                halign="left",
-                valign="top",
-                size_hint_y=None,
-                height=dp(112),
-            )
-            resumen.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-            self.resumen_credito_label = resumen
-
-            resumen_card = RoundedBox(
-                orientation="vertical",
-                size_hint_y=None,
-                height=dp(160),
-                padding=[dp(12), dp(10), dp(12), dp(10)],
-                spacing=dp(6),
-            )
-            resumen_card.bg_color = (0.98, 0.98, 1, 1)
-
-            resumen_title = Label(
-                text="Resumen matematico del credito",
-                color=TEXT,
-                bold=True,
-                font_size="13sp",
-                halign="left",
-                size_hint_y=None,
-                height=dp(24),
-            )
-            resumen_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-            resumen_card.add_widget(resumen_title)
-            resumen_card.add_widget(resumen)
-            content.add_widget(resumen_card)
-
-        else:
-            content.add_widget(self.step_header("Datos del seguro", "Informacion opcional."))
-
-            fields = [
-                self.field_box("Valor seguro", self.make_input("valor_seguro", "Ej: 10.000", money_field=True)),
-                self.field_box("Beneficiario", self.make_input("beneficiario", "Nombre beneficiario")),
-                self.field_box("Observaciones", self.make_input("obs_seguro", "Observaciones", multiline=True), multiline=True),
-            ]
-            content.add_widget(self.make_card(fields))
-
-        buttons = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(48))
-
-        back = Button(
-            text="VOLVER" if self.current_step == 1 else "ATRAS",
-            background_normal="",
-            background_color=(0.55, 0.58, 0.63, 1),
-            color=WHITE,
-            bold=True,
-            font_size="12sp",
-        )
-        back.bind(on_release=lambda *_: self.previous_step())
-
-        if self.current_step < 4:
-            next_button = Button(
-                text="SIGUIENTE",
-                background_normal="",
-                background_color=BLUE,
-                color=WHITE,
-                bold=True,
-                font_size="12sp",
-            )
-            next_button.bind(on_release=lambda *_: self.next_step())
-        else:
-            next_button = Button(
-                text="CREAR CLIENTE",
-                background_normal="",
-                background_color=SUCCESS,
-                color=WHITE,
-                bold=True,
-                font_size="12sp",
-            )
-            next_button.bind(on_release=lambda *_: self.create_client())
-
-        buttons.add_widget(back)
-        buttons.add_widget(next_button)
-        content.add_widget(buttons)
-
-        scroll.add_widget(content)
-        self.main_area.add_widget(scroll)
-
     def next_step(self):
-        self.save_current_step_values()
+        if self.step == 1 and not self.nombre.text.strip():
+            show_popup("Falta nombre", "Ingrese el nombre del cliente para continuar.")
+            return
 
-        if self.current_step == 3:
-            self.calculate_credit_values()
+        if self.step == 2:
+            self.calculate_credit()
+            base = to_int(self.valor_credito.text, 0)
+            cuotas = to_int(self.numero_cuotas.text, 0)
+            cuota = to_int(self.valor_cuota.text, 0)
+            if base <= 0:
+                show_popup("Valor inválido", "Ingrese el valor del crédito.")
+                return
+            if cuotas <= 0:
+                show_popup("Valor inválido", "Ingrese el número de cuotas.")
+                return
+            if cuota <= 0:
+                show_popup("Valor inválido", "La cuota calculada debe ser mayor a cero.")
+                return
 
-        if self.current_step < 4:
-            self.current_step += 1
-            self.render_step()
+        self.step += 1
+        self.build()
 
     def previous_step(self):
-        self.save_current_step_values()
-
-        if self.current_step > 1:
-            self.current_step -= 1
-            self.render_step()
-        else:
-            self.app_ref.go("clientes", remember=False)
+        if self.step > 1:
+            self.step -= 1
+            self.build()
 
     def create_client(self):
-        self.save_current_step_values()
-        self.calculate_credit_values()
+        self.calculate_credit()
 
-        nombre = self.form_data.get("nombre", "").strip().upper() or "CLIENTE NUEVO DEMO"
-        movil = self.form_data.get("movil", "").strip() or "3000000000"
-
-        valor_prestar = parse_money_value(self.form_data.get("valor_prestar", ""))
-        total_pagar = parse_money_value(self.form_data.get("total_pagar", ""))
-        cuota = parse_money_value(self.form_data.get("valor_cuota", ""))
-
-        try:
-            cuotas = int(float(str(self.form_data.get("numero_cuotas", "")).replace(",", ".")))
-        except Exception:
-            cuotas = 0
-
-        if valor_prestar <= 0 or total_pagar <= 0 or cuota <= 0 or cuotas <= 0:
-            make_popup("Datos incompletos", "Debe ingresar valor a prestar, interes y numero de cuotas.")
-            self.current_step = 3
-            self.render_step()
+        nombre = self.nombre.text.strip().upper()
+        if not nombre:
+            self.step = 1
+            self.build()
+            show_popup("Falta nombre", "Ingrese el nombre del cliente.")
             return
 
-        saldo_caja = calculate_cash_balance()
+        valor_credito = to_int(self.valor_credito.text, 0)
+        total_credito = to_int(self.total_credito.text, 0)
+        cuota = to_int(self.valor_cuota.text, 0)
+        numero_cuotas = to_int(self.numero_cuotas.text, 0)
 
-        if valor_prestar > saldo_caja:
-            make_popup(
-                "Fondos insuficientes",
-                f"No se puede crear este prestamo.\n\n"
-                f"Saldo disponible en caja: {money(saldo_caja)}\n"
-                f"Valor solicitado: {money(valor_prestar)}\n\n"
-                f"Debe ingresar mas dinero a caja o reducir el valor a prestar."
+        if valor_credito <= 0 or total_credito <= 0 or cuota <= 0 or numero_cuotas <= 0:
+            self.step = 2
+            self.build()
+            show_popup("Datos incompletos", "Revise valor crédito, interés y número de cuotas.")
+            return
+
+        refresh_memory_from_db()
+        saldo_caja = current_cash_balance()
+
+        if valor_credito > saldo_caja:
+            show_popup(
+                "Saldo insuficiente",
+                f"No se puede crear el préstamo.\n"
+                f"Valor a prestar: {money(valor_credito)}\n"
+                f"Saldo en caja: {money(saldo_caja)}\n\n"
+                f"Primero registre un INGRESO o CAJA INICIAL."
             )
-            self.current_step = 3
-            self.render_step()
             return
 
-        frecuencia = self.form_data.get("frecuencia", "Diario")
-        proximo_cobro = next_due_date(frecuencia)
-
-        nuevo = {
-            "id": None,
+        cliente = {
+            "documento": self.documento.text.strip(),
             "nombre": nombre,
-            "telefono": f"+57 {movil}",
+            "telefono": f"+57 {self.movil.text.strip()}" if self.movil.text.strip() else "",
+            "direccion": self.direccion.text.strip(),
+            "producto": self.producto.text.strip() or "5 - CREDITO EN EFECTIVO",
+            "valor_credito": valor_credito,
+            "interes": to_float(self.interes.text, 0),
+            "total_credito": total_credito,
             "cuota": cuota,
-            "saldo": total_pagar,
+            "numero_cuotas": numero_cuotas,
+            "saldo": total_credito,
             "pagadas": 0,
-            "pendientes": cuotas,
-            "estado": "siguiente",
-            "ultimo_tipo": f"Credito creado. Proximo cobro: {format_date_for_user(proximo_cobro)}",
-            "documento": self.form_data.get("documento", "").strip(),
-            "direccion": self.form_data.get("direccion", "").strip(),
-            "frecuencia_cobro": frecuencia,
-            "fecha_proximo_cobro": proximo_cobro,
+            "pendientes": numero_cuotas,
+            "cobro": self.cobro.text,
+            "estado": "pendiente",
+            "ultimo_tipo": "Pendiente por cobrar",
+            "proximo_cobro": iso_today(),
+            "ultima_fecha_pago": "",
+            "codeudor_documento": self.documento_codeudor.text.strip(),
+            "codeudor_nombre": self.nombre_codeudor.text.strip(),
+            "codeudor_movil": self.movil_codeudor.text.strip(),
+            "valor_seguro": to_int(self.valor_seguro.text, 0),
+            "beneficiario": self.beneficiario.text.strip(),
+            "obs_seguro": self.obs_seguro.text.strip(),
         }
 
-        nuevo["id"] = insert_client_db(nuevo)
+        cliente_id = insert_client_db(cliente)
 
-        movimiento_prestamo = {
+        insert_movement_db({
             "tipo": "Egreso",
-            "concepto": "Prestamo otorgado",
-            "valor": valor_prestar,
-            "observaciones": f"Prestamo entregado a {nombre}",
-            "fecha": today_iso(),
+            "concepto": "Desembolso préstamo",
+            "valor": valor_credito,
+            "observaciones": f"Préstamo entregado a {nombre}",
+            "fecha": today_text(),
             "synced": 0,
-        }
+        })
 
-        insert_movement_db(movimiento_prestamo)
-        refresh_financial_state()
-
-        make_popup(
-            "Cliente creado",
-            f"Cliente y credito activados correctamente.\n"
-            f"Valor entregado: {money(valor_prestar)}\n"
-            f"Total a pagar: {money(total_pagar)}\n"
-            f"Cuota: {money(cuota)}",
-        )
-        Clock.schedule_once(lambda *_: self.app_ref.go("clientes", remember=False), 0.6)
+        refresh_memory_from_db()
+        show_popup("Cliente creado", "Cliente y crédito activados correctamente.\nEl desembolso fue descontado de caja.")
+        Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.8)
 
 
 # ============================================================
-# PANTALLA: EDITAR CLIENTE
+# EDITAR CLIENTE
 # ============================================================
 
 class EditarClienteScreen(Screen):
@@ -2434,59 +1803,53 @@ class EditarClienteScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        self.cliente = self.app_ref.selected_client
-
-        if not self.cliente:
-            self.app_ref.go("clientes", remember=False)
-            return
-
+        self.cliente = get_client_by_id(self.app_ref.selected_client.get("id")) if self.app_ref.selected_client else None
         self.build()
 
     def build(self):
         self.root.clear_widgets()
-        self.root.add_widget(Header("Editar Cliente / Prestamo", show_back=True, on_back=lambda: self.app_ref.safe_back()))
+        self.root.add_widget(Header("Editar Cliente / Préstamo", show_back=True, on_back=lambda: self.app_ref.go("gestion_cliente")))
+
+        if not self.cliente:
+            self.root.add_widget(Label(text="Cliente no encontrado", color=WHITE))
+            return
 
         scroll = ScrollView()
-        content = BoxLayout(
-            orientation="vertical",
-            padding=[dp(12), dp(12), dp(12), dp(24)],
-            spacing=dp(12),
-            size_hint_y=None,
-        )
+        content = BoxLayout(orientation="vertical", padding=[dp(12), dp(12), dp(12), dp(24)], spacing=dp(12), size_hint_y=None)
         content.bind(minimum_height=content.setter("height"))
 
-        card = RoundedBox(
-            orientation="vertical",
-            size_hint_y=None,
-            height=dp(610),
-            padding=[dp(12), dp(12), dp(12), dp(12)],
-            spacing=dp(8),
-        )
+        card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(740), padding=[dp(12), dp(12), dp(12), dp(12)], spacing=dp(8))
 
         self.documento = AppTextInput(text=str(self.cliente.get("documento", "")))
         self.nombre = AppTextInput(text=str(self.cliente.get("nombre", "")))
         telefono = str(self.cliente.get("telefono", "")).replace("+57", "").strip()
         self.movil = AppTextInput(text=telefono)
         self.direccion = AppTextInput(text=str(self.cliente.get("direccion", "")))
-        self.saldo = AutoMoneyInput(text=format_miles(self.cliente.get("saldo", 0)))
-        self.cuota = AutoMoneyInput(text=format_miles(self.cliente.get("cuota", 0)))
-        self.pendientes = AutoNumberInput(text=str(self.cliente.get("pendientes", 0)))
+        self.valor_credito = MoneyTextInput(text=format_thousands(self.cliente.get("valor_credito", 0)))
+        self.interes = AppTextInput(text=str(self.cliente.get("interes", 0)))
+        self.numero_cuotas = AppTextInput(text=str(self.cliente.get("numero_cuotas", self.cliente.get("pendientes", 1))))
+        self.total_credito = MoneyTextInput(text=format_thousands(self.cliente.get("total_credito", self.cliente.get("saldo", 0))), readonly=True)
+        self.valor_cuota = MoneyTextInput(text=format_thousands(self.cliente.get("cuota", 0)), readonly=True)
 
-        fields = [
+        self.valor_credito.bind(text=lambda *_: self.calculate_credit())
+        self.interes.bind(text=lambda *_: self.calculate_credit())
+        self.numero_cuotas.bind(text=lambda *_: self.calculate_credit())
+
+        for label, widget in [
             ("Documento", self.documento),
             ("Nombre", self.nombre),
-            ("Movil +57", self.movil),
-            ("Direccion", self.direccion),
-            ("Total a pagar / Saldo", self.saldo),
-            ("Valor cuota", self.cuota),
-            ("Cuotas pendientes", self.pendientes),
-        ]
-
-        for label, widget in fields:
-            box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(68), spacing=dp(3))
-            box.add_widget(FieldLabel(label))
-            box.add_widget(widget)
-            card.add_widget(box)
+            ("Móvil +57", self.movil),
+            ("Dirección", self.direccion),
+            ("Valor Crédito", self.valor_credito),
+            ("Interés %", self.interes),
+            ("Número de Cuotas", self.numero_cuotas),
+            ("Total Crédito", self.total_credito),
+            ("Valor Cuota", self.valor_cuota),
+        ]:
+            field = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(68), spacing=dp(3))
+            field.add_widget(FieldLabel(label))
+            field.add_widget(widget)
+            card.add_widget(field)
 
         save = SmallButton("Guardar Cambios", bg_color=SUCCESS)
         save.bind(on_release=lambda *_: self.save_changes())
@@ -2496,114 +1859,94 @@ class EditarClienteScreen(Screen):
         scroll.add_widget(content)
         self.root.add_widget(scroll)
 
+    def calculate_credit(self):
+        base = to_int(self.valor_credito.text, 0)
+        interes = to_float(self.interes.text, 0)
+        cuotas = to_int(self.numero_cuotas.text, 0)
+        total = int(round(base * (1 + interes / 100)))
+        cuota = int(round(total / cuotas)) if cuotas > 0 else 0
+        self.total_credito.text = format_thousands(total)
+        self.valor_cuota.text = format_thousands(cuota)
+
     def save_changes(self):
-        saldo = parse_money_value(self.saldo.text)
-        cuota = parse_money_value(self.cuota.text)
+        self.calculate_credit()
+        nombre = self.nombre.text.strip().upper()
+        if not nombre:
+            show_popup("Falta nombre", "Ingrese el nombre del cliente.")
+            return
 
-        try:
-            pendientes = int(float(str(self.pendientes.text).replace(",", ".")))
-        except Exception:
-            pendientes = 0
+        valor_credito = to_int(self.valor_credito.text, 0)
+        total_credito = to_int(self.total_credito.text, 0)
+        cuota = to_int(self.valor_cuota.text, 0)
+        numero_cuotas = to_int(self.numero_cuotas.text, 0)
 
+        if valor_credito < 0 or total_credito < 0 or cuota < 0 or numero_cuotas < 0:
+            show_popup("Datos inválidos", "Los valores no pueden ser negativos.")
+            return
+
+        # Al editar el crédito, el saldo se actualiza al total calculado.
         self.cliente["documento"] = self.documento.text.strip()
-        self.cliente["nombre"] = self.nombre.text.strip().upper() or "SIN NOMBRE"
-        self.cliente["telefono"] = f"+57 {self.movil.text.strip()}"
+        self.cliente["nombre"] = nombre
+        self.cliente["telefono"] = f"+57 {self.movil.text.strip()}" if self.movil.text.strip() else ""
         self.cliente["direccion"] = self.direccion.text.strip()
-        self.cliente["saldo"] = saldo
+        self.cliente["valor_credito"] = valor_credito
+        self.cliente["interes"] = to_float(self.interes.text, 0)
+        self.cliente["total_credito"] = total_credito
         self.cliente["cuota"] = cuota
-        self.cliente["pendientes"] = pendientes
-        self.cliente["ultimo_tipo"] = "Cliente actualizado"
+        self.cliente["numero_cuotas"] = numero_cuotas
+        self.cliente["saldo"] = total_credito
+        self.cliente["pendientes"] = numero_cuotas
+        self.cliente["pagadas"] = 0
+        self.cliente["estado"] = "pendiente"
+        self.cliente["ultimo_tipo"] = "Cliente y crédito actualizado"
 
-        update_client_in_db(self.cliente)
-        refresh_financial_state()
-
-        updated = get_client_by_id(self.cliente.get("id"))
-        if updated:
-            self.app_ref.selected_client = updated
-
-        make_popup(
-            "Cambios guardados",
-            "Cliente y prestamo actualizados correctamente.\n"
-            "El resumen del dia fue recalculado."
-        )
-        Clock.schedule_once(lambda *_: self.app_ref.go("gestion_cliente", remember=False), 0.6)
+        update_client_db(self.cliente)
+        refresh_memory_from_db()
+        show_popup("Cambios guardados", "Cliente y préstamo actualizados correctamente.")
+        Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.7)
 
 
 # ============================================================
-# PANTALLA: MOVIMIENTOS
+# MOVIMIENTOS DE CAJA
 # ============================================================
 
 class MovimientosScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(name="movimientos", **kwargs)
-
         root = BoxLayout(orientation="vertical")
         root.add_widget(Header("Movimientos de Caja"))
 
         scroll = ScrollView()
-        content = BoxLayout(
-            orientation="vertical",
-            padding=[dp(12), dp(14), dp(12), dp(90)],
-            spacing=dp(12),
-            size_hint_y=None,
-        )
+        content = BoxLayout(orientation="vertical", padding=[dp(12), dp(14), dp(12), dp(80)], spacing=dp(12), size_hint_y=None)
         content.bind(minimum_height=content.setter("height"))
 
         type_card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(104))
         type_card.add_widget(FieldLabel("Tipo de movimiento"))
 
         row = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
-
-        self.egreso = ToggleButton(
-            text="Egreso",
-            group="mov",
-            state="down",
-            background_normal="",
-            background_color=GOLD,
-            color=DARK,
-            bold=True,
-        )
-        self.ingreso = ToggleButton(
-            text="Ingreso",
-            group="mov",
-            background_normal="",
-            background_color=(0.88, 0.90, 0.94, 1),
-            color=TEXT,
-            bold=True,
-        )
-
+        self.egreso = ToggleButton(text="(*) Egreso", group="movimiento", state="down", background_normal="", background_color=GOLD, color=DARK, bold=True)
+        self.ingreso = ToggleButton(text="( ) Ingreso", group="movimiento", background_normal="", background_color=(0.88, 0.90, 0.94, 1), color=TEXT, bold=True)
         self.egreso.bind(on_release=self.update_type)
         self.ingreso.bind(on_release=self.update_type)
-
         row.add_widget(self.egreso)
         row.add_widget(self.ingreso)
-
         type_card.add_widget(row)
         content.add_widget(type_card)
 
         form = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(330))
-
         form.add_widget(FieldLabel("Concepto"))
-        self.concepto = Spinner(
-            text="Seleccione concepto",
-            values=["Transporte", "Alimentacion", "Papeleria", "Recaudo adicional", "Ajuste de caja", "Otro"],
-            size_hint_y=None,
-            height=dp(44),
-            background_normal="",
-            background_color=WHITE,
-            color=TEXT,
-        )
+        self.concepto = Spinner(text="Seleccione concepto", values=["Caja inicial", "Transporte", "Alimentación", "Papelería", "Recaudo adicional", "Ajuste de caja", "Otro"], size_hint_y=None, height=dp(44), background_normal="", background_color=WHITE, color=TEXT)
         form.add_widget(self.concepto)
 
         form.add_widget(FieldLabel("Valor"))
-        self.valor = AutoMoneyInput(hint_text="Ej: 50.000")
+        self.valor = MoneyTextInput(hint_text="Ej: 50.000")
         form.add_widget(self.valor)
 
         form.add_widget(FieldLabel("Observaciones"))
         self.obs = AppTextInput(hint_text="Escriba observaciones", multiline=True)
         form.add_widget(self.obs)
 
-        save = PillButton("OK Guardar", bg_color=DARK)
+        save = PillButton("Guardar")
         save.bind(on_release=lambda *_: self.save_movement())
         form.add_widget(save)
 
@@ -2611,7 +1954,7 @@ class MovimientosScreen(Screen):
         scroll.add_widget(content)
         root.add_widget(scroll)
 
-        self.nav_container = BoxLayout(size_hint_y=None, height=dp(76))
+        self.nav_container = BoxLayout(size_hint_y=None, height=dp(66))
         root.add_widget(self.nav_container)
         self.add_widget(root)
 
@@ -2621,104 +1964,66 @@ class MovimientosScreen(Screen):
         self.nav_container.add_widget(BottomNav(self.app_ref, active="caja"))
 
     def update_type(self, *_):
+        if self.egreso.state == "down":
+            self.egreso.text = "(*) Egreso"
+            self.ingreso.text = "( ) Ingreso"
+        else:
+            self.egreso.text = "( ) Egreso"
+            self.ingreso.text = "(*) Ingreso"
         self.egreso.background_color = GOLD if self.egreso.state == "down" else (0.88, 0.90, 0.94, 1)
         self.ingreso.background_color = GOLD if self.ingreso.state == "down" else (0.88, 0.90, 0.94, 1)
 
     def save_movement(self):
         tipo = "Egreso" if self.egreso.state == "down" else "Ingreso"
-        valor = parse_money_value(self.valor.text)
-
+        valor = to_int(self.valor.text, 0)
         if valor <= 0:
-            make_popup("Valor inválido", "Debe ingresar un valor mayor a cero.")
+            show_popup("Valor inválido", "Ingrese un valor mayor a cero.")
             return
 
-        saldo_disponible = calculate_cash_balance()
+        refresh_memory_from_db()
+        saldo_caja = current_cash_balance()
 
-        if tipo == "Egreso":
-            if saldo_disponible <= 0:
-                make_popup(
-                    "Caja sin fondos",
-                    "No se puede registrar este egreso porque el saldo en caja es cero."
-                )
-                return
+        if tipo == "Egreso" and valor > saldo_caja:
+            show_popup(
+                "Saldo insuficiente",
+                f"No se puede registrar el egreso.\n"
+                f"Egreso: {money(valor)}\n"
+                f"Saldo en caja: {money(saldo_caja)}"
+            )
+            return
 
-            if valor > saldo_disponible:
-                make_popup(
-                    "Fondos insuficientes",
-                    f"No se puede registrar el egreso.\\n\\n"
-                    f"Saldo disponible en caja: {money(saldo_disponible)}\\n"
-                    f"Valor del egreso: {money(valor)}\\n\\n"
-                    f"Debe registrar un ingreso o reducir el gasto."
-                )
-                return
-
-        movimiento = {
+        insert_movement_db({
             "tipo": tipo,
             "concepto": self.concepto.text,
             "valor": valor,
             "observaciones": self.obs.text,
-            "fecha": today_iso(),
+            "fecha": today_text(),
             "synced": 0,
-        }
-
-        insert_movement_db(movimiento)
+        })
         refresh_memory_from_db()
-
-        saldo_final = calculate_cash_balance()
-
-        make_popup(
-            "Movimiento guardado",
-            f"{tipo} registrado por {money(valor)}.\\n"
-            f"Saldo en caja: {money(saldo_final)}"
-        )
-
         self.valor.text = ""
         self.obs.text = ""
         self.concepto.text = "Seleccione concepto"
+        show_popup("Movimiento guardado", f"{tipo} registrado por {money(valor)}.")
 
 
 # ============================================================
-# PANTALLA: RESUMEN
+# RESUMEN
 # ============================================================
 
 class MetricRow(BoxLayout):
     def __init__(self, left, right, highlight=False, **kwargs):
-        super().__init__(
-            orientation="horizontal",
-            size_hint_y=None,
-            height=dp(38) if not highlight else dp(46),
-            padding=[dp(10), 0, dp(10), 0],
-            **kwargs,
-        )
-
+        super().__init__(orientation="horizontal", size_hint_y=None, height=dp(38) if not highlight else dp(46), padding=[dp(10), 0, dp(10), 0], **kwargs)
         bg_color = (0.98, 0.98, 1, 1) if not highlight else (1.0, 0.95, 0.78, 1)
-
         with self.canvas.before:
             Color(*bg_color)
             self.bg = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(8)])
-
         self.bind(pos=self._update_bg, size=self._update_bg)
 
-        left_label = Label(
-            text=left,
-            color=TEXT if highlight else MUTED,
-            bold=highlight,
-            font_size="12sp",
-            halign="left",
-            valign="middle",
-        )
+        left_label = Label(text=left, color=TEXT if highlight else MUTED, bold=highlight, font_size="12sp", halign="left", valign="middle")
+        right_label = Label(text=right, color=TEXT, bold=highlight, font_size="12sp", halign="right", valign="middle")
         left_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        right_label = Label(
-            text=str(right),
-            color=TEXT,
-            bold=highlight,
-            font_size="12sp",
-            halign="right",
-            valign="middle",
-        )
         right_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
         self.add_widget(left_label)
         self.add_widget(right_label)
 
@@ -2737,131 +2042,96 @@ class ResumenScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-
-        try:
-            refresh_financial_state()
-        except Exception as error:
-            print("ERROR refresh resumen:", error)
-
+        refresh_memory_from_db()
         self.build()
 
     def build(self):
-        try:
-            refresh_financial_state()
-        except Exception as error:
-            print("ERROR build resumen refresh:", error)
-
         self.root.clear_widgets()
-        self.root.add_widget(Header("::V12:: Resumen del Dia", show_back=True, on_back=lambda: self.app_ref.safe_back()))
+        self.root.add_widget(Header("::V12:: Resumen del Día", show_back=True, on_back=lambda: self.app_ref.go("clientes")))
 
         scroll = ScrollView()
-        content = BoxLayout(
-            orientation="vertical",
-            padding=[dp(12), dp(12), dp(12), dp(18)],
-            spacing=dp(10),
-            size_hint_y=None,
-        )
+        content = BoxLayout(orientation="vertical", padding=[dp(12), dp(12), dp(12), dp(18)], spacing=dp(10), size_hint_y=None)
         content.bind(minimum_height=content.setter("height"))
+
+        total_clientes = len(CLIENTES)
+        clientes_nuevos = len([c for c in CLIENTES if str(c.get("created_at", "")).startswith(today_text())])
+        pagos = len([t for t in TRANSACCIONES if t["tipo"] in ("Cuota", "Aporte")])
+        no_pagos = len([t for t in TRANSACCIONES if t["tipo"] == "No Pago"])
+        aplazados = len([t for t in TRANSACCIONES if t["tipo"] == "Siguiente Día"])
+        recaudo_dia = sum(int(t.get("valor", 0)) for t in TRANSACCIONES if t["tipo"] in ("Cuota", "Aporte"))
+        ingresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m["tipo"] == "Ingreso")
+        egresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m["tipo"] == "Egreso")
+        caja_inicial = 0
+        recaudo_esperado = sum(int(c.get("cuota", 0)) for c in CLIENTES)
+        saldo_caja = current_cash_balance()
+        pendientes_sync = count_pending_sync()
 
         report = RoundedBox(orientation="vertical", spacing=dp(7), padding=dp(10), size_hint_y=None)
         report.bind(minimum_height=report.setter("height"))
 
-        total_clientes = len(CLIENTES)
-        clientes_nuevos = max(total_clientes - len(CLIENTES_DEMO), 0)
-
-        transacciones_hoy = [item for item in TRANSACCIONES if is_today_record(item)]
-        movimientos_hoy = [item for item in MOVIMIENTOS_CAJA if is_today_record(item)]
-
-        pagos = len([item for item in transacciones_hoy if item.get("tipo") in ["Cuota", "Aporte"]])
-        no_pagos = len([item for item in transacciones_hoy if item.get("tipo") == "No Pago"])
-        aplazados = len([item for item in transacciones_hoy if item.get("tipo") in ["Siguiente Dia", "Siguiente Día"]])
-
-        recaudo_dia = sum(item.get("valor", 0) for item in transacciones_hoy if item.get("tipo") in ["Cuota", "Aporte"])
-        egresos = sum(item.get("valor", 0) for item in movimientos_hoy if item.get("tipo") == "Egreso")
-
-        caja_inicial = CAJA_INICIAL_BASE
-        recaudo_esperado = sum(
-            cliente.get("cuota", 0)
-            for cliente in CLIENTES
-            if cliente.get("saldo", 0) > 0 and cliente.get("pendientes", 0) > 0
-        )
-        efectivo_transferencia = recaudo_dia
-        ingresos = sum(item.get("valor", 0) for item in movimientos_hoy if item.get("tipo") == "Ingreso")
-        retiros_caja = 0
-        retiro_seguro = 0
-        ingresos_seguro = 0
-        caja_seguro = 0
-        total_ventas = recaudo_dia + ingresos
-
-        saldo_caja = calculate_cash_balance()
-
-        try:
-            pendientes_sync = count_pending_sync()
-        except Exception:
-            pendientes_sync = 0
-
-        rows = [
-            ("Vendedor", "CORREDOR - LUIS"),
+        for left, right in [
+            ("Vendedor", "CORREDOR - USUARIO"),
             ("Fecha de Ruta", today_text()),
             ("Clientes Ausentes", str(no_pagos)),
-            ("Aplazados Siguiente Dia", str(aplazados)),
-            ("Numero Clientes", str(total_clientes)),
+            ("Aplazados Sig. Día", str(aplazados)),
+            ("Número Clientes", str(total_clientes)),
             ("Clientes Nuevos", str(clientes_nuevos)),
-            ("Pagos Registrados", f"{pagos} / {total_clientes} Adicionales: 0"),
+            ("Pagos Registrados", f"{pagos} / {total_clientes}"),
             ("Caja Inicial", money(caja_inicial)),
             ("Recaudo Esperado", money(recaudo_esperado)),
-            ("Recaudo del dia", money(recaudo_dia)),
-            ("Efectivo/Transferencia", money(efectivo_transferencia)),
-            ("Total Ventas", money(total_ventas)),
-            ("Retiros Caja", money(retiros_caja)),
-            ("Egresos", money(egresos)),
+            ("Recaudo del día", money(recaudo_dia)),
             ("Ingresos", money(ingresos)),
-            ("Retiro Caja Seguros", money(retiro_seguro)),
-            ("Ingresos Seguros", money(ingresos_seguro)),
-            ("Caja Seguros", money(caja_seguro)),
-            ("Movimientos del dia", str(len(movimientos_hoy))),
-            ("Pendientes nube", str(pendientes_sync)),
-            ("Sincronizacion", self.sync_status),
-        ]
-
-        for left, right in rows:
+            ("Egresos", money(egresos)),
+            ("Pendientes Nube", str(pendientes_sync)),
+            ("Sincronización", self.sync_status),
+        ]:
             report.add_widget(MetricRow(left, right))
 
         report.add_widget(MetricRow("Saldo en Caja", money(saldo_caja), highlight=True))
-
         content.add_widget(report)
 
-        actions = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(122), spacing=dp(8))
-
+        actions = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(176), spacing=dp(8))
         row1 = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
-        row1.add_widget(PillButton("No Pagos", bg_color=DARK))
-        row1.add_widget(PillButton("Config.", bg_color=DARK))
+        row1.add_widget(PillButton("No Pagos"))
+        row1.add_widget(PillButton("Configuración"))
 
         row2 = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
-        row2.add_widget(PillButton("Reaj.", bg_color=DARK))
-
-        cloud = PillButton("SYNC Carga", bg_color=BLUE)
+        row2.add_widget(PillButton("Reajuste"))
+        cloud = PillButton("Carga Completa", bg_color=BLUE)
         cloud.bind(on_release=lambda *_: self.simulate_cloud_upload())
         row2.add_widget(cloud)
 
+        row3 = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
+        clear = PillButton("Limpiar Todo", bg_color=DANGER)
+        clear.bind(on_release=lambda *_: self.confirm_clear())
+        row3.add_widget(clear)
+
         actions.add_widget(row1)
         actions.add_widget(row2)
-
+        actions.add_widget(row3)
         content.add_widget(actions)
+
         scroll.add_widget(content)
         self.root.add_widget(scroll)
 
+    def confirm_clear(self):
+        confirm_popup("Limpiar datos", "Esto borrará clientes, pagos y movimientos.\nLa app quedará vacía para uso personal.", self.clear_all)
+
+    def clear_all(self):
+        clear_all_data_db()
+        self.sync_status = "Pendiente"
+        self.build()
+        show_popup("Datos limpiados", "La base local fue limpiada correctamente.")
+
     def simulate_cloud_upload(self):
-        self.sync_status = "Enviando datos..."
+        self.sync_status = "Enviando datos a la nube..."
         self.build()
 
         def complete_sync(*_):
             mark_all_as_synced()
-            refresh_memory_from_db()
             self.sync_status = "Sincronizado correctamente"
             self.build()
-            make_popup("Carga completa", "Los datos fueron enviados a la nube correctamente.")
-
+            show_popup("Carga completa", "Datos enviados a la nube correctamente.\nModo online simulado.")
         Clock.schedule_once(complete_sync, 1.2)
 
 
@@ -2874,13 +2144,8 @@ class CobrosV12App(App):
 
     def build(self):
         self.title = "Cobros V12 Mobile"
-        self.nav_stack = []
-        self.selected_client = None
-
         try:
             init_database()
-            ensure_client_schedule_columns()
-            seed_database_if_empty()
             refresh_memory_from_db()
         except Exception as error:
             print("ERROR SQLITE:", error)
@@ -2894,11 +2159,7 @@ class CobrosV12App(App):
             size_hint = (None, 1)
             width = min(Window.width, dp(430))
 
-        self.sm = ScreenManager(
-            transition=NoTransition(),
-            size_hint=size_hint,
-            width=width,
-        )
+        self.sm = ScreenManager(transition=NoTransition(), size_hint=size_hint, width=width)
 
         self.sm.add_widget(ClientesScreen())
         self.sm.add_widget(GestionClienteScreen())
@@ -2909,9 +2170,7 @@ class CobrosV12App(App):
         self.sm.add_widget(ResumenScreen())
 
         self.shell.add_widget(self.sm)
-
         Window.bind(size=self.update_mobile_width)
-        Window.bind(on_keyboard=self.on_keyboard)
 
         return self.shell
 
@@ -2923,124 +2182,8 @@ class CobrosV12App(App):
         print("Cobros V12 iniciado correctamente.")
         print("Base de datos:", get_db_path())
 
-    def on_keyboard(self, window, key, scancode, codepoint, modifier):
-        if key != 27:
-            return False
-
-        self.safe_back()
-        return True
-
-    def go(self, screen_name, remember=True):
-        valid_routes = {
-            "clientes",
-            "gestion_cliente",
-            "cuota",
-            "nuevo_cliente",
-            "editar_cliente",
-            "movimientos",
-            "resumen",
-        }
-
-        if screen_name not in valid_routes:
-            screen_name = "clientes"
-
-        if not hasattr(self, "sm"):
-            return
-
-        current = self.sm.current
-
-        if current == screen_name:
-            return
-
-        if remember and current:
-            if not self.nav_stack or self.nav_stack[-1] != current:
-                self.nav_stack.append(current)
-            self.nav_stack = self.nav_stack[-20:]
-
+    def go(self, screen_name):
         self.sm.current = screen_name
-
-    def safe_back(self):
-        if not hasattr(self, "sm"):
-            return
-
-        current = self.sm.current
-
-        if current == "clientes":
-            return
-
-        if current == "nuevo_cliente":
-            screen = self.sm.get_screen("nuevo_cliente")
-            if getattr(screen, "current_step", 1) > 1:
-                screen.previous_step()
-            else:
-                self.go("clientes", remember=False)
-            return
-
-        if current in ["gestion_cliente", "movimientos", "resumen"]:
-            self.go("clientes", remember=False)
-            return
-
-        if current in ["cuota", "editar_cliente"]:
-            if self.selected_client:
-                self.go("gestion_cliente", remember=False)
-            else:
-                self.go("clientes", remember=False)
-            return
-
-        self.go("clientes", remember=False)
-
-    def confirm_exit(self):
-        content = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(10))
-
-        message = Label(
-            text="Desea salir de la aplicacion?",
-            color=TEXT,
-            font_size="15sp",
-            halign="center",
-            valign="middle",
-        )
-        message.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-
-        buttons = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
-
-        cancel = Button(
-            text="Cancelar",
-            background_normal="",
-            background_color=(0.55, 0.58, 0.63, 1),
-            color=WHITE,
-            bold=True,
-        )
-
-        accept = Button(
-            text="Salir",
-            background_normal="",
-            background_color=DANGER,
-            color=WHITE,
-            bold=True,
-        )
-
-        buttons.add_widget(cancel)
-        buttons.add_widget(accept)
-
-        content.add_widget(message)
-        content.add_widget(buttons)
-
-        popup = Popup(
-            title="Salir",
-            content=content,
-            size_hint=(0.86, None),
-            height=dp(220),
-            auto_dismiss=False,
-        )
-
-        cancel.bind(on_release=popup.dismiss)
-
-        def do_exit(*_):
-            popup.dismiss()
-            self.stop()
-
-        accept.bind(on_release=do_exit)
-        popup.open()
 
 
 if __name__ == "__main__":
