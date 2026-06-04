@@ -1302,23 +1302,29 @@ def supabase_get(table_name):
 
 
 def pull_clients_from_cloud():
+    """
+    Descarga clientes de Supabase y reconcilia eliminados remotos.
+
+    Si un cliente fue eliminado en Supabase, también se elimina localmente
+    si ya estaba sincronizado. Los clientes locales pendientes synced=0
+    se conservan.
+    """
     ok, msg, rows = supabase_get("clientes")
     if not ok:
         return False, msg
 
-    if not rows:
-        return True, "Sin clientes en nube"
-
     deleted_client_ids = get_deleted_ids("cliente")
     rows = [r for r in rows if int(r.get("id")) not in deleted_client_ids]
-
-    if not rows:
-        return True, "Clientes de nube ya estaban eliminados localmente"
 
     conn = get_connection()
     cursor = conn.cursor()
 
+    remote_ids = set()
+
     for r in rows:
+        client_id = int(r.get("id"))
+        remote_ids.add(client_id)
+
         cursor.execute("""
             INSERT OR REPLACE INTO clientes (
                 id, documento, nombre, telefono, direccion, producto,
@@ -1330,7 +1336,7 @@ def pull_clients_from_cloud():
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            int(r.get("id")),
+            client_id,
             r.get("documento", ""),
             r.get("nombre", "SIN NOMBRE"),
             r.get("telefono", ""),
@@ -1360,36 +1366,49 @@ def pull_clients_from_cloud():
             1,
         ))
 
+    cursor.execute("SELECT id FROM clientes WHERE synced = 1")
+    local_synced_ids = {int(row[0]) for row in cursor.fetchall()}
+
+    ids_to_delete = (local_synced_ids - remote_ids) - deleted_client_ids
+
+    for client_id in ids_to_delete:
+        cursor.execute("DELETE FROM transacciones WHERE cliente_id = ?", (client_id,))
+        cursor.execute("DELETE FROM clientes WHERE id = ? AND synced = 1", (client_id,))
+
     conn.commit()
     conn.close()
-    return True, f"Clientes descargados: {len(rows)}"
+
+    return True, f"Clientes descargados: {len(rows)} | Eliminados locales: {len(ids_to_delete)}"
+
 
 
 def pull_transactions_from_cloud():
+    """
+    Descarga transacciones desde Supabase y reconcilia eliminados remotos.
+    """
     ok, msg, rows = supabase_get("transacciones")
     if not ok:
         return False, msg
 
-    if not rows:
-        return True, "Sin transacciones en nube"
-
     deleted_client_ids = get_deleted_ids("cliente")
     rows = [r for r in rows if not r.get("cliente_id") or int(r.get("cliente_id")) not in deleted_client_ids]
-
-    if not rows:
-        return True, "Transacciones de clientes eliminados omitidas"
 
     conn = get_connection()
     cursor = conn.cursor()
 
+    remote_ids = set()
+
     for r in rows:
+        tx_id = int(r.get("id"))
+        remote_ids.add(tx_id)
+
         cursor.execute("""
             INSERT OR REPLACE INTO transacciones (
                 id, cliente_id, cliente, tipo, valor, metodo, fecha, synced
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            int(r.get("id")),
+            tx_id,
             r.get("cliente_id"),
             r.get("cliente", ""),
             r.get("tipo", ""),
@@ -1399,30 +1418,50 @@ def pull_transactions_from_cloud():
             1,
         ))
 
+    cursor.execute("SELECT id FROM transacciones WHERE synced = 1")
+    local_synced_ids = {int(row[0]) for row in cursor.fetchall()}
+
+    ids_to_delete = local_synced_ids - remote_ids
+
+    for tx_id in ids_to_delete:
+        cursor.execute("DELETE FROM transacciones WHERE id = ? AND synced = 1", (tx_id,))
+
     conn.commit()
     conn.close()
-    return True, f"Transacciones descargadas: {len(rows)}"
+
+    return True, f"Transacciones descargadas: {len(rows)} | Eliminadas locales: {len(ids_to_delete)}"
+
 
 
 def pull_movements_from_cloud():
+    """
+    Descarga movimientos de caja desde Supabase y reconcilia eliminados.
+
+    Si un movimiento fue eliminado directamente en Supabase, también se elimina
+    de SQLite local, siempre que ya estuviera sincronizado (synced=1).
+    Los movimientos locales pendientes (synced=0) se conservan para no perder
+    registros hechos sin internet.
+    """
     ok, msg, rows = supabase_get("movimientos_caja")
     if not ok:
         return False, msg
 
-    if not rows:
-        return True, "Sin movimientos en nube"
-
     conn = get_connection()
     cursor = conn.cursor()
 
+    remote_ids = set()
+
     for r in rows:
+        movement_id = int(r.get("id"))
+        remote_ids.add(movement_id)
+
         cursor.execute("""
             INSERT OR REPLACE INTO movimientos_caja (
                 id, tipo, concepto, valor, observaciones, fecha, synced
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
-            int(r.get("id")),
+            movement_id,
             r.get("tipo", ""),
             r.get("concepto", ""),
             int(r.get("valor") or 0),
@@ -1431,9 +1470,22 @@ def pull_movements_from_cloud():
             1,
         ))
 
+    # Reconciliación de eliminados remotos:
+    # si el registro local estaba sincronizado y ya no existe en Supabase,
+    # se elimina localmente.
+    cursor.execute("SELECT id FROM movimientos_caja WHERE synced = 1")
+    local_synced_ids = {int(row[0]) for row in cursor.fetchall()}
+
+    ids_to_delete = local_synced_ids - remote_ids
+
+    for movement_id in ids_to_delete:
+        cursor.execute("DELETE FROM movimientos_caja WHERE id = ? AND synced = 1", (movement_id,))
+
     conn.commit()
     conn.close()
-    return True, f"Movimientos descargados: {len(rows)}"
+
+    return True, f"Movimientos descargados: {len(rows)} | Eliminados locales: {len(ids_to_delete)}"
+
 
 
 def rest_value(value):
