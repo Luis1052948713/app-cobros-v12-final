@@ -1079,6 +1079,50 @@ def count_pending_sync():
     return clientes + tx + mv
 
 
+
+def current_cash_balance():
+    """
+    Calcula saldo disponible en caja:
+    ingresos + recaudos de clientes - egresos.
+    """
+    try:
+        ingresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Ingreso")
+        egresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Egreso")
+        recaudos = sum(int(t.get("valor", 0)) for t in TRANSACCIONES if t.get("tipo") in ("Cuota", "Aporte"))
+        return ingresos + recaudos - egresos
+    except Exception:
+        return 0
+
+
+def update_due_statuses():
+    """
+    Si el cliente pagó y ya llegó su próxima fecha de cobro,
+    vuelve automáticamente a pendiente para que aparezca amarillo.
+    """
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        today = iso_today()
+
+        cursor.execute("""
+            UPDATE clientes
+            SET estado = 'pendiente',
+                ultimo_tipo = 'Pendiente por cobrar',
+                updated_at = ?
+            WHERE estado IN ('pagado', 'aporte')
+              AND proximo_cobro IS NOT NULL
+              AND proximo_cobro <> ''
+              AND proximo_cobro <= ?
+              AND pendientes > 0
+        """, (now_text(), today))
+
+        conn.commit()
+        conn.close()
+    except Exception as error:
+        print("ERROR update_due_statuses:", error)
+
+
+
 def supabase_configured():
     return (
         SYNC_ENABLED
@@ -1115,6 +1159,188 @@ def supabase_request(table_name, payload, method="POST"):
         return False, f"HTTPError {error.code}: {detail}"
     except Exception as error:
         return False, str(error)
+
+
+
+def supabase_get(table_name):
+    """
+    Descarga datos desde Supabase filtrando por cobrador_id.
+    Sirve para restaurar datos en un celular nuevo.
+    """
+    if not supabase_configured():
+        return False, "Supabase no configurado", []
+
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{table_name}?select=*&cobrador_id=eq.{COBRADOR_ID}"
+
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    request = urllib.request.Request(url=url, headers=headers, method="GET")
+
+    try:
+        with urllib.request.urlopen(request, timeout=SYNC_TIMEOUT_SECONDS) as response:
+            status = response.getcode()
+            raw = response.read().decode("utf-8")
+            if 200 <= status < 300:
+                return True, "OK", json.loads(raw or "[]")
+            return False, f"HTTP {status}", []
+    except urllib.error.HTTPError as error:
+        try:
+            detail = error.read().decode("utf-8")
+        except Exception:
+            detail = str(error)
+        return False, f"HTTPError {error.code}: {detail}", []
+    except Exception as error:
+        return False, str(error), []
+
+
+def pull_clients_from_cloud():
+    ok, msg, rows = supabase_get("clientes")
+    if not ok:
+        return False, msg
+
+    if not rows:
+        return True, "Sin clientes en nube"
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    for r in rows:
+        cursor.execute("""
+            INSERT OR REPLACE INTO clientes (
+                id, documento, nombre, telefono, direccion, producto,
+                valor_credito, interes, total_credito, cuota, numero_cuotas,
+                saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
+                codeudor_documento, codeudor_nombre, codeudor_movil,
+                valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
+                proximo_cobro, ultima_fecha_pago, synced
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            int(r.get("id")),
+            r.get("documento", ""),
+            r.get("nombre", "SIN NOMBRE"),
+            r.get("telefono", ""),
+            r.get("direccion", ""),
+            r.get("producto", "5 - CREDITO EN EFECTIVO"),
+            int(r.get("valor_credito") or 0),
+            float(r.get("interes") or 0),
+            int(r.get("total_credito") or 0),
+            int(r.get("cuota") or 0),
+            int(r.get("numero_cuotas") or 1),
+            int(r.get("saldo") or 0),
+            int(r.get("pagadas") or 0),
+            int(r.get("pendientes") or 0),
+            r.get("cobro", "Diario"),
+            r.get("estado", "pendiente"),
+            r.get("ultimo_tipo", "Pendiente por cobrar"),
+            r.get("codeudor_documento", ""),
+            r.get("codeudor_nombre", ""),
+            r.get("codeudor_movil", ""),
+            int(r.get("valor_seguro") or 0),
+            r.get("beneficiario", ""),
+            r.get("obs_seguro", ""),
+            r.get("created_at", now_text()),
+            r.get("updated_at", now_text()),
+            r.get("proximo_cobro", ""),
+            r.get("ultima_fecha_pago", ""),
+            1,
+        ))
+
+    conn.commit()
+    conn.close()
+    return True, f"Clientes descargados: {len(rows)}"
+
+
+def pull_transactions_from_cloud():
+    ok, msg, rows = supabase_get("transacciones")
+    if not ok:
+        return False, msg
+
+    if not rows:
+        return True, "Sin transacciones en nube"
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    for r in rows:
+        cursor.execute("""
+            INSERT OR REPLACE INTO transacciones (
+                id, cliente_id, cliente, tipo, valor, metodo, fecha, synced
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            int(r.get("id")),
+            r.get("cliente_id"),
+            r.get("cliente", ""),
+            r.get("tipo", ""),
+            int(r.get("valor") or 0),
+            r.get("metodo", ""),
+            r.get("fecha", today_text()),
+            1,
+        ))
+
+    conn.commit()
+    conn.close()
+    return True, f"Transacciones descargadas: {len(rows)}"
+
+
+def pull_movements_from_cloud():
+    ok, msg, rows = supabase_get("movimientos_caja")
+    if not ok:
+        return False, msg
+
+    if not rows:
+        return True, "Sin movimientos en nube"
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    for r in rows:
+        cursor.execute("""
+            INSERT OR REPLACE INTO movimientos_caja (
+                id, tipo, concepto, valor, observaciones, fecha, synced
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            int(r.get("id")),
+            r.get("tipo", ""),
+            r.get("concepto", ""),
+            int(r.get("valor") or 0),
+            r.get("observaciones", ""),
+            r.get("fecha", today_text()),
+            1,
+        ))
+
+    conn.commit()
+    conn.close()
+    return True, f"Movimientos descargados: {len(rows)}"
+
+
+def pull_all_from_cloud():
+    """
+    Descarga toda la informacion de Supabase hacia SQLite local.
+    Ideal para celular nuevo o app recien instalada.
+    """
+    if not supabase_configured():
+        return False, "Supabase no configurado"
+
+    results = [
+        pull_clients_from_cloud(),
+        pull_transactions_from_cloud(),
+        pull_movements_from_cloud(),
+    ]
+
+    refresh_memory_from_db()
+
+    ok = all(item[0] for item in results)
+    msg = " | ".join(item[1] for item in results)
+
+    return ok, msg
+
 
 
 def sync_clients_to_cloud():
@@ -1207,63 +1433,36 @@ def sync_movements_to_cloud():
 
 
 def sync_all_to_cloud(silent=True):
+    """
+    Sincronizacion bidireccional basica:
+    1. Sube pendientes locales a Supabase.
+    2. Descarga registros de Supabase al SQLite local.
+    3. Si no hay internet, no borra nada y reintenta despues.
+    """
     if not supabase_configured():
         return False, "Supabase no configurado"
+
     try:
-        results = [
+        refresh_memory_from_db()
+
+        push_results = [
             sync_clients_to_cloud(),
             sync_transactions_to_cloud(),
             sync_movements_to_cloud(),
         ]
+
+        pull_result = pull_all_from_cloud()
+
         refresh_memory_from_db()
-        all_ok = all(item[0] for item in results)
-        message = " | ".join(item[1] for item in results)
+
+        all_ok = all(item[0] for item in push_results) and pull_result[0]
+        message = " | ".join(item[1] for item in push_results + [pull_result])
+
         return all_ok, message
     except Exception as error:
         return False, str(error)
 
 
-def current_cash_balance():
-    """
-    Calcula el saldo real disponible en caja:
-    ingresos + recaudos de clientes - egresos.
-    Los desembolsos de préstamos se registran como egresos.
-    """
-    try:
-        refresh_only = False
-        # No llamamos refresh_memory_from_db aquí para evitar recursión.
-        ingresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Ingreso")
-        egresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Egreso")
-        recaudos = sum(int(t.get("valor", 0)) for t in TRANSACCIONES if t.get("tipo") in ("Cuota", "Aporte"))
-        return ingresos + recaudos - egresos
-    except Exception:
-        return 0
-
-
-def update_due_statuses():
-    """
-    Si un cliente ya pagó y llega su próxima fecha de cobro,
-    vuelve automáticamente a PENDIENTE para que salga amarillo.
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
-    today = iso_today()
-
-    try:
-        cursor.execute("""
-            UPDATE clientes
-            SET estado = 'pendiente',
-                ultimo_tipo = 'Pendiente por cobrar',
-                updated_at = ?
-            WHERE estado IN ('pagado', 'aporte')
-              AND proximo_cobro IS NOT NULL
-              AND proximo_cobro <> ''
-              AND proximo_cobro <= ?
-              AND pendientes > 0
-        """, (now_text(), today))
-        conn.commit()
-    finally:
-        conn.close()
 
 
 # ============================================================
@@ -1650,6 +1849,14 @@ class ClientesScreen(Screen):
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
         refresh_memory_from_db()
+
+        # Si el celular esta nuevo y no tiene SQLite local,
+        # intenta restaurar automaticamente desde Supabase.
+        if not CLIENTES and supabase_configured():
+            ok, msg = pull_all_from_cloud()
+            print("RESTORE FROM CLOUD:", ok, msg)
+            refresh_memory_from_db()
+
         self.nav_container.clear_widgets()
         self.nav_container.add_widget(BottomNav(self.app_ref, active="clientes"))
         self.render_clients()
@@ -2660,7 +2867,7 @@ class ResumenScreen(Screen):
                 if ok:
                     self.sync_status = "Sincronizado correctamente"
                     self.build()
-                    show_popup("Carga completa", "Datos enviados a Supabase correctamente.")
+                    show_popup("Carga completa", "Datos sincronizados con Supabase correctamente.\nSe subieron y descargaron registros.")
                 else:
                     self.sync_status = "Pendiente"
                     self.build()
