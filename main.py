@@ -21,6 +21,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import os
 import sqlite3
+import json
+import urllib.request
+import urllib.error
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -68,6 +71,20 @@ STATUS_RED = (1.00, 0.88, 0.88, 1)
 STATUS_BORDER_GREEN = (0.12, 0.62, 0.32, 1)
 STATUS_BORDER_YELLOW = (0.93, 0.69, 0.13, 1)
 STATUS_BORDER_RED = (0.83, 0.18, 0.18, 1)
+
+
+# ============================================================
+# CONFIGURACIÓN SUPABASE
+# ============================================================
+# Pega aquí los datos de tu proyecto Supabase.
+# No uses SERVICE_ROLE_KEY dentro de la app móvil.
+SUPABASE_URL = "https://frvzniydfdmhltxwyknh.supabase.co"
+SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZydnpuaXlkZmRtaGx0eHd5a25oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA1Nzc3NjUsImV4cCI6MjA5NjE1Mzc2NX0.2NFIkalEfGf0P7d9bT_kmNW_DvMU8I9bYTqQxabV_hI"
+COBRADOR_ID = "e058ca8f-210f-4c2e-8c7d-33ed239b3f20"
+
+SYNC_ENABLED = True
+SYNC_INTERVAL_SECONDS = 60
+SYNC_TIMEOUT_SECONDS = 10
 
 
 # ============================================================
@@ -193,12 +210,316 @@ def asset_path(filename):
     return ""
 
 
+def safe_pdf_text(value):
+    text = str(value or "")
+    replacements = {
+        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u",
+        "Á": "A", "É": "E", "Í": "I", "Ó": "O", "Ú": "U",
+        "ñ": "n", "Ñ": "N",
+        "–": "-", "—": "-", "“": '"', "”": '"',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def get_exports_dir():
+    if platform in ("android", "ios"):
+        try:
+            app = App.get_running_app()
+            if app and getattr(app, "user_data_dir", None):
+                path = Path(app.user_data_dir) / "reportes"
+                path.mkdir(parents=True, exist_ok=True)
+                return path
+        except Exception:
+            pass
+
+    path = Path(__file__).resolve().parent / "reportes"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def shorten(value, max_len=34):
+    text = str(value or "")
+    return text if len(text) <= max_len else text[:max_len - 3] + "..."
+
+
+class ProfessionalPDF:
+    def __init__(self, output_path):
+        self.output_path = Path(output_path)
+        self.page_width = 595
+        self.page_height = 842
+        self.margin = 34
+        self.pages = []
+        self.commands = []
+        self.page_no = 0
+        self.new_page()
+
+    def color(self, r, g, b):
+        self.commands.append(f"{r:.3f} {g:.3f} {b:.3f} rg")
+        self.commands.append(f"{r:.3f} {g:.3f} {b:.3f} RG")
+
+    def rect(self, x, y, w, h, fill=True):
+        self.commands.append(f"{x:.2f} {y:.2f} {w:.2f} {h:.2f} re {'f' if fill else 'S'}")
+
+    def line(self, x1, y1, x2, y2):
+        self.commands.append(f"{x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S")
+
+    def text(self, x, y, text, size=10, bold=False, color=(0.10, 0.12, 0.16)):
+        font = "F2" if bold else "F1"
+        r, g, b = color
+        txt = safe_pdf_text(text)
+        self.commands.extend([
+            "BT",
+            f"{r:.3f} {g:.3f} {b:.3f} rg",
+            f"/{font} {size} Tf",
+            f"1 0 0 1 {x:.2f} {y:.2f} Tm",
+            f"({txt}) Tj",
+            "ET",
+        ])
+
+    def new_page(self):
+        if self.commands:
+            self.footer()
+            self.pages.append("\n".join(self.commands))
+        self.page_no += 1
+        self.commands = []
+        self.y = 800
+        self.header()
+
+    def header(self):
+        self.color(0.117, 0.227, 0.541)
+        self.rect(0, 774, self.page_width, 68, True)
+        self.text(self.margin, 814, "COBROS V12", 20, True, (1, 1, 1))
+        self.text(self.margin, 792, "Reporte profesional de cierre de caja", 10, False, (0.90, 0.94, 1))
+        self.color(0.93, 0.69, 0.13)
+        self.rect(self.page_width - 170, 796, 135, 26, True)
+        self.text(self.page_width - 158, 805, today_text(), 10, True, (0.12, 0.14, 0.18))
+        self.y = 752
+
+    def footer(self):
+        self.color(0.78, 0.81, 0.86)
+        self.line(self.margin, 42, self.page_width - self.margin, 42)
+        self.text(self.margin, 26, "Cobros V12 Mobile - Reporte de cierre", 8, False, (0.42, 0.46, 0.52))
+        self.text(self.page_width - 95, 26, f"Pagina {self.page_no}", 8, False, (0.42, 0.46, 0.52))
+
+    def ensure_space(self, height):
+        if self.y - height < 62:
+            self.new_page()
+
+    def section(self, title):
+        self.ensure_space(38)
+        self.color(0.117, 0.227, 0.541)
+        self.rect(self.margin, self.y - 22, self.page_width - 2 * self.margin, 24, True)
+        self.text(self.margin + 10, self.y - 15, title.upper(), 11, True, (1, 1, 1))
+        self.y -= 36
+
+    def key_grid(self, items, columns=2):
+        width = self.page_width - 2 * self.margin
+        col_w = width / columns
+        row_h = 36
+
+        for i in range(0, len(items), columns):
+            self.ensure_space(row_h + 4)
+            row = items[i:i + columns]
+            for j, item in enumerate(row):
+                label, value, highlight = item
+                x = self.margin + j * col_w
+                y = self.y - row_h
+                self.color(1.00, 0.95, 0.78) if highlight else self.color(0.96, 0.97, 0.99)
+                self.rect(x, y, col_w - 6, row_h - 4, True)
+                self.color(0.84, 0.87, 0.91)
+                self.rect(x, y, col_w - 6, row_h - 4, False)
+                self.text(x + 8, y + 20, label, 8, True, (0.42, 0.46, 0.52))
+                self.text(x + 8, y + 7, value, 11, highlight, (0.10, 0.12, 0.16))
+            self.y -= row_h
+        self.y -= 8
+
+    def table(self, headers, rows, col_widths):
+        table_width = sum(col_widths)
+        header_h = 22
+        row_h = 20
+        self.ensure_space(header_h + row_h + 10)
+
+        y = self.y - header_h
+        self.color(0.90, 0.93, 0.97)
+        self.rect(self.margin, y, table_width, header_h, True)
+        self.color(0.78, 0.81, 0.86)
+        self.rect(self.margin, y, table_width, header_h, False)
+
+        x = self.margin
+        for h, w in zip(headers, col_widths):
+            self.text(x + 4, y + 8, h, 8, True, (0.20, 0.24, 0.30))
+            x += w
+        self.y -= header_h
+
+        if not rows:
+            self.ensure_space(row_h)
+            self.text(self.margin + 4, self.y - 14, "Sin registros para mostrar.", 9, False, (0.42, 0.46, 0.52))
+            self.y -= row_h + 8
+            return
+
+        for idx, row in enumerate(rows):
+            self.ensure_space(row_h + 4)
+            y = self.y - row_h
+            self.color(1, 1, 1) if idx % 2 == 0 else self.color(0.98, 0.99, 1)
+            self.rect(self.margin, y, table_width, row_h, True)
+            self.color(0.88, 0.90, 0.94)
+            self.line(self.margin, y, self.margin + table_width, y)
+            x = self.margin
+            for value, w in zip(row, col_widths):
+                self.text(x + 4, y + 7, value, 8, False, (0.10, 0.12, 0.16))
+                x += w
+            self.y -= row_h
+        self.y -= 10
+
+    def paragraph(self, text):
+        self.ensure_space(20)
+        self.text(self.margin, self.y - 10, text, 9, False, (0.42, 0.46, 0.52))
+        self.y -= 20
+
+    def save(self):
+        if self.commands:
+            self.footer()
+            self.pages.append("\n".join(self.commands))
+            self.commands = []
+
+        objects = [
+            "1 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+            "2 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n",
+        ]
+
+        page_refs = []
+        next_obj = 3
+
+        for content in self.pages:
+            content_id = next_obj
+            page_id = next_obj + 1
+            next_obj += 2
+            page_refs.append(f"{page_id} 0 R")
+            content_bytes = content.encode("latin-1", errors="ignore")
+            objects.append(f"{content_id} 0 obj\n<< /Length {len(content_bytes)} >>\nstream\n{content}\nendstream\nendobj\n")
+            objects.append(
+                f"{page_id} 0 obj\n"
+                f"<< /Type /Page /Parent 999 0 R /MediaBox [0 0 {self.page_width} {self.page_height}] "
+                f"/Resources << /Font << /F1 1 0 R /F2 2 0 R >> >> /Contents {content_id} 0 R >>\n"
+                f"endobj\n"
+            )
+
+        pages_id = next_obj
+        catalog_id = next_obj + 1
+        objects = [obj.replace("999 0 R", f"{pages_id} 0 R") for obj in objects]
+        objects.append(f"{pages_id} 0 obj\n<< /Type /Pages /Kids [{' '.join(page_refs)}] /Count {len(page_refs)} >>\nendobj\n")
+        objects.append(f"{catalog_id} 0 obj\n<< /Type /Catalog /Pages {pages_id} 0 R >>\nendobj\n")
+
+        pdf = "%PDF-1.4\n"
+        offsets = [0]
+        for obj in objects:
+            offsets.append(len(pdf.encode("latin-1", errors="ignore")))
+            pdf += obj
+
+        xref_pos = len(pdf.encode("latin-1", errors="ignore"))
+        total_objects = len(objects) + 1
+        pdf += f"xref\n0 {total_objects}\n"
+        pdf += "0000000000 65535 f \n"
+        for offset in offsets[1:]:
+            pdf += f"{offset:010d} 00000 n \n"
+        pdf += f"trailer\n<< /Size {total_objects} /Root {catalog_id} 0 R >>\nstartxref\n{xref_pos}\n%%EOF"
+
+        self.output_path.write_bytes(pdf.encode("latin-1", errors="ignore"))
+        return str(self.output_path)
+
+
+def generate_daily_pdf_report():
+    refresh_memory_from_db()
+
+    total_clientes = len(CLIENTES)
+    pagos = [t for t in TRANSACCIONES if t.get("tipo") in ("Cuota", "Aporte")]
+    no_pagos = [t for t in TRANSACCIONES if t.get("tipo") == "No Pago"]
+    aplazados = [t for t in TRANSACCIONES if t.get("tipo") == "Siguiente Día"]
+
+    recaudo_dia = sum(int(t.get("valor", 0)) for t in pagos)
+    ingresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Ingreso")
+    egresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Egreso")
+    recaudo_esperado = sum(int(c.get("cuota", 0)) for c in CLIENTES)
+    saldo_caja = current_cash_balance() if "current_cash_balance" in globals() else (recaudo_dia + ingresos - egresos)
+    pendientes_sync = count_pending_sync()
+
+    filename = f"cierre_caja_{datetime.now().strftime('%Y_%m_%d_%H_%M')}.pdf"
+    output_path = get_exports_dir() / filename
+    pdf = ProfessionalPDF(output_path)
+
+    pdf.section("Resumen ejecutivo")
+    pdf.key_grid([
+        ("Fecha", today_text(), False),
+        ("Cobrador", "CORREDOR - USUARIO", False),
+        ("Clientes registrados", str(total_clientes), False),
+        ("Pagos registrados", str(len(pagos)), False),
+        ("Clientes no pago", str(len(no_pagos)), False),
+        ("Aplazados", str(len(aplazados)), False),
+        ("Recaudo esperado", money(recaudo_esperado), False),
+        ("Recaudo del dia", money(recaudo_dia), True),
+        ("Ingresos de caja", money(ingresos), False),
+        ("Egresos de caja", money(egresos), False),
+        ("Saldo final en caja", money(saldo_caja), True),
+        ("Pendientes nube", str(pendientes_sync), False),
+    ])
+
+    pdf.section("Pagos y aportes registrados")
+    pagos_rows = [[
+        shorten(t.get("cliente", ""), 28),
+        shorten(t.get("tipo", ""), 9),
+        money(t.get("valor", 0)),
+        t.get("metodo", ""),
+        t.get("fecha", ""),
+    ] for t in pagos[-80:]]
+    pdf.table(["Cliente", "Tipo", "Valor", "Metodo", "Fecha"], pagos_rows, [180, 60, 80, 75, 95])
+
+    pdf.section("Clientes no pago y aplazados")
+    especiales = [c for c in CLIENTES if c.get("estado") in ("no_pago", "siguiente")]
+    especiales_rows = []
+    for c in especiales:
+        prox = display_date_from_iso(c.get("proximo_cobro", "")) if "display_date_from_iso" in globals() else c.get("proximo_cobro", "")
+        especiales_rows.append([
+            shorten(c.get("nombre", ""), 28),
+            estado_texto(c.get("estado", "pendiente")),
+            money(c.get("saldo", 0)),
+            prox,
+        ])
+    pdf.table(["Cliente", "Estado", "Saldo", "Prox. cobro"], especiales_rows, [210, 90, 90, 100])
+
+    pdf.section("Movimientos de caja")
+    mov_rows = [[
+        shorten(m.get("tipo", ""), 8),
+        shorten(m.get("concepto", ""), 26),
+        money(m.get("valor", 0)),
+        shorten(m.get("observaciones", ""), 24),
+    ] for m in MOVIMIENTOS_CAJA[-80:]]
+    pdf.table(["Tipo", "Concepto", "Valor", "Observacion"], mov_rows, [65, 180, 90, 155])
+
+    pdf.section("Clientes activos")
+    cliente_rows = [[
+        shorten(c.get("nombre", ""), 26),
+        money(c.get("cuota", 0)),
+        money(c.get("saldo", 0)),
+        estado_texto(c.get("estado", "pendiente")),
+        c.get("cobro", "Diario"),
+    ] for c in CLIENTES[-120:]]
+    pdf.table(["Cliente", "Cuota", "Saldo", "Estado", "Cobro"], cliente_rows, [170, 75, 90, 80, 75])
+
+    pdf.section("Observacion")
+    pdf.paragraph("Este reporte resume la gestion diaria del cobrador, los recaudos, movimientos de caja y clientes con novedades.")
+    pdf.paragraph("El archivo sirve como soporte administrativo del cierre de ruta.")
+
+    return pdf.save()
+
+
 def show_popup(title, message, height=240):
     content = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(12))
 
     label = Label(
         text=message,
-        color=TEXT,
+        color=WHITE,
         font_size="14sp",
         halign="center",
         valign="middle",
@@ -235,7 +556,7 @@ def confirm_popup(title, message, on_confirm):
 
     label = Label(
         text=message,
-        color=TEXT,
+        color=WHITE,
         font_size="14sp",
         halign="center",
         valign="middle",
@@ -375,7 +696,8 @@ def init_database():
             created_at TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL DEFAULT '',
             proximo_cobro TEXT,
-            ultima_fecha_pago TEXT
+            ultima_fecha_pago TEXT,
+            synced INTEGER NOT NULL DEFAULT 0
         )
     """)
 
@@ -406,6 +728,7 @@ def init_database():
         ("updated_at", "TEXT NOT NULL DEFAULT ''"),
         ("proximo_cobro", "TEXT"),
         ("ultima_fecha_pago", "TEXT"),
+        ("synced", "INTEGER NOT NULL DEFAULT 0"),
     ]
 
     for name, definition in columns:
@@ -495,7 +818,7 @@ def load_clients_from_db():
                saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
                codeudor_documento, codeudor_nombre, codeudor_movil,
                valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-               proximo_cobro, ultima_fecha_pago
+               proximo_cobro, ultima_fecha_pago, synced
         FROM clientes
         ORDER BY nombre ASC
     """)
@@ -554,9 +877,9 @@ def insert_client_db(cliente):
             saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
             codeudor_documento, codeudor_nombre, codeudor_movil,
             valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-            proximo_cobro, ultima_fecha_pago
+            proximo_cobro, ultima_fecha_pago, synced
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         cliente.get("documento", ""),
         cliente.get("nombre", "SIN NOMBRE"),
@@ -584,6 +907,7 @@ def insert_client_db(cliente):
         now_text(),
         cliente.get("proximo_cobro", iso_today()),
         cliente.get("ultima_fecha_pago", ""),
+        int(cliente.get("synced", 0)),
     ))
 
     new_id = cursor.lastrowid
@@ -603,7 +927,7 @@ def update_client_db(cliente):
             saldo = ?, pagadas = ?, pendientes = ?, cobro = ?, estado = ?, ultimo_tipo = ?,
             codeudor_documento = ?, codeudor_nombre = ?, codeudor_movil = ?,
             valor_seguro = ?, beneficiario = ?, obs_seguro = ?, updated_at = ?,
-            proximo_cobro = ?, ultima_fecha_pago = ?
+            proximo_cobro = ?, ultima_fecha_pago = ?, synced = ?
         WHERE id = ?
     """, (
         cliente.get("documento", ""),
@@ -631,6 +955,7 @@ def update_client_db(cliente):
         now_text(),
         cliente.get("proximo_cobro", ""),
         cliente.get("ultima_fecha_pago", ""),
+        int(cliente.get("synced", 0)),
         int(cliente.get("id")),
     ))
 
@@ -658,7 +983,7 @@ def get_client_by_id(cliente_id):
                saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
                codeudor_documento, codeudor_nombre, codeudor_movil,
                valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-               proximo_cobro, ultima_fecha_pago
+               proximo_cobro, ultima_fecha_pago, synced
         FROM clientes
         WHERE id = ?
     """, (int(cliente_id),))
@@ -733,6 +1058,7 @@ def clear_all_data_db():
 def mark_all_as_synced():
     conn = get_connection()
     cursor = conn.cursor()
+    cursor.execute("UPDATE clientes SET synced = 1")
     cursor.execute("UPDATE transacciones SET synced = 1")
     cursor.execute("UPDATE movimientos_caja SET synced = 1")
     conn.commit()
@@ -743,12 +1069,158 @@ def mark_all_as_synced():
 def count_pending_sync():
     conn = get_connection()
     cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM clientes WHERE synced = 0")
+    clientes = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM transacciones WHERE synced = 0")
     tx = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM movimientos_caja WHERE synced = 0")
     mv = cursor.fetchone()[0]
     conn.close()
-    return tx + mv
+    return clientes + tx + mv
+
+
+def supabase_configured():
+    return (
+        SYNC_ENABLED
+        and SUPABASE_URL.startswith("http")
+        and len(SUPABASE_ANON_KEY) > 20
+        and "PEGAR_AQUI" not in SUPABASE_URL
+        and "PEGAR_AQUI" not in SUPABASE_ANON_KEY
+        and "PEGAR_AQUI" not in COBRADOR_ID
+    )
+
+
+def supabase_request(table_name, payload, method="POST"):
+    if not supabase_configured():
+        return False, "Supabase no configurado"
+
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{table_name}"
+    data = json.dumps(payload).encode("utf-8")
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+    }
+    request = urllib.request.Request(url=url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=SYNC_TIMEOUT_SECONDS) as response:
+            status = response.getcode()
+            return (200 <= status < 300), f"HTTP {status}"
+    except urllib.error.HTTPError as error:
+        try:
+            detail = error.read().decode("utf-8")
+        except Exception:
+            detail = str(error)
+        return False, f"HTTPError {error.code}: {detail}"
+    except Exception as error:
+        return False, str(error)
+
+
+def sync_clients_to_cloud():
+    if not supabase_configured():
+        return False, "Supabase no configurado"
+
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, documento, nombre, telefono, direccion, producto,
+               valor_credito, interes, total_credito, cuota, numero_cuotas,
+               saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
+               codeudor_documento, codeudor_nombre, codeudor_movil,
+               valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
+               proximo_cobro, ultima_fecha_pago
+        FROM clientes
+        WHERE synced = 0
+    """)
+    rows = [dict(row) for row in cursor.fetchall()]
+    if not rows:
+        conn.close()
+        return True, "Sin clientes pendientes"
+    payload = []
+    for row in rows:
+        row["cobrador_id"] = COBRADOR_ID
+        payload.append(row)
+    ok, msg = supabase_request("clientes", payload)
+    if ok:
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(f"UPDATE clientes SET synced = 1 WHERE id IN ({placeholders})", ids)
+        conn.commit()
+    conn.close()
+    return ok, msg
+
+
+def sync_transactions_to_cloud():
+    if not supabase_configured():
+        return False, "Supabase no configurado"
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, cliente_id, cliente, tipo, valor, metodo, fecha
+        FROM transacciones
+        WHERE synced = 0
+    """)
+    rows = [dict(row) for row in cursor.fetchall()]
+    if not rows:
+        conn.close()
+        return True, "Sin transacciones pendientes"
+    for row in rows:
+        row["cobrador_id"] = COBRADOR_ID
+    ok, msg = supabase_request("transacciones", rows)
+    if ok:
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(f"UPDATE transacciones SET synced = 1 WHERE id IN ({placeholders})", ids)
+        conn.commit()
+    conn.close()
+    return ok, msg
+
+
+def sync_movements_to_cloud():
+    if not supabase_configured():
+        return False, "Supabase no configurado"
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, tipo, concepto, valor, observaciones, fecha
+        FROM movimientos_caja
+        WHERE synced = 0
+    """)
+    rows = [dict(row) for row in cursor.fetchall()]
+    if not rows:
+        conn.close()
+        return True, "Sin movimientos pendientes"
+    for row in rows:
+        row["cobrador_id"] = COBRADOR_ID
+    ok, msg = supabase_request("movimientos_caja", rows)
+    if ok:
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(f"UPDATE movimientos_caja SET synced = 1 WHERE id IN ({placeholders})", ids)
+        conn.commit()
+    conn.close()
+    return ok, msg
+
+
+def sync_all_to_cloud(silent=True):
+    if not supabase_configured():
+        return False, "Supabase no configurado"
+    try:
+        results = [
+            sync_clients_to_cloud(),
+            sync_transactions_to_cloud(),
+            sync_movements_to_cloud(),
+        ]
+        refresh_memory_from_db()
+        all_ok = all(item[0] for item in results)
+        message = " | ".join(item[1] for item in results)
+        return all_ok, message
+    except Exception as error:
+        return False, str(error)
 
 
 def current_cash_balance():
@@ -1154,12 +1626,8 @@ class ClientesScreen(Screen):
         summary = Button(text="RES", size_hint_x=None, width=dp(54), background_normal="", background_color=GOLD, color=DARK, bold=True, font_size="12sp")
         summary.bind(on_release=lambda *_: self.app_ref.go("resumen"))
 
-        clean = Button(text="LIMPIAR", size_hint_x=None, width=dp(76), background_normal="", background_color=DANGER, color=WHITE, bold=True, font_size="10sp")
-        clean.bind(on_release=lambda *_: self.confirm_clear())
-
         row.add_widget(self.search)
         row.add_widget(summary)
-        row.add_widget(clean)
         tools.add_widget(row)
         root.add_widget(tools)
 
@@ -1259,7 +1727,7 @@ class GestionClienteScreen(Screen):
         content.bind(minimum_height=content.setter("height"))
 
         bg_status, border_color, badge_text = estado_colores(self.cliente.get("estado", "pendiente"))
-        card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(360), padding=[dp(14), dp(12), dp(14), dp(12)], spacing=dp(8))
+        card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(390), padding=[dp(14), dp(12), dp(14), dp(12)], spacing=dp(8))
         card.bg_color = bg_status
 
         title = Label(text=self.cliente.get("nombre", "SIN NOMBRE"), color=TEXT, bold=True, font_size="17sp", halign="left", size_hint_y=None, height=dp(30))
@@ -1272,6 +1740,7 @@ class GestionClienteScreen(Screen):
         card.add_widget(DetailRow("Valor Crédito", money(self.cliente.get("valor_credito", 0))))
         card.add_widget(DetailRow("Total Crédito", money(self.cliente.get("total_credito", 0))))
         card.add_widget(DetailRow("Cuota", money(self.cliente.get("cuota", 0))))
+        card.add_widget(DetailRow("Tipo Cobro", self.cliente.get("cobro", "Diario")))
         card.add_widget(DetailRow("Saldo", money(self.cliente.get("saldo", 0))))
         card.add_widget(DetailRow("Pendientes", str(self.cliente.get("pendientes", 0))))
         card.add_widget(DetailRow("Próx. cobro", display_date_from_iso(self.cliente.get("proximo_cobro", ""))))
@@ -1358,11 +1827,12 @@ class CuotaScreen(Screen):
         content = BoxLayout(orientation="vertical", padding=[dp(12), dp(12), dp(12), dp(20)], spacing=dp(12), size_hint_y=None)
         content.bind(minimum_height=content.setter("height"))
 
-        summary = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(160), padding=dp(12), spacing=dp(6))
+        summary = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(190), padding=dp(12), spacing=dp(6))
         summary.add_widget(Label(text=self.cliente.get("nombre", "").lower(), color=TEXT, bold=True, font_size="18sp", halign="left", size_hint_y=None, height=dp(30)))
         summary.add_widget(DetailRow("Teléfono", self.cliente.get("telefono", "")))
         summary.add_widget(DetailRow("Pagadas", str(self.cliente.get("pagadas", 0))))
         summary.add_widget(DetailRow("Pendientes", str(self.cliente.get("pendientes", 0))))
+        summary.add_widget(DetailRow("Tipo Cobro", self.cliente.get("cobro", "Diario")))
         summary.add_widget(DetailRow("Saldo", money(self.cliente.get("saldo", 0))))
         content.add_widget(summary)
 
@@ -1430,9 +1900,19 @@ class CuotaScreen(Screen):
 
     def apply_payment_rules(self):
         estado = self.cliente.get("estado", "pendiente")
+
+        # Primero normalizamos todos los botones para evitar que "Cuota"
+        # quede seleccionado internamente cuando el sistema escoge Aporte.
+        for btn in self.tipo_buttons:
+            btn.disabled = False
+            btn.state = "normal"
+            btn.background_color = (0.88, 0.90, 0.94, 1)
+            btn.color = DARK
+
         if estado in ("pagado", "aporte"):
             self.warning.text = "Cliente en verde. No se permite otra cuota; solo aporte."
             self.warning.color = DANGER
+
             for btn in self.tipo_buttons:
                 if btn.text == "Aporte":
                     btn.disabled = False
@@ -1441,21 +1921,40 @@ class CuotaScreen(Screen):
                     btn.color = DARK
                 else:
                     btn.disabled = True
+                    btn.state = "normal"
                     btn.background_color = (0.78, 0.80, 0.84, 1)
                     btn.color = (0.40, 0.40, 0.40, 1)
+
         elif estado == "no_pago":
             self.warning.text = "Cliente en rojo. Si entrega dinero, registre Aporte."
             self.warning.color = DANGER
+
             for btn in self.tipo_buttons:
-                if btn.text == "Cuota":
-                    btn.disabled = True
-                    btn.background_color = (0.78, 0.80, 0.84, 1)
-                    btn.color = (0.40, 0.40, 0.40, 1)
-                elif btn.text == "Aporte":
+                if btn.text == "Aporte":
                     btn.disabled = False
                     btn.state = "down"
                     btn.background_color = GOLD
                     btn.color = DARK
+                elif btn.text == "Cuota":
+                    btn.disabled = True
+                    btn.state = "normal"
+                    btn.background_color = (0.78, 0.80, 0.84, 1)
+                    btn.color = (0.40, 0.40, 0.40, 1)
+                else:
+                    btn.disabled = False
+                    btn.state = "normal"
+                    btn.background_color = (0.88, 0.90, 0.94, 1)
+                    btn.color = DARK
+
+        else:
+            # Cliente pendiente normal: por defecto queda Cuota.
+            for btn in self.tipo_buttons:
+                if btn.text == "Cuota":
+                    btn.state = "down"
+                    btn.background_color = GOLD
+                else:
+                    btn.state = "normal"
+                    btn.background_color = (0.88, 0.90, 0.94, 1)
 
     def update_tipo_colors(self, *_):
         for btn in self.tipo_buttons:
@@ -1466,8 +1965,15 @@ class CuotaScreen(Screen):
 
     def selected_tipo(self):
         for btn in self.tipo_buttons:
-            if btn.state == "down":
+            if not btn.disabled and btn.state == "down":
                 return btn.text
+
+        # Seguridad adicional: si por estado visual quedó bloqueado,
+        # usar Aporte cuando sea el único permitido.
+        estado = self.cliente.get("estado", "pendiente")
+        if estado in ("pagado", "aporte", "no_pago"):
+            return "Aporte"
+
         return "Cuota"
 
     def recalculate_balance(self):
@@ -1479,6 +1985,9 @@ class CuotaScreen(Screen):
         tipo = self.selected_tipo()
         pago = to_int(self.valor_pagar.text, 0)
         estado_actual = self.cliente.get("estado", "pendiente")
+
+        if estado_actual in ("pagado", "aporte", "no_pago"):
+            tipo = "Aporte"
 
         if estado_actual in ("pagado", "aporte") and tipo != "Aporte":
             show_popup("Cobro bloqueado", "Este cliente ya está en verde.\nSolo se permite registrar Aporte.")
@@ -1514,6 +2023,7 @@ class CuotaScreen(Screen):
             self.cliente["ultimo_tipo"] = "Siguiente día"
             self.cliente["proximo_cobro"] = next_due_date("Diario")
 
+        self.cliente["synced"] = 0
         update_client_db(self.cliente)
 
         insert_transaction_db({
@@ -1527,6 +2037,7 @@ class CuotaScreen(Screen):
         })
 
         refresh_memory_from_db()
+        App.get_running_app().request_auto_sync()
         show_popup("Transacción registrada", "Registro guardado correctamente.")
         Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.7)
 
@@ -1767,6 +2278,7 @@ class NuevoClienteScreen(Screen):
             "ultimo_tipo": "Pendiente por cobrar",
             "proximo_cobro": iso_today(),
             "ultima_fecha_pago": "",
+            "synced": 0,
             "codeudor_documento": self.documento_codeudor.text.strip(),
             "codeudor_nombre": self.nombre_codeudor.text.strip(),
             "codeudor_movil": self.movil_codeudor.text.strip(),
@@ -1787,6 +2299,7 @@ class NuevoClienteScreen(Screen):
         })
 
         refresh_memory_from_db()
+        App.get_running_app().request_auto_sync()
         show_popup("Cliente creado", "Cliente y crédito activados correctamente.\nEl desembolso fue descontado de caja.")
         Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.8)
 
@@ -1900,8 +2413,10 @@ class EditarClienteScreen(Screen):
         self.cliente["estado"] = "pendiente"
         self.cliente["ultimo_tipo"] = "Cliente y crédito actualizado"
 
+        self.cliente["synced"] = 0
         update_client_db(self.cliente)
         refresh_memory_from_db()
+        App.get_running_app().request_auto_sync()
         show_popup("Cambios guardados", "Cliente y préstamo actualizados correctamente.")
         Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.7)
 
@@ -2001,6 +2516,7 @@ class MovimientosScreen(Screen):
             "synced": 0,
         })
         refresh_memory_from_db()
+        App.get_running_app().request_auto_sync()
         self.valor.text = ""
         self.obs.text = ""
         self.concepto.text = "Seleccione concepto"
@@ -2101,14 +2617,14 @@ class ResumenScreen(Screen):
         cloud.bind(on_release=lambda *_: self.simulate_cloud_upload())
         row2.add_widget(cloud)
 
-        row3 = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
-        clear = PillButton("Limpiar Todo", bg_color=DANGER)
-        clear.bind(on_release=lambda *_: self.confirm_clear())
-        row3.add_widget(clear)
+        row_pdf = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
+        pdf_btn = PillButton("Generar PDF", bg_color=SUCCESS)
+        pdf_btn.bind(on_release=lambda *_: self.generate_pdf())
+        row_pdf.add_widget(pdf_btn)
 
         actions.add_widget(row1)
         actions.add_widget(row2)
-        actions.add_widget(row3)
+        actions.add_widget(row_pdf)
         content.add_widget(actions)
 
         scroll.add_widget(content)
@@ -2123,16 +2639,37 @@ class ResumenScreen(Screen):
         self.build()
         show_popup("Datos limpiados", "La base local fue limpiada correctamente.")
 
+    def generate_pdf(self):
+        try:
+            pdf_path = generate_daily_pdf_report()
+            show_popup(
+                "PDF generado",
+                f"Reporte creado correctamente.\n\nRuta:\n{pdf_path}",
+                height=300,
+            )
+        except Exception as error:
+            show_popup("Error PDF", f"No se pudo generar el PDF.\n{error}", height=260)
+
     def simulate_cloud_upload(self):
-        self.sync_status = "Enviando datos a la nube..."
+        self.sync_status = "Sincronizando..."
         self.build()
 
         def complete_sync(*_):
-            mark_all_as_synced()
-            self.sync_status = "Sincronizado correctamente"
-            self.build()
-            show_popup("Carga completa", "Datos enviados a la nube correctamente.\nModo online simulado.")
-        Clock.schedule_once(complete_sync, 1.2)
+            if supabase_configured():
+                ok, msg = sync_all_to_cloud(silent=False)
+                if ok:
+                    self.sync_status = "Sincronizado correctamente"
+                    self.build()
+                    show_popup("Carga completa", "Datos enviados a Supabase correctamente.")
+                else:
+                    self.sync_status = "Pendiente"
+                    self.build()
+                    show_popup("Sincronización pendiente", f"No se pudo sincronizar ahora.\n{msg}")
+            else:
+                self.sync_status = "Supabase no configurado"
+                self.build()
+                show_popup("Supabase no configurado", "Debes pegar SUPABASE_URL, SUPABASE_ANON_KEY y COBRADOR_ID en main.py.")
+        Clock.schedule_once(complete_sync, 0.5)
 
 
 # ============================================================
@@ -2181,6 +2718,18 @@ class CobrosV12App(App):
     def on_start(self):
         print("Cobros V12 iniciado correctamente.")
         print("Base de datos:", get_db_path())
+        print("Supabase configurado:", supabase_configured())
+        Clock.schedule_once(lambda *_: self.request_auto_sync(), 3)
+        Clock.schedule_interval(lambda *_: self.request_auto_sync(), SYNC_INTERVAL_SECONDS)
+
+    def request_auto_sync(self):
+        if not supabase_configured():
+            return
+        Clock.schedule_once(lambda *_: self._do_auto_sync(), 0.2)
+
+    def _do_auto_sync(self):
+        ok, msg = sync_all_to_cloud(silent=True)
+        print("AUTO SYNC:", ok, msg)
 
     def go(self, screen_name):
         self.sm.current = screen_name
