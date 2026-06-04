@@ -802,6 +802,17 @@ def init_database():
     ]:
         ensure_column(cursor, "movimientos_caja", name, definition)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS eliminados (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entidad TEXT NOT NULL,
+            entidad_id INTEGER NOT NULL,
+            cobrador_id TEXT,
+            synced INTEGER NOT NULL DEFAULT 0,
+            deleted_at TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -963,13 +974,95 @@ def update_client_db(cliente):
     conn.close()
 
 
+def mark_deleted_local(entidad, entidad_id):
+    """
+    Guarda una marca local de eliminación para que Supabase no restaure
+    registros que el usuario ya borró.
+    """
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO eliminados (entidad, entidad_id, cobrador_id, synced, deleted_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            entidad,
+            int(entidad_id),
+            COBRADOR_ID if "COBRADOR_ID" in globals() else "",
+            0,
+            now_text(),
+        ))
+
+        conn.commit()
+        conn.close()
+    except Exception as error:
+        print("ERROR mark_deleted_local:", error)
+
+
+def get_deleted_ids(entidad):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT entidad_id FROM eliminados WHERE entidad = ?", (entidad,))
+        ids = {int(row[0]) for row in cursor.fetchall()}
+        conn.close()
+        return ids
+    except Exception:
+        return set()
+
+
+def mark_deleted_synced(entidad, entidad_id):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE eliminados SET synced = 1
+            WHERE entidad = ? AND entidad_id = ?
+        """, (entidad, int(entidad_id)))
+        conn.commit()
+        conn.close()
+    except Exception as error:
+        print("ERROR mark_deleted_synced:", error)
+
+
 def delete_client_db(cliente_id):
+    """
+    Elimina un cliente/préstamo localmente, corrige caja y marca el registro
+    como eliminado para que no vuelva a descargarse desde Supabase.
+    """
+    cliente = get_client_by_id(cliente_id)
+
     conn = get_connection()
     cursor = conn.cursor()
+
+    if cliente:
+        nombre_cliente = str(cliente.get("nombre", "")).strip()
+        valor_credito = int(cliente.get("valor_credito") or 0)
+
+        cursor.execute("""
+            DELETE FROM movimientos_caja
+            WHERE tipo = 'Egreso'
+              AND concepto = 'Desembolso préstamo'
+              AND valor = ?
+              AND observaciones LIKE ?
+        """, (valor_credito, f"%{nombre_cliente}%"))
+
+        if cursor.rowcount == 0:
+            cursor.execute("""
+                DELETE FROM movimientos_caja
+                WHERE tipo = 'Egreso'
+                  AND concepto = 'Desembolso préstamo'
+                  AND valor = ?
+            """, (valor_credito,))
+
     cursor.execute("DELETE FROM transacciones WHERE cliente_id = ?", (int(cliente_id),))
     cursor.execute("DELETE FROM clientes WHERE id = ?", (int(cliente_id),))
+
     conn.commit()
     conn.close()
+
+    mark_deleted_local("cliente", int(cliente_id))
 
 
 def get_client_by_id(cliente_id):
@@ -1205,6 +1298,12 @@ def pull_clients_from_cloud():
     if not rows:
         return True, "Sin clientes en nube"
 
+    deleted_client_ids = get_deleted_ids("cliente")
+    rows = [r for r in rows if int(r.get("id")) not in deleted_client_ids]
+
+    if not rows:
+        return True, "Clientes de nube ya estaban eliminados localmente"
+
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -1263,6 +1362,12 @@ def pull_transactions_from_cloud():
     if not rows:
         return True, "Sin transacciones en nube"
 
+    deleted_client_ids = get_deleted_ids("cliente")
+    rows = [r for r in rows if not r.get("cliente_id") or int(r.get("cliente_id")) not in deleted_client_ids]
+
+    if not rows:
+        return True, "Transacciones de clientes eliminados omitidas"
+
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -1318,6 +1423,81 @@ def pull_movements_from_cloud():
     conn.commit()
     conn.close()
     return True, f"Movimientos descargados: {len(rows)}"
+
+
+def supabase_delete_where(table_name, query_filter):
+    """
+    Ejecuta DELETE en Supabase usando filtros REST.
+    """
+    if not supabase_configured():
+        return False, "Supabase no configurado"
+
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{table_name}?{query_filter}"
+
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+    request = urllib.request.Request(
+        url=url,
+        headers=headers,
+        method="DELETE",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=SYNC_TIMEOUT_SECONDS) as response:
+            status = response.getcode()
+            if 200 <= status < 300:
+                return True, "OK"
+            return False, f"HTTP {status}"
+    except urllib.error.HTTPError as error:
+        try:
+            detail = error.read().decode("utf-8")
+        except Exception:
+            detail = str(error)
+        return False, f"HTTPError {error.code}: {detail}"
+    except Exception as error:
+        return False, str(error)
+
+
+def delete_remote_client_bundle(cliente):
+    """
+    Elimina en Supabase el cliente, sus transacciones y el egreso de desembolso.
+    """
+    if not cliente or not supabase_configured():
+        return False, "Supabase no configurado o cliente vacío"
+
+    cliente_id = int(cliente.get("id"))
+    valor_credito = int(cliente.get("valor_credito") or 0)
+
+    results = []
+
+    results.append(supabase_delete_where(
+        "transacciones",
+        f"cliente_id=eq.{cliente_id}&cobrador_id=eq.{COBRADOR_ID}"
+    ))
+
+    results.append(supabase_delete_where(
+        "movimientos_caja",
+        f"cobrador_id=eq.{COBRADOR_ID}&tipo=eq.Egreso&valor=eq.{valor_credito}"
+    ))
+
+    results.append(supabase_delete_where(
+        "clientes",
+        f"id=eq.{cliente_id}&cobrador_id=eq.{COBRADOR_ID}"
+    ))
+
+    ok = all(item[0] for item in results)
+    msg = " | ".join(item[1] for item in results)
+
+    if ok:
+        mark_deleted_synced("cliente", cliente_id)
+
+    return ok, msg
+
 
 
 def pull_all_from_cloud():
@@ -2001,13 +2181,29 @@ class GestionClienteScreen(Screen):
         confirm_popup("Eliminar cliente", f"¿Eliminar a {self.cliente.get('nombre', 'este cliente')}?\nTambién se borrarán sus transacciones.", self.delete_client)
 
     def delete_client(self):
+        cliente_eliminado = dict(self.cliente) if self.cliente else None
+
+        # 1. Intentar eliminar primero en Supabase para que no se restaure.
+        try:
+            if cliente_eliminado and supabase_configured():
+                ok, msg = delete_remote_client_bundle(cliente_eliminado)
+                print("DELETE REMOTE:", ok, msg)
+        except Exception as error:
+            print("ERROR DELETE REMOTE:", error)
+
+        # 2. Eliminar en SQLite local y corregir caja.
         delete_client_db(self.cliente.get("id"))
         refresh_memory_from_db()
-        show_popup("Cliente eliminado", "El cliente fue eliminado correctamente.")
+
+        # 3. Limpiar selección y volver a la lista.
+        self.app_ref.selected_client = None
+
+        show_popup(
+            "Cliente eliminado",
+            "El cliente, sus transacciones y el egreso del préstamo fueron eliminados correctamente."
+        )
         Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.7)
 
-
-# ============================================================
 # COBRO
 # ============================================================
 
