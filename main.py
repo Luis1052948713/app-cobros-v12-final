@@ -24,6 +24,7 @@ import sqlite3
 import json
 import urllib.request
 import urllib.error
+import urllib.parse
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -42,6 +43,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 from kivy.uix.togglebutton import ToggleButton
+from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 
@@ -1028,8 +1030,12 @@ def mark_deleted_synced(entidad, entidad_id):
 
 def delete_client_db(cliente_id):
     """
-    Elimina un cliente/préstamo localmente, corrige caja y marca el registro
-    como eliminado para que no vuelva a descargarse desde Supabase.
+    Elimina un cliente/préstamo localmente y corrige completamente la caja.
+
+    Además de borrar el cliente y sus transacciones, elimina movimientos de caja
+    relacionados con ese cliente, especialmente:
+    - Egreso automático de desembolso del préstamo.
+    - Movimientos cuya observación contenga el nombre del cliente.
     """
     cliente = get_client_by_id(cliente_id)
 
@@ -1040,28 +1046,33 @@ def delete_client_db(cliente_id):
         nombre_cliente = str(cliente.get("nombre", "")).strip()
         valor_credito = int(cliente.get("valor_credito") or 0)
 
+        # 1. Eliminar movimientos vinculados por observación con nombre del cliente.
+        # Esto cubre el desembolso y cualquier movimiento manual donde se haya escrito el nombre.
+        if nombre_cliente:
+            cursor.execute("""
+                DELETE FROM movimientos_caja
+                WHERE observaciones LIKE ?
+            """, (f"%{nombre_cliente}%",))
+
+        # 2. Eliminar egreso automático de desembolso por concepto y valor.
+        # Esto cubre versiones donde la observación no quedó completa.
         cursor.execute("""
             DELETE FROM movimientos_caja
             WHERE tipo = 'Egreso'
               AND concepto = 'Desembolso préstamo'
               AND valor = ?
-              AND observaciones LIKE ?
-        """, (valor_credito, f"%{nombre_cliente}%"))
+        """, (valor_credito,))
 
-        if cursor.rowcount == 0:
-            cursor.execute("""
-                DELETE FROM movimientos_caja
-                WHERE tipo = 'Egreso'
-                  AND concepto = 'Desembolso préstamo'
-                  AND valor = ?
-            """, (valor_credito,))
-
+    # 3. Eliminar transacciones del cliente.
     cursor.execute("DELETE FROM transacciones WHERE cliente_id = ?", (int(cliente_id),))
+
+    # 4. Eliminar cliente/préstamo.
     cursor.execute("DELETE FROM clientes WHERE id = ?", (int(cliente_id),))
 
     conn.commit()
     conn.close()
 
+    # 5. Marcar eliminado para que no vuelva a descargarse desde Supabase en este celular.
     mark_deleted_local("cliente", int(cliente_id))
 
 
@@ -1425,6 +1436,20 @@ def pull_movements_from_cloud():
     return True, f"Movimientos descargados: {len(rows)}"
 
 
+def rest_value(value):
+    """
+    Codifica un valor para filtros REST de Supabase/PostgREST.
+    """
+    return urllib.parse.quote(str(value or ""), safe="")
+
+
+def rest_like(value):
+    """
+    Codifica un valor para filtro ilike de PostgREST.
+    """
+    return urllib.parse.quote(f"*{value or ''}*", safe="")
+
+
 def supabase_delete_where(table_name, query_filter):
     """
     Ejecuta DELETE en Supabase usando filtros REST.
@@ -1465,26 +1490,41 @@ def supabase_delete_where(table_name, query_filter):
 
 def delete_remote_client_bundle(cliente):
     """
-    Elimina en Supabase el cliente, sus transacciones y el egreso de desembolso.
+    Elimina en Supabase:
+    - cliente
+    - transacciones del cliente
+    - movimientos de caja relacionados con el cliente
+    - egreso automático del desembolso
     """
     if not cliente or not supabase_configured():
         return False, "Supabase no configurado o cliente vacío"
 
     cliente_id = int(cliente.get("id"))
     valor_credito = int(cliente.get("valor_credito") or 0)
+    nombre_cliente = str(cliente.get("nombre", "")).strip()
 
     results = []
 
+    # 1. Borrar transacciones asociadas al cliente.
     results.append(supabase_delete_where(
         "transacciones",
         f"cliente_id=eq.{cliente_id}&cobrador_id=eq.{COBRADOR_ID}"
     ))
 
+    # 2. Borrar movimientos cuya observación contenga el nombre del cliente.
+    if nombre_cliente:
+        results.append(supabase_delete_where(
+            "movimientos_caja",
+            f"cobrador_id=eq.{COBRADOR_ID}&observaciones=ilike.{rest_like(nombre_cliente)}"
+        ))
+
+    # 3. Borrar egreso automático por desembolso del préstamo.
     results.append(supabase_delete_where(
         "movimientos_caja",
-        f"cobrador_id=eq.{COBRADOR_ID}&tipo=eq.Egreso&valor=eq.{valor_credito}"
+        f"cobrador_id=eq.{COBRADOR_ID}&tipo=eq.Egreso&concepto=eq.{rest_value('Desembolso préstamo')}&valor=eq.{valor_credito}"
     ))
 
+    # 4. Borrar cliente.
     results.append(supabase_delete_where(
         "clientes",
         f"id=eq.{cliente_id}&cobrador_id=eq.{COBRADOR_ID}"
@@ -2030,11 +2070,11 @@ class ClientesScreen(Screen):
         self.app_ref = App.get_running_app()
         refresh_memory_from_db()
 
-        # Si el celular esta nuevo y no tiene SQLite local,
-        # intenta restaurar automaticamente desde Supabase.
+        # Si el celular está nuevo y no tiene SQLite local,
+        # intenta restaurar automáticamente desde Supabase.
         if not CLIENTES and supabase_configured():
             ok, msg = pull_all_from_cloud()
-            print("RESTORE FROM CLOUD:", ok, msg)
+            print("RESTORE FROM CLOUD CLIENTES:", ok, msg)
             refresh_memory_from_db()
 
         self.nav_container.clear_widgets()
@@ -2227,21 +2267,73 @@ class CuotaScreen(Screen):
             return
 
         scroll = ScrollView()
-        content = BoxLayout(orientation="vertical", padding=[dp(12), dp(12), dp(12), dp(20)], spacing=dp(12), size_hint_y=None)
+        content = BoxLayout(
+            orientation="vertical",
+            padding=[dp(12), dp(12), dp(12), dp(24)],
+            spacing=dp(12),
+            size_hint_y=None,
+        )
         content.bind(minimum_height=content.setter("height"))
 
-        summary = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(190), padding=dp(12), spacing=dp(6))
-        summary.add_widget(Label(text=self.cliente.get("nombre", "").lower(), color=TEXT, bold=True, font_size="18sp", halign="left", size_hint_y=None, height=dp(30)))
-        summary.add_widget(DetailRow("Teléfono", self.cliente.get("telefono", "")))
+        # ====================================================
+        # TARJETA RESUMEN DEL CLIENTE
+        # ====================================================
+        summary = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(222),
+            padding=[dp(14), dp(12), dp(14), dp(12)],
+            spacing=dp(8),
+        )
+        summary.bg_color = (0.98, 0.99, 1, 1)
+
+        name_lbl = Label(
+            text=self.cliente.get("nombre", "").title(),
+            color=TEXT,
+            bold=True,
+            font_size="18sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(34),
+        )
+        name_lbl.bind(size=lambda instance, value: setattr(instance, "text_size", (value[0], None)))
+        summary.add_widget(name_lbl)
+
+        summary.add_widget(DetailRow("Teléfono", self.cliente.get("telefono", "") or "No registrado"))
         summary.add_widget(DetailRow("Pagadas", str(self.cliente.get("pagadas", 0))))
         summary.add_widget(DetailRow("Pendientes", str(self.cliente.get("pendientes", 0))))
         summary.add_widget(DetailRow("Tipo Cobro", self.cliente.get("cobro", "Diario")))
-        summary.add_widget(DetailRow("Saldo", money(self.cliente.get("saldo", 0))))
+        summary.add_widget(DetailRow("Saldo Actual", money(self.cliente.get("saldo", 0))))
+
         content.add_widget(summary)
 
-        action = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(132), padding=dp(12), spacing=dp(8))
-        action.add_widget(FieldLabel("Tipo de transacción"))
-        row = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint_y=None, height=dp(44))
+        # ====================================================
+        # TARJETA TIPO DE TRANSACCIÓN
+        # ====================================================
+        action = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(166),
+            padding=[dp(14), dp(12), dp(14), dp(12)],
+            spacing=dp(10),
+        )
+        action.bg_color = (0.98, 0.99, 1, 1)
+
+        action_title = Label(
+            text="Resultado del cobro",
+            color=TEXT,
+            bold=True,
+            font_size="14sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(24),
+        )
+        action_title.bind(size=lambda instance, value: setattr(instance, "text_size", (value[0], None)))
+        action.add_widget(action_title)
+
+        row = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint_y=None, height=dp(48))
         self.tipo_buttons = []
 
         for index, option in enumerate(["Cuota", "Aporte", "No Pago", "Siguiente Día"]):
@@ -2250,32 +2342,76 @@ class CuotaScreen(Screen):
                 group="tipo_cuota",
                 state="down" if index == 0 else "normal",
                 background_normal="",
-                background_color=GOLD if index == 0 else (0.88, 0.90, 0.94, 1),
-                color=DARK,
+                background_color=SUCCESS if index == 0 else (0.88, 0.90, 0.94, 1),
+                color=WHITE if index == 0 else DARK,
                 font_size="10sp",
                 bold=True,
+                halign="center",
+                valign="middle",
             )
+            btn.bind(size=lambda instance, value: setattr(instance, "text_size", value))
             btn.bind(on_release=self.update_tipo_colors)
             self.tipo_buttons.append(btn)
             row.add_widget(btn)
 
         action.add_widget(row)
 
-        self.warning = Label(text="Seleccione el resultado del cobro.", color=MUTED, font_size="11sp", halign="left", valign="middle", size_hint_y=None, height=dp(28))
+        self.warning = Label(
+            text="Seleccione si el cliente pagó, hizo aporte, no pagó o queda para el siguiente día.",
+            color=MUTED,
+            font_size="11sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(38),
+        )
         self.warning.bind(size=lambda instance, value: setattr(instance, "text_size", value))
         action.add_widget(self.warning)
+
         content.add_widget(action)
 
-        self.apply_payment_rules()
+        # ====================================================
+        # FORMULARIO DE PAGO
+        # ====================================================
+        form = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(500),
+            padding=[dp(14), dp(12), dp(14), dp(14)],
+            spacing=dp(10),
+        )
+        form.bg_color = WHITE
 
-        form = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(360), padding=dp(12), spacing=dp(8))
+        form_title = Label(
+            text="Detalle de la transacción",
+            color=TEXT,
+            bold=True,
+            font_size="14sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(24),
+        )
+        form_title.bind(size=lambda instance, value: setattr(instance, "text_size", (value[0], None)))
+        form.add_widget(form_title)
 
         self.valor_cuota = MoneyTextInput(text=format_thousands(self.cliente.get("cuota", 0)), readonly=True)
         self.saldo_actual = MoneyTextInput(text=format_thousands(self.cliente.get("saldo", 0)), readonly=True)
         self.valor_pagar = MoneyTextInput(text=format_thousands(self.cliente.get("cuota", 0)))
         self.numero_cuotas = AppTextInput(text="1")
-        self.nuevo_saldo = MoneyTextInput(text=format_thousands(max(int(self.cliente.get("saldo", 0)) - int(self.cliente.get("cuota", 0)), 0)), readonly=True)
-        self.metodo_pago = Spinner(text="Efectivo", values=["Efectivo", "Transferencia"], size_hint_y=None, height=dp(44), background_normal="", background_color=WHITE, color=TEXT)
+        self.nuevo_saldo = MoneyTextInput(
+            text=format_thousands(max(int(self.cliente.get("saldo", 0)) - int(self.cliente.get("cuota", 0)), 0)),
+            readonly=True,
+        )
+        self.metodo_pago = Spinner(
+            text="Efectivo",
+            values=["Efectivo", "Transferencia"],
+            size_hint_y=None,
+            height=dp(42),
+            background_normal="",
+            background_color=WHITE,
+            color=TEXT,
+        )
 
         for label, widget in [
             ("Valor Cuota", self.valor_cuota),
@@ -2285,10 +2421,7 @@ class CuotaScreen(Screen):
             ("Nuevo Saldo", self.nuevo_saldo),
             ("Método de Pago", self.metodo_pago),
         ]:
-            box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(48), spacing=dp(3))
-            box.add_widget(FieldLabel(label))
-            box.add_widget(widget)
-            form.add_widget(box)
+            form.add_widget(self.field_container(label, widget, highlight=(label == "Nuevo Saldo")))
 
         self.valor_pagar.bind(text=lambda *_: self.recalculate_balance())
         self.numero_cuotas.bind(text=lambda *_: self.recalculate_balance())
@@ -2301,11 +2434,39 @@ class CuotaScreen(Screen):
         scroll.add_widget(content)
         self.root.add_widget(scroll)
 
+        self.apply_payment_rules()
+
+    def field_container(self, label, widget, highlight=False):
+        box = BoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(66),
+            spacing=dp(5),
+            padding=[0, dp(2), 0, 0],
+        )
+
+        lbl = FieldLabel(label)
+        lbl.size_hint_y = None
+        lbl.height = dp(18)
+        lbl.color = BLUE if highlight else MUTED
+        lbl.bold = True if highlight else False
+        box.add_widget(lbl)
+
+        try:
+            widget.size_hint_y = None
+            widget.height = dp(42)
+            if highlight:
+                widget.background_color = (1.0, 0.95, 0.78, 1)
+                widget.foreground_color = TEXT
+        except Exception:
+            pass
+
+        box.add_widget(widget)
+        return box
+
     def apply_payment_rules(self):
         estado = self.cliente.get("estado", "pendiente")
 
-        # Primero normalizamos todos los botones para evitar que "Cuota"
-        # quede seleccionado internamente cuando el sistema escoge Aporte.
         for btn in self.tipo_buttons:
             btn.disabled = False
             btn.state = "normal"
@@ -2350,29 +2511,53 @@ class CuotaScreen(Screen):
                     btn.color = DARK
 
         else:
-            # Cliente pendiente normal: por defecto queda Cuota.
             for btn in self.tipo_buttons:
                 if btn.text == "Cuota":
                     btn.state = "down"
-                    btn.background_color = GOLD
+                    btn.background_color = SUCCESS
+                    btn.color = WHITE
                 else:
                     btn.state = "normal"
                     btn.background_color = (0.88, 0.90, 0.94, 1)
+                    btn.color = DARK
 
     def update_tipo_colors(self, *_):
+        selected = self.selected_tipo()
+
         for btn in self.tipo_buttons:
             if btn.disabled:
                 continue
-            btn.background_color = GOLD if btn.state == "down" else (0.88, 0.90, 0.94, 1)
-            btn.color = DARK
+
+            if btn.state == "down":
+                if btn.text == "Cuota":
+                    btn.background_color = SUCCESS
+                    btn.color = WHITE
+                    self.warning.text = "Se registrará el pago normal de la cuota."
+                    self.warning.color = SUCCESS
+                elif btn.text == "Aporte":
+                    btn.background_color = GOLD
+                    btn.color = DARK
+                    self.warning.text = "Se registrará un aporte adicional al saldo."
+                    self.warning.color = MUTED
+                elif btn.text == "No Pago":
+                    btn.background_color = DANGER
+                    btn.color = WHITE
+                    self.warning.text = "El cliente quedará marcado en rojo como no pago."
+                    self.warning.color = DANGER
+                else:
+                    btn.background_color = (0.45, 0.48, 0.55, 1)
+                    btn.color = WHITE
+                    self.warning.text = "El cliente quedará pendiente para el siguiente día."
+                    self.warning.color = MUTED
+            else:
+                btn.background_color = (0.88, 0.90, 0.94, 1)
+                btn.color = DARK
 
     def selected_tipo(self):
         for btn in self.tipo_buttons:
             if not btn.disabled and btn.state == "down":
                 return btn.text
 
-        # Seguridad adicional: si por estado visual quedó bloqueado,
-        # usar Aporte cuando sea el único permitido.
         estado = self.cliente.get("estado", "pendiente")
         if estado in ("pagado", "aporte", "no_pago"):
             return "Aporte"
@@ -2395,9 +2580,11 @@ class CuotaScreen(Screen):
         if estado_actual in ("pagado", "aporte") and tipo != "Aporte":
             show_popup("Cobro bloqueado", "Este cliente ya está en verde.\nSolo se permite registrar Aporte.")
             return
+
         if estado_actual == "no_pago" and tipo == "Cuota":
             show_popup("Cobro bloqueado", "Este cliente está en rojo.\nSi entrega dinero, registre Aporte.")
             return
+
         if tipo in ("Cuota", "Aporte") and pago <= 0:
             show_popup("Valor inválido", "Ingrese un valor mayor a cero.")
             return
@@ -2410,16 +2597,19 @@ class CuotaScreen(Screen):
             self.cliente["ultimo_tipo"] = "Cuota pagada"
             self.cliente["ultima_fecha_pago"] = iso_today()
             self.cliente["proximo_cobro"] = next_due_date(self.cliente.get("cobro", "Diario"))
+
         elif tipo == "Aporte":
             self.cliente["saldo"] = max(int(self.cliente.get("saldo", 0)) - pago, 0)
             self.cliente["estado"] = "aporte"
             self.cliente["ultimo_tipo"] = "Aporte"
             self.cliente["ultima_fecha_pago"] = iso_today()
             self.cliente["proximo_cobro"] = next_due_date(self.cliente.get("cobro", "Diario"))
+
         elif tipo == "No Pago":
             pago = 0
             self.cliente["estado"] = "no_pago"
             self.cliente["ultimo_tipo"] = "No pago"
+
         elif tipo == "Siguiente Día":
             pago = 0
             self.cliente["estado"] = "siguiente"
@@ -2443,6 +2633,8 @@ class CuotaScreen(Screen):
         App.get_running_app().request_auto_sync()
         show_popup("Transacción registrada", "Registro guardado correctamente.")
         Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.7)
+
+
 
 
 # ============================================================
@@ -3081,6 +3273,7 @@ class ResumenScreen(Screen):
 
 class CobrosV12App(App):
     selected_client = None
+    cloud_restore_done = False
 
     def build(self):
         self.title = "Cobros V12 Mobile"
@@ -3118,10 +3311,33 @@ class CobrosV12App(App):
         if hasattr(self, "sm") and platform not in ("android", "ios"):
             self.sm.width = min(Window.width, dp(430))
 
+    def restore_from_cloud_once(self):
+        """
+        Descarga una vez los datos de Supabase al iniciar la app.
+        Sirve para celulares nuevos o reinstalaciones.
+        """
+        if self.cloud_restore_done:
+            return
+
+        self.cloud_restore_done = True
+
+        if not supabase_configured():
+            print("RESTORE FROM CLOUD: Supabase no configurado")
+            return
+
+        try:
+            ok, msg = pull_all_from_cloud()
+            print("RESTORE FROM CLOUD:", ok, msg)
+        except Exception as error:
+            print("ERROR RESTORE FROM CLOUD:", error)
+
+
     def on_start(self):
         print("Cobros V12 iniciado correctamente.")
         print("Base de datos:", get_db_path())
         print("Supabase configurado:", supabase_configured())
+
+        Clock.schedule_once(lambda *_: self.restore_from_cloud_once(), 1)
         Clock.schedule_once(lambda *_: self.request_auto_sync(), 3)
         Clock.schedule_interval(lambda *_: self.request_auto_sync(), SYNC_INTERVAL_SECONDS)
 
