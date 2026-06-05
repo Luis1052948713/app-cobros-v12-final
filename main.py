@@ -3409,7 +3409,6 @@ class NuevoClienteScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        self.step = 1
         self.build()
 
     def calculate_credit(self):
@@ -3427,68 +3426,160 @@ class NuevoClienteScreen(Screen):
         self.root.clear_widgets()
         self.root.add_widget(Header("Nuevo Cliente y Crédito"))
 
-        body = BoxLayout(orientation="vertical", padding=[dp(12), dp(12), dp(12), dp(8)], spacing=dp(10))
+        scroll = ScrollView(
+            do_scroll_x=False,
+            bar_width=dp(4),
+            scroll_type=["bars", "content"],
+        )
 
-        body.add_widget(self.progress_card())
+        content = BoxLayout(
+            orientation="vertical",
+            padding=[dp(12), dp(14), dp(12), dp(100)],
+            spacing=dp(14),
+            size_hint_y=None,
+        )
+        content.bind(minimum_height=content.setter("height"))
 
-        scroll = ScrollView(size_hint_y=1)
-        card_wrap = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(10))
-        card_wrap.bind(minimum_height=card_wrap.setter("height"))
+        intro = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(86),
+            padding=[dp(14), dp(10), dp(14), dp(10)],
+            spacing=dp(4),
+        )
+        intro.bg_color = (0.94, 0.97, 1, 1)
 
-        if self.step == 1:
-            card_wrap.add_widget(self.form_card("1", "DATOS DEL CLIENTE", [
-                ("Documento", self.documento),
-                ("Nombre", self.nombre),
-                ("Móvil +57", self.movil),
-                ("Dirección", self.direccion),
-            ], height=dp(382)))
-        elif self.step == 2:
-            card_wrap.add_widget(self.form_card("2", "DATOS DEL CRÉDITO", [
-                ("Producto", self.producto),
-                ("Valor Crédito", self.valor_credito),
-                ("Interés %", self.interes),
-                ("Número de Cuotas", self.numero_cuotas),
-                ("Total Crédito", self.total_credito),
-                ("Valor Cuota Calculada", self.valor_cuota),
-                ("Cobro", self.cobro),
-            ], height=dp(536)))
-        elif self.step == 3:
-            card_wrap.add_widget(self.form_card("3", "CODEUDOR", [
-                ("Documento Codeudor", self.documento_codeudor),
-                ("Nombre Codeudor", self.nombre_codeudor),
-                ("Móvil Codeudor", self.movil_codeudor),
-            ], height=dp(322)))
-        else:
-            card_wrap.add_widget(self.form_card("4", "SEGURO", [
-                ("Valor Seguro", self.valor_seguro),
-                ("Beneficiario", self.beneficiario),
-                ("Observaciones", self.obs_seguro),
-            ], height=dp(370)))
+        intro_title = Label(
+            text="Registro completo",
+            color=TEXT,
+            bold=True,
+            font_size="16sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(30),
+        )
+        intro_title.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
 
-        scroll.add_widget(card_wrap)
-        body.add_widget(scroll)
+        intro_text = Label(
+            text="Complete todos los datos y guarde el cliente al final.",
+            color=MUTED,
+            font_size="11sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(30),
+        )
+        intro_text.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
 
-        nav = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(52), spacing=dp(8))
+        intro.add_widget(intro_title)
+        intro.add_widget(intro_text)
+        content.add_widget(intro)
 
-        back = SmallButton("Atrás", bg_color=(0.45, 0.48, 0.55, 1))
-        back.disabled = self.step == 1
-        back.bind(on_release=lambda *_: self.previous_step())
+        content.add_widget(
+            self.form_card(
+                "1",
+                "DATOS DEL CLIENTE",
+                [
+                    ("Documento", self.documento),
+                    ("Nombre", self.nombre),
+                    ("Móvil +57", self.movil),
+                    ("Dirección", self.direccion),
+                ],
+                height=dp(382),
+            )
+        )
 
-        if self.step < 4:
-            next_btn = SmallButton("Siguiente", bg_color=BLUE)
-            next_btn.bind(on_release=lambda *_: self.next_step())
-        else:
-            next_btn = SmallButton("Crear Cliente", bg_color=SUCCESS)
-            next_btn.bind(on_release=lambda *_: self.create_client())
+        content.add_widget(
+            self.form_card(
+                "2",
+                "DATOS DEL CRÉDITO",
+                [
+                    ("Producto", self.producto),
+                    ("Valor Crédito", self.valor_credito),
+                    ("Interés %", self.interes),
+                    ("Número de Cuotas", self.numero_cuotas),
+                    ("Total Crédito", self.total_credito),
+                    ("Valor Cuota Calculada", self.valor_cuota),
+                    ("Cobro", self.cobro),
+                ],
+                height=dp(536),
+            )
+        )
 
-        nav.add_widget(back)
-        nav.add_widget(next_btn)
-        body.add_widget(nav)
+        content.add_widget(
+            self.form_card(
+                "3",
+                "CODEUDOR (OPCIONAL)",
+                [
+                    ("Documento Codeudor", self.documento_codeudor),
+                    ("Nombre Codeudor", self.nombre_codeudor),
+                    ("Móvil Codeudor", self.movil_codeudor),
+                ],
+                height=dp(322),
+            )
+        )
 
-        self.root.add_widget(body)
+        content.add_widget(
+            self.form_card(
+                "4",
+                "SEGURO (OPCIONAL)",
+                [
+                    ("Valor Seguro", self.valor_seguro),
+                    ("Beneficiario", self.beneficiario),
+                    ("Observaciones", self.obs_seguro),
+                ],
+                height=dp(370),
+            )
+        )
 
-        nav_container = BoxLayout(size_hint_y=None, height=dp(66))
-        nav_container.add_widget(BottomNav(self.app_ref, active="nuevo"))
+        create_button = SmallButton(
+            "Crear Cliente y Activar Crédito",
+            bg_color=SUCCESS,
+        )
+        create_button.size_hint_y = None
+        create_button.height = dp(54)
+        create_button.bind(
+            on_release=lambda *_: self.create_client()
+        )
+        content.add_widget(create_button)
+
+        for input_widget in [
+            self.documento,
+            self.nombre,
+            self.movil,
+            self.direccion,
+            self.producto,
+            self.valor_credito,
+            self.interes,
+            self.numero_cuotas,
+            self.documento_codeudor,
+            self.nombre_codeudor,
+            self.movil_codeudor,
+            self.valor_seguro,
+            self.beneficiario,
+            self.obs_seguro,
+        ]:
+            bind_scroll_to_input(scroll, input_widget)
+
+        scroll.add_widget(content)
+        self.root.add_widget(scroll)
+
+        nav_container = BoxLayout(
+            size_hint_y=None,
+            height=dp(66),
+        )
+        nav_container.add_widget(
+            BottomNav(self.app_ref, active="nuevo")
+        )
         self.root.add_widget(nav_container)
 
     def progress_card(self):
@@ -3559,8 +3650,6 @@ class NuevoClienteScreen(Screen):
 
         nombre = self.nombre.text.strip().upper()
         if not nombre:
-            self.step = 1
-            self.build()
             show_popup("Falta nombre", "Ingrese el nombre del cliente.")
             return
 
@@ -3570,9 +3659,10 @@ class NuevoClienteScreen(Screen):
         numero_cuotas = to_int(self.numero_cuotas.text, 0)
 
         if valor_credito <= 0 or total_credito <= 0 or cuota <= 0 or numero_cuotas <= 0:
-            self.step = 2
-            self.build()
-            show_popup("Datos incompletos", "Revise valor crédito, interés y número de cuotas.")
+            show_popup(
+                "Datos incompletos",
+                "Revise valor crédito, interés y número de cuotas."
+            )
             return
 
         refresh_memory_from_db()
