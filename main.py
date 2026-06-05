@@ -380,32 +380,101 @@ def get_exports_dir():
 
 
 
-def publish_pdf_to_downloads(pdf_path):
+def open_pdf_file(pdf_reference):
     """
-    Publica el PDF en la carpeta pública Descargas/CobrosV12 de Android.
+    Abre el PDF con el visor predeterminado.
 
-    Android 10 o superior:
-    usa MediaStore y no requiere acceso total al almacenamiento.
+    Android:
+    pdf_reference debe ser un URI de MediaStore.
 
-    PC:
-    conserva el archivo dentro de la carpeta reportes del proyecto.
+    Windows:
+    pdf_reference debe ser la ruta local del archivo.
+    """
+    try:
+        if platform == "android":
+            from importlib import import_module
+
+            autoclass = import_module("jnius").autoclass
+
+            PythonActivity = autoclass(
+                "org.kivy.android.PythonActivity"
+            )
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+
+            activity = PythonActivity.mActivity
+
+            uri = (
+                pdf_reference
+                if hasattr(pdf_reference, "getScheme")
+                else Uri.parse(str(pdf_reference))
+            )
+
+            intent = Intent(Intent.ACTION_VIEW)
+            intent.setDataAndType(uri, "application/pdf")
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+            chooser = Intent.createChooser(
+                intent,
+                "Abrir reporte PDF",
+            )
+            activity.startActivity(chooser)
+            return True, "PDF abierto correctamente."
+
+        # Windows
+        if os.name == "nt":
+            os.startfile(str(pdf_reference))
+            return True, "PDF abierto correctamente."
+
+        # Linux/macOS
+        import subprocess
+
+        command = (
+            ["open", str(pdf_reference)]
+            if platform == "macosx"
+            else ["xdg-open", str(pdf_reference)]
+        )
+        subprocess.Popen(command)
+        return True, "PDF abierto correctamente."
+
+    except Exception as error:
+        return False, str(error)
+
+
+def publish_pdf_to_downloads(pdf_path, open_after=True):
+    """
+    Guarda el PDF en Descargas/CobrosV12 y, opcionalmente,
+    lo abre automáticamente con el visor instalado.
+
+    Retorna:
+        display_path: ruta mostrada al usuario.
+        open_ok: indica si se pudo abrir.
+        open_message: detalle de apertura.
     """
     source = Path(pdf_path)
 
     if platform != "android":
-        return str(source)
+        open_ok = False
+        open_message = "No se intentó abrir."
+
+        if open_after:
+            open_ok, open_message = open_pdf_file(str(source))
+
+        return str(source), open_ok, open_message
 
     try:
-        # jnius solo existe dentro del APK Android.
-        # La carga dinámica evita que Pylance lo marque como importación
-        # faltante cuando el proyecto se edita o prueba en Windows.
         from importlib import import_module
 
         autoclass = import_module("jnius").autoclass
 
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        PythonActivity = autoclass(
+            "org.kivy.android.PythonActivity"
+        )
         MediaStore = autoclass("android.provider.MediaStore")
-        ContentValues = autoclass("android.content.ContentValues")
+        ContentValues = autoclass(
+            "android.content.ContentValues"
+        )
         BuildVersion = autoclass("android.os.Build$VERSION")
         Environment = autoclass("android.os.Environment")
 
@@ -413,16 +482,23 @@ def publish_pdf_to_downloads(pdf_path):
         resolver = activity.getContentResolver()
 
         values = ContentValues()
-        values.put(MediaStore.MediaColumns.DISPLAY_NAME, source.name)
-        values.put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
+        values.put(
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            source.name,
+        )
+        values.put(
+            MediaStore.MediaColumns.MIME_TYPE,
+            "application/pdf",
+        )
 
         if BuildVersion.SDK_INT >= 29:
-            public_folder = (
-                Environment.DIRECTORY_DOWNLOADS + "/CobrosV12"
-            )
             values.put(
                 MediaStore.MediaColumns.RELATIVE_PATH,
-                public_folder,
+                Environment.DIRECTORY_DOWNLOADS + "/CobrosV12",
+            )
+            values.put(
+                MediaStore.MediaColumns.IS_PENDING,
+                1,
             )
 
         uri = resolver.insert(
@@ -431,21 +507,60 @@ def publish_pdf_to_downloads(pdf_path):
         )
 
         if uri is None:
-            raise RuntimeError("Android no permitió crear el archivo.")
+            raise RuntimeError(
+                "Android no permitió crear el archivo PDF."
+            )
 
         output_stream = resolver.openOutputStream(uri)
+
         if output_stream is None:
-            raise RuntimeError("No se pudo abrir Descargas para escribir.")
+            raise RuntimeError(
+                "No se pudo abrir Descargas para escribir."
+            )
 
         output_stream.write(source.read_bytes())
         output_stream.flush()
         output_stream.close()
 
-        return "Descargas/CobrosV12/" + source.name
+        if BuildVersion.SDK_INT >= 29:
+            completed_values = ContentValues()
+            completed_values.put(
+                MediaStore.MediaColumns.IS_PENDING,
+                0,
+            )
+            resolver.update(
+                uri,
+                completed_values,
+                None,
+                None,
+            )
+
+        display_path = (
+            "Descargas/CobrosV12/" + source.name
+        )
+
+        open_ok = False
+        open_message = "PDF guardado sin abrir."
+
+        if open_after:
+            open_ok, open_message = open_pdf_file(uri)
+
+        return display_path, open_ok, open_message
 
     except Exception as error:
         print("ERROR EXPORTANDO PDF A DESCARGAS:", error)
-        return str(source)
+
+        # El PDF privado no se pierde si falla MediaStore.
+        fallback_path = str(source)
+        open_ok = False
+        open_message = str(error)
+
+        if open_after:
+            open_ok, open_message = open_pdf_file(
+                fallback_path
+            )
+
+        return fallback_path, open_ok, open_message
 
 
 
@@ -4221,19 +4336,36 @@ class ResumenScreen(Screen):
     def generate_pdf(self):
         try:
             private_pdf_path = generate_daily_pdf_report()
-            final_path = publish_pdf_to_downloads(private_pdf_path)
 
-            show_popup(
-                "PDF generado",
-                "Reporte creado correctamente.\n\n"
-                f"Ubicación:\n{final_path}",
-                height=300,
+            final_path, open_ok, open_message = (
+                publish_pdf_to_downloads(
+                    private_pdf_path,
+                    open_after=True,
+                )
             )
+
+            if open_ok:
+                # El visor ya fue abierto. No se coloca un popup encima
+                # porque podría ocultar la aplicación que muestra el PDF.
+                print(
+                    "PDF generado y abierto:",
+                    final_path,
+                )
+            else:
+                show_popup(
+                    "PDF generado",
+                    "El reporte fue guardado correctamente, "
+                    "pero no se pudo abrir automáticamente.\n\n"
+                    f"Ubicación:\n{final_path}\n\n"
+                    f"Detalle:\n{open_message}",
+                    height=360,
+                )
+
         except Exception as error:
             show_popup(
                 "Error PDF",
                 f"No se pudo generar el PDF.\n{error}",
-                height=260,
+                height=280,
             )
 
     def simulate_cloud_upload(self):
