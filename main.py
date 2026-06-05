@@ -27,6 +27,7 @@ import urllib.error
 import ssl
 import certifi
 import urllib.parse
+import threading
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -4369,25 +4370,32 @@ class ResumenScreen(Screen):
             )
 
     def simulate_cloud_upload(self):
-        self.sync_status = "Sincronizando..."
+        """
+        Inicia una sincronización manual sin bloquear la app.
+        Si no hay internet, los datos quedan guardados localmente.
+        """
+        app = App.get_running_app()
+
+        if not supabase_configured():
+            self.sync_status = "Supabase no configurado"
+            self.build()
+            show_popup(
+                "Supabase no configurado",
+                "La app seguirá funcionando offline, pero falta configurar la nube.",
+            )
+            return
+
+        self.sync_status = "Sincronizando en segundo plano..."
         self.build()
 
-        def complete_sync(*_):
-            if supabase_configured():
-                ok, msg = sync_all_to_cloud(silent=False)
-                if ok:
-                    self.sync_status = "Sincronizado correctamente"
-                    self.build()
-                    show_popup("Carga completa", "Datos sincronizados con Supabase correctamente.\nSe subieron y descargaron registros.")
-                else:
-                    self.sync_status = "Pendiente"
-                    self.build()
-                    show_popup("Sincronización pendiente", f"No se pudo sincronizar ahora.\n{msg}")
-            else:
-                self.sync_status = "Supabase no configurado"
-                self.build()
-                show_popup("Supabase no configurado", "Debes pegar SUPABASE_URL, SUPABASE_ANON_KEY y COBRADOR_ID en main.py.")
-        Clock.schedule_once(complete_sync, 0.5)
+        app.request_auto_sync(force_pull=True)
+
+        show_popup(
+            "Sincronización iniciada",
+            "La app seguirá funcionando mientras intenta sincronizar.\n"
+            "Si no hay internet, volverá a intentarlo automáticamente.",
+            height=280,
+        )
 
 
 # ============================================================
@@ -4397,6 +4405,11 @@ class ResumenScreen(Screen):
 class CobrosV12App(App):
     selected_client = None
     cloud_restore_done = False
+
+    # Estado offline-first
+    sync_in_progress = False
+    last_sync_ok = False
+    last_sync_message = "Pendiente"
 
     def build(self):
         self.title = "Cobros V12 Mobile"
@@ -4437,43 +4450,139 @@ class CobrosV12App(App):
 
     def restore_from_cloud_once(self):
         """
-        Descarga una vez los datos de Supabase al iniciar la app.
-        Sirve para celulares nuevos o reinstalaciones.
-        """
-        if self.cloud_restore_done:
-            return
+        Intenta restaurar desde Supabase sin bloquear el inicio.
 
-        self.cloud_restore_done = True
+        Si no hay internet, NO marca la restauración como completada.
+        Así volverá a intentarlo automáticamente cuando regrese la conexión.
+        """
+        if self.cloud_restore_done or self.sync_in_progress:
+            return
 
         if not supabase_configured():
             print("RESTORE FROM CLOUD: Supabase no configurado")
             return
 
-        try:
-            ok, msg = pull_all_from_cloud()
-            print("RESTORE FROM CLOUD:", ok, msg)
-        except Exception as error:
-            print("ERROR RESTORE FROM CLOUD:", error)
+        self.request_auto_sync(force_pull=True)
+
 
 
     def on_start(self):
         configure_mobile_keyboard()
+
         print("Cobros V12 iniciado correctamente.")
+        print("Modo: OFFLINE-FIRST")
         print("Base de datos:", get_db_path())
         print("Supabase configurado:", supabase_configured())
 
-        Clock.schedule_once(lambda *_: self.restore_from_cloud_once(), 1)
-        Clock.schedule_once(lambda *_: self.request_auto_sync(), 3)
-        Clock.schedule_interval(lambda *_: self.request_auto_sync(), SYNC_INTERVAL_SECONDS)
+        # La aplicación abre inmediatamente con SQLite.
+        # La nube se consulta después, sin bloquear la interfaz.
+        Clock.schedule_once(
+            lambda *_: self.restore_from_cloud_once(),
+            1.0,
+        )
 
-    def request_auto_sync(self):
+        # Primer reintento automático.
+        Clock.schedule_once(
+            lambda *_: self.request_auto_sync(),
+            5.0,
+        )
+
+        # Reintentos periódicos. Si no hay internet, no interrumpe al usuario.
+        Clock.schedule_interval(
+            lambda *_: self.request_auto_sync(),
+            SYNC_INTERVAL_SECONDS,
+        )
+
+    def request_auto_sync(self, force_pull=False):
+        """
+        Solicita sincronización en segundo plano.
+
+        La función retorna de inmediato, de modo que el usuario puede seguir
+        registrando clientes, cuotas y movimientos aunque no haya internet.
+        """
         if not supabase_configured():
+            self.last_sync_ok = False
+            self.last_sync_message = "Supabase no configurado"
             return
-        Clock.schedule_once(lambda *_: self._do_auto_sync(), 0.2)
 
-    def _do_auto_sync(self):
-        ok, msg = sync_all_to_cloud(silent=True)
-        print("AUTO SYNC:", ok, msg)
+        if self.sync_in_progress:
+            return
+
+        self.sync_in_progress = True
+
+        worker = threading.Thread(
+            target=self._do_auto_sync,
+            kwargs={"force_pull": force_pull},
+            daemon=True,
+        )
+        worker.start()
+
+    def _do_auto_sync(self, force_pull=False):
+        """
+        Ejecuta la red fuera del hilo gráfico de Kivy.
+        """
+        try:
+            # sync_all_to_cloud ya hace:
+            # 1. subir pendientes locales;
+            # 2. descargar datos de Supabase;
+            # 3. reconciliar eliminaciones.
+            ok, message = sync_all_to_cloud(silent=True)
+
+            self.last_sync_ok = bool(ok)
+            self.last_sync_message = (
+                "Sincronizado correctamente"
+                if ok
+                else "Pendiente - sin conexión"
+            )
+
+            if ok:
+                self.cloud_restore_done = True
+
+            print("AUTO SYNC:", ok, message)
+
+            Clock.schedule_once(
+                lambda *_: self._after_background_sync(ok),
+                0,
+            )
+
+        except Exception as error:
+            self.last_sync_ok = False
+            self.last_sync_message = "Pendiente - sin conexión"
+            print("AUTO SYNC OFFLINE:", error)
+
+        finally:
+            self.sync_in_progress = False
+
+    def _after_background_sync(self, ok):
+        """
+        Actualiza memoria y pantalla después de una sincronización exitosa.
+        No muestra ventanas emergentes en sincronización automática.
+        """
+        try:
+            refresh_memory_from_db()
+
+            if hasattr(self, "sm"):
+                current_screen = self.sm.current_screen
+
+                if current_screen and hasattr(
+                    current_screen,
+                    "sync_status",
+                ):
+                    current_screen.sync_status = (
+                        "Sincronizado correctamente"
+                        if ok
+                        else "Pendiente"
+                    )
+
+                if current_screen and hasattr(
+                    current_screen,
+                    "build",
+                ):
+                    current_screen.build()
+
+        except Exception as error:
+            print("ERROR REFRESH POST SYNC:", error)
+
 
     def go(self, screen_name):
         self.sm.current = screen_name
