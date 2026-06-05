@@ -28,6 +28,7 @@ import ssl
 import certifi
 import urllib.parse
 import threading
+import calendar
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -73,9 +74,11 @@ LIGHT_BG = (0.95, 0.96, 0.98, 1)
 STATUS_GREEN = (0.86, 0.98, 0.89, 1)
 STATUS_YELLOW = (1.00, 0.96, 0.78, 1)
 STATUS_RED = (1.00, 0.88, 0.88, 1)
+STATUS_PAID_OFF = (0.86, 0.94, 1.00, 1)
 STATUS_BORDER_GREEN = (0.12, 0.62, 0.32, 1)
 STATUS_BORDER_YELLOW = (0.93, 0.69, 0.13, 1)
 STATUS_BORDER_RED = (0.83, 0.18, 0.18, 1)
+STATUS_BORDER_PAID_OFF = (0.12, 0.45, 0.78, 1)
 
 
 # ============================================================
@@ -189,8 +192,6 @@ def add_calendar_months(base_date, months=1):
     Ejemplo: 09/06/2026 + 1 mes = 09/07/2026.
     Si el día no existe en el mes destino, usa el último día del mes.
     """
-    import calendar
-
     months = max(int(months or 1), 1)
     month_index = (base_date.month - 1) + months
     year = base_date.year + (month_index // 12)
@@ -284,6 +285,47 @@ def actual_or_projected_end_date(cliente, transactions):
         if last_date:
             return f"{last_date.strftime('%d/%m/%Y')} (final real)"
     return f"{projected_end_date(cliente)} (estimada)"
+
+def normalize_client_name(value):
+    """
+    Normaliza un nombre para comparar duplicados:
+    - ignora mayúsculas/minúsculas;
+    - elimina espacios repetidos;
+    - elimina espacios al inicio y final.
+    """
+    return " ".join(str(value or "").strip().upper().split())
+
+
+def client_name_exists(name, exclude_client_id=None):
+    """
+    Retorna True si ya existe otro cliente con el mismo nombre normalizado.
+    """
+    normalized = normalize_client_name(name)
+
+    if not normalized:
+        return False
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    if exclude_client_id is None:
+        cursor.execute(
+            "SELECT id, nombre FROM clientes"
+        )
+    else:
+        cursor.execute(
+            "SELECT id, nombre FROM clientes WHERE id <> ?",
+            (int(exclude_client_id),),
+        )
+
+    exists = any(
+        normalize_client_name(row[1]) == normalized
+        for row in cursor.fetchall()
+    )
+
+    conn.close()
+    return exists
+
 
 def detach_widget(widget):
     """
@@ -778,7 +820,7 @@ def generate_daily_pdf_report():
     pdf.section("Resumen ejecutivo")
     pdf.key_grid([
         ("Fecha", today_text(), False),
-        ("Cobrador", "CORREDOR - USUARIO", False),
+        ("Cobrador", "PACHO", False),
         ("Clientes registrados", str(total_clientes), False),
         ("Pagos registrados", str(len(pagos)), False),
         ("Clientes no pago", str(len(no_pagos)), False),
@@ -932,6 +974,8 @@ def confirm_popup(title, message, on_confirm):
 
 
 def estado_texto(estado):
+    if estado == "paz_y_salvo":
+        return "PAZ Y SALVO"
     if estado == "pagado":
         return "PAGADO"
     if estado == "aporte":
@@ -944,6 +988,12 @@ def estado_texto(estado):
 
 
 def estado_colores(estado):
+    if estado == "paz_y_salvo":
+        return (
+            STATUS_PAID_OFF,
+            STATUS_BORDER_PAID_OFF,
+            "PAZ Y SALVO",
+        )
     if estado in ("pagado", "aporte"):
         return STATUS_GREEN, STATUS_BORDER_GREEN, estado_texto(estado)
     if estado == "no_pago":
@@ -1081,6 +1131,16 @@ def init_database():
 
     cursor.execute("UPDATE clientes SET created_at = ? WHERE created_at IS NULL OR created_at = ''", (now_text(),))
     cursor.execute("UPDATE clientes SET updated_at = ? WHERE updated_at IS NULL OR updated_at = ''", (now_text(),))
+
+    # Clientes completamente cancelados pasan al estado PAZ Y SALVO.
+    cursor.execute("""
+        UPDATE clientes
+        SET estado = 'paz_y_salvo',
+            ultimo_tipo = 'Crédito cancelado - Paz y salvo',
+            proximo_cobro = ''
+        WHERE saldo <= 0
+          AND pendientes <= 0
+    """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transacciones (
@@ -2147,6 +2207,244 @@ def bind_scroll_to_input(scroll_view, widget):
 
 
 
+class CalendarPopup(Popup):
+    """
+    Selector de fecha simple y compatible con Windows/Android.
+    No requiere librerías externas.
+    """
+
+    MONTH_NAMES = [
+        "",
+        "Enero", "Febrero", "Marzo", "Abril",
+        "Mayo", "Junio", "Julio", "Agosto",
+        "Septiembre", "Octubre", "Noviembre", "Diciembre",
+    ]
+
+    WEEK_DAYS = ["L", "M", "M", "J", "V", "S", "D"]
+
+    def __init__(self, initial_date=None, on_select=None, **kwargs):
+        self.on_select_callback = on_select
+
+        if isinstance(initial_date, str):
+            parsed = None
+            for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                try:
+                    parsed = datetime.strptime(initial_date, fmt).date()
+                    break
+                except ValueError:
+                    continue
+            initial_date = parsed
+
+        self.selected_date = initial_date or datetime.now().date()
+        self.current_year = self.selected_date.year
+        self.current_month = self.selected_date.month
+
+        super().__init__(
+            title="Seleccionar próxima fecha",
+            size_hint=(0.94, None),
+            height=dp(520),
+            auto_dismiss=False,
+            **kwargs,
+        )
+
+        self.container = BoxLayout(
+            orientation="vertical",
+            padding=dp(12),
+            spacing=dp(10),
+        )
+        self.content = self.container
+        self.build_calendar()
+
+    def build_calendar(self):
+        self.container.clear_widgets()
+
+        navigation = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(46),
+            spacing=dp(8),
+        )
+
+        previous_button = Button(
+            text="<",
+            size_hint_x=None,
+            width=dp(48),
+            background_normal="",
+            background_color=BLUE,
+            color=WHITE,
+            bold=True,
+        )
+        previous_button.bind(
+            on_release=lambda *_: self.change_month(-1)
+        )
+
+        month_label = Label(
+            text=(
+                f"{self.MONTH_NAMES[self.current_month]} "
+                f"{self.current_year}"
+            ),
+            color=WHITE,
+            bold=True,
+            font_size="16sp",
+            halign="center",
+            valign="middle",
+        )
+        month_label.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
+
+        next_button = Button(
+            text=">",
+            size_hint_x=None,
+            width=dp(48),
+            background_normal="",
+            background_color=BLUE,
+            color=WHITE,
+            bold=True,
+        )
+        next_button.bind(
+            on_release=lambda *_: self.change_month(1)
+        )
+
+        navigation.add_widget(previous_button)
+        navigation.add_widget(month_label)
+        navigation.add_widget(next_button)
+        self.container.add_widget(navigation)
+
+        week_header = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(30),
+            spacing=dp(4),
+        )
+
+        for day_name in self.WEEK_DAYS:
+            week_header.add_widget(
+                Label(
+                    text=day_name,
+                    color=GOLD,
+                    bold=True,
+                    halign="center",
+                    valign="middle",
+                )
+            )
+
+        self.container.add_widget(week_header)
+
+        month_grid = BoxLayout(
+            orientation="vertical",
+            spacing=dp(4),
+        )
+
+        weeks = calendar.monthcalendar(
+            self.current_year,
+            self.current_month,
+        )
+
+        while len(weeks) < 6:
+            weeks.append([0] * 7)
+
+        for week in weeks:
+            row = BoxLayout(
+                orientation="horizontal",
+                spacing=dp(4),
+            )
+
+            for day_number in week:
+                if day_number == 0:
+                    row.add_widget(Widget())
+                    continue
+
+                candidate = datetime(
+                    self.current_year,
+                    self.current_month,
+                    day_number,
+                ).date()
+
+                is_selected = candidate == self.selected_date
+
+                day_button = Button(
+                    text=str(day_number),
+                    background_normal="",
+                    background_color=(
+                        GOLD
+                        if is_selected
+                        else (0.22, 0.25, 0.31, 1)
+                    ),
+                    color=DARK if is_selected else WHITE,
+                    bold=is_selected,
+                )
+                day_button.bind(
+                    on_release=lambda _button, date=candidate:
+                    self.select_date(date)
+                )
+                row.add_widget(day_button)
+
+            month_grid.add_widget(row)
+
+        self.container.add_widget(month_grid)
+
+        actions = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(46),
+            spacing=dp(8),
+        )
+
+        today_button = Button(
+            text="Hoy",
+            background_normal="",
+            background_color=(0.45, 0.48, 0.55, 1),
+            color=WHITE,
+            bold=True,
+        )
+        today_button.bind(
+            on_release=lambda *_: self.go_today()
+        )
+
+        cancel_button = Button(
+            text="Cancelar",
+            background_normal="",
+            background_color=DANGER,
+            color=WHITE,
+            bold=True,
+        )
+        cancel_button.bind(on_release=self.dismiss)
+
+        actions.add_widget(today_button)
+        actions.add_widget(cancel_button)
+        self.container.add_widget(actions)
+
+    def change_month(self, delta):
+        month_index = (
+            self.current_year * 12
+            + self.current_month
+            - 1
+            + delta
+        )
+        self.current_year = month_index // 12
+        self.current_month = month_index % 12 + 1
+        self.build_calendar()
+
+    def go_today(self):
+        today = datetime.now().date()
+        self.selected_date = today
+        self.current_year = today.year
+        self.current_month = today.month
+        self.build_calendar()
+
+    def select_date(self, selected_date):
+        self.selected_date = selected_date
+
+        if self.on_select_callback:
+            self.on_select_callback(selected_date)
+
+        self.dismiss()
+
+
+
 # ============================================================
 # WIDGETS BASE
 # ============================================================
@@ -2532,6 +2830,12 @@ class ClientesScreen(Screen):
         self.app_ref = App.get_running_app()
         refresh_memory_from_db()
 
+        # Cada vez que se vuelve a la lista principal, limpiar la búsqueda.
+        # Así, después de pagar, editar, renovar, eliminar o reajustar,
+        # la pantalla vuelve a mostrar la lista normal.
+        if self.search.text:
+            self.search.text = ""
+
         # Si el celular está nuevo y no tiene SQLite local,
         # intenta restaurar automáticamente desde Supabase.
         if not CLIENTES and supabase_configured():
@@ -2541,6 +2845,12 @@ class ClientesScreen(Screen):
 
         self.nav_container.clear_widgets()
         self.nav_container.add_widget(BottomNav(self.app_ref, active="clientes"))
+        self.render_clients()
+
+    def clear_search(self):
+        """Limpia el buscador y actualiza la lista principal."""
+        if self.search.text:
+            self.search.text = ""
         self.render_clients()
 
     def confirm_clear(self):
@@ -2559,18 +2869,55 @@ class ClientesScreen(Screen):
         query = (self.search.text or "").strip().lower()
         self.client_list.clear_widgets()
 
-        filtered = [
-            cliente for cliente in CLIENTES
-            if query in cliente.get("nombre", "").lower()
-            or query in cliente.get("telefono", "").lower()
-            or query in cliente.get("documento", "").lower()
-        ]
+        if query:
+            # Cuando el usuario busca, se muestran todos los clientes,
+            # incluso pagados, finalizados o con aporte.
+            filtered = [
+                cliente for cliente in CLIENTES
+                if query in cliente.get("nombre", "").lower()
+                or query in cliente.get("telefono", "").lower()
+                or query in cliente.get("documento", "").lower()
+            ]
+        else:
+            # En la lista principal solo se muestran clientes pendientes,
+            # no pago o aplazados. Los verdes desaparecen hasta su próxima fecha.
+            filtered = [
+                cliente for cliente in CLIENTES
+                if cliente.get("estado") not in ("pagado", "aporte")
+                and int(cliente.get("pendientes", 0)) > 0
+                and int(cliente.get("saldo", 0)) > 0
+            ]
 
         if not filtered:
             empty_box = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(160), padding=dp(14), spacing=dp(8))
-            title = Label(text="No hay clientes registrados", color=TEXT, bold=True, font_size="15sp", halign="center", size_hint_y=None, height=dp(30))
-            msg = Label(text="Presiona NUEVO para crear tu primer cliente real.", color=MUTED, font_size="12sp", halign="center", valign="middle")
-            btn = SmallButton("Crear primer cliente", bg_color=BLUE)
+            empty_title = (
+                "No se encontraron coincidencias"
+                if query
+                else "No hay clientes pendientes por cobrar"
+            )
+            empty_message = (
+                "Prueba buscando por nombre, documento o teléfono."
+                if query
+                else "Los clientes pagados se ocultan aquí, pero aparecen al buscarlos."
+            )
+
+            title = Label(
+                text=empty_title,
+                color=TEXT,
+                bold=True,
+                font_size="15sp",
+                halign="center",
+                size_hint_y=None,
+                height=dp(30),
+            )
+            msg = Label(
+                text=empty_message,
+                color=MUTED,
+                font_size="12sp",
+                halign="center",
+                valign="middle",
+            )
+            btn = SmallButton("Crear nuevo cliente", bg_color=BLUE)
             btn.bind(on_release=lambda *_: self.app_ref.go("nuevo_cliente"))
             title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
             msg.bind(size=lambda instance, value: setattr(instance, "text_size", value))
@@ -2636,6 +2983,11 @@ class GestionClienteScreen(Screen):
 
         content.add_widget(card)
 
+        credito_finalizado = (
+            int(self.cliente.get("saldo", 0)) <= 0
+            or int(self.cliente.get("pendientes", 0)) <= 0
+        )
+
         btn_cobrar = SmallButton("COBRAR CUOTA / APORTE", bg_color=BLUE)
         btn_historial = SmallButton("VER HISTORIAL COMPLETO", bg_color=SUCCESS)
         btn_editar = SmallButton("EDITAR CLIENTE Y PRÉSTAMO", bg_color=GOLD, text_color=DARK)
@@ -2648,10 +3000,24 @@ class GestionClienteScreen(Screen):
         btn_reset.bind(on_release=lambda *_: self.reset_estado())
         btn_borrar.bind(on_release=lambda *_: self.confirm_delete())
 
-        content.add_widget(btn_cobrar)
+        if credito_finalizado:
+            btn_renovar = SmallButton(
+                "RENOVAR PRÉSTAMO",
+                bg_color=SUCCESS,
+            )
+            btn_renovar.bind(
+                on_release=lambda *_: self.go_renovar()
+            )
+            content.add_widget(btn_renovar)
+        else:
+            content.add_widget(btn_cobrar)
+
         content.add_widget(btn_historial)
         content.add_widget(btn_editar)
-        content.add_widget(btn_reset)
+
+        if not credito_finalizado:
+            content.add_widget(btn_reset)
+
         content.add_widget(btn_borrar)
 
         help_card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(154), padding=[dp(14), dp(12), dp(14), dp(12)])
@@ -2675,6 +3041,10 @@ class GestionClienteScreen(Screen):
     def go_historial(self):
         self.app_ref.selected_client = self.cliente
         self.app_ref.go("historial_cliente")
+
+    def go_renovar(self):
+        self.app_ref.selected_client = self.cliente
+        self.app_ref.go("renovar_prestamo")
 
     def go_editar(self):
         self.app_ref.selected_client = self.cliente
@@ -2888,6 +3258,8 @@ class HistorialClienteScreen(Screen):
             accent = GOLD
         elif tipo == "No Pago":
             accent = DANGER
+        elif tipo == "Renovación":
+            accent = BLUE
         else:
             accent = (0.45, 0.48, 0.55, 1)
 
@@ -3429,15 +3801,19 @@ class CuotaScreen(Screen):
             self.cliente["ultima_fecha_pago"] = iso_today()
             # El cronograma avanza desde la fecha programada actual,
             # no desde la fecha del dispositivo.
-            self.cliente["proximo_cobro"] = (
-                next_due_from_anchor(
+            if (
+                self.cliente["pendientes"] <= 0
+                or self.cliente["saldo"] <= 0
+            ):
+                self.cliente["estado"] = "paz_y_salvo"
+                self.cliente["ultimo_tipo"] = "Crédito cancelado - Paz y salvo"
+                self.cliente["proximo_cobro"] = ""
+            else:
+                self.cliente["proximo_cobro"] = next_due_from_anchor(
                     self.cliente.get("proximo_cobro", ""),
                     self.cliente.get("cobro", "Diario"),
                     cantidad_cuotas,
                 )
-                if self.cliente["pendientes"] > 0
-                else ""
-            )
 
         elif tipo == "No Pago":
             self.cliente["estado"] = "no_pago"
@@ -3525,7 +3901,37 @@ class NuevoClienteScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
+
+        if getattr(self, "reset_on_next_entry", False):
+            self.clear_form()
+            self.reset_on_next_entry = False
+
         self.build()
+
+    def clear_form(self):
+        """
+        Limpia todos los campos después de crear un cliente.
+        """
+        self.documento.text = ""
+        self.nombre.text = ""
+        self.movil.text = ""
+        self.direccion.text = ""
+
+        self.producto.text = "5 - CREDITO EN EFECTIVO"
+        self.valor_credito.text = ""
+        self.interes.text = ""
+        self.numero_cuotas.text = ""
+        self.total_credito.text = "0"
+        self.valor_cuota.text = "0"
+        self.cobro.text = "Diario"
+
+        self.documento_codeudor.text = ""
+        self.nombre_codeudor.text = ""
+        self.movil_codeudor.text = ""
+
+        self.valor_seguro.text = ""
+        self.beneficiario.text = ""
+        self.obs_seguro.text = ""
 
     def calculate_credit(self):
         base = to_int(self.valor_credito.text, 0)
@@ -3764,9 +4170,22 @@ class NuevoClienteScreen(Screen):
     def create_client(self):
         self.calculate_credit()
 
-        nombre = self.nombre.text.strip().upper()
+        nombre = normalize_client_name(self.nombre.text)
+
         if not nombre:
-            show_popup("Falta nombre", "Ingrese el nombre del cliente.")
+            show_popup(
+                "Falta nombre",
+                "Ingrese el nombre del cliente.",
+            )
+            return
+
+        if client_name_exists(nombre):
+            show_popup(
+                "Cliente duplicado",
+                "Ya existe un cliente registrado con ese nombre.\n"
+                "Búsquelo en la lista antes de crear otro préstamo.",
+                height=280,
+            )
             return
 
         valor_credito = to_int(self.valor_credito.text, 0)
@@ -3835,8 +4254,323 @@ class NuevoClienteScreen(Screen):
 
         refresh_memory_from_db()
         App.get_running_app().request_auto_sync()
-        show_popup("Cliente creado", "Cliente y crédito activados correctamente.\nEl desembolso fue descontado de caja.")
-        Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.8)
+
+        # El siguiente registro debe iniciar completamente vacío.
+        self.reset_on_next_entry = True
+
+        show_popup(
+            "Cliente creado",
+            "Cliente y crédito activados correctamente.\n"
+            "El desembolso fue descontado de caja.",
+        )
+        Clock.schedule_once(
+            lambda *_: self.app_ref.go("clientes"),
+            0.8,
+        )
+
+
+
+# ============================================================
+# RENOVAR PRÉSTAMO
+# ============================================================
+
+class RenovarPrestamoScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(name="renovar_prestamo", **kwargs)
+        self.root = BoxLayout(orientation="vertical")
+        self.add_widget(self.root)
+
+    def on_pre_enter(self):
+        self.app_ref = App.get_running_app()
+        self.cliente = (
+            get_client_by_id(self.app_ref.selected_client.get("id"))
+            if self.app_ref.selected_client
+            else None
+        )
+        self.build()
+
+    def build(self):
+        self.root.clear_widgets()
+        self.root.add_widget(
+            Header(
+                "Renovar Préstamo",
+                show_back=True,
+                on_back=lambda: self.app_ref.go("gestion_cliente"),
+            )
+        )
+
+        if not self.cliente:
+            self.root.add_widget(
+                Label(text="Cliente no encontrado", color=WHITE)
+            )
+            return
+
+        scroll = ScrollView(
+            do_scroll_x=False,
+            bar_width=dp(4),
+            scroll_type=["bars", "content"],
+        )
+
+        content = BoxLayout(
+            orientation="vertical",
+            padding=[dp(14), dp(16), dp(14), dp(50)],
+            spacing=dp(14),
+            size_hint_y=None,
+        )
+        content.bind(minimum_height=content.setter("height"))
+
+        summary = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(152),
+            padding=dp(14),
+            spacing=dp(8),
+        )
+        summary.add_widget(
+            Label(
+                text=self.cliente.get("nombre", "SIN NOMBRE"),
+                color=TEXT,
+                bold=True,
+                font_size="18sp",
+                halign="left",
+                valign="middle",
+                size_hint_y=None,
+                height=dp(32),
+            )
+        )
+        summary.add_widget(
+            DetailRow(
+                "Crédito anterior",
+                money(self.cliente.get("total_credito", 0)),
+            )
+        )
+        summary.add_widget(
+            DetailRow(
+                "Saldo anterior",
+                money(self.cliente.get("saldo", 0)),
+            )
+        )
+        summary.add_widget(
+            DetailRow(
+                "Estado",
+                "FINALIZADO",
+            )
+        )
+        content.add_widget(summary)
+
+        self.valor_credito = MoneyTextInput()
+        self.interes = AppTextInput(
+            text=str(self.cliente.get("interes", 0))
+        )
+        self.numero_cuotas = AppTextInput(
+            input_filter="int"
+        )
+        self.total_credito = MoneyTextInput(
+            text="0",
+            readonly=True,
+        )
+        self.valor_cuota = MoneyTextInput(
+            text="0",
+            readonly=True,
+        )
+        self.cobro = Spinner(
+            text=self.cliente.get("cobro", "Diario"),
+            values=["Diario", "Semanal", "Quincenal", "Mensual"],
+            size_hint_y=None,
+            height=dp(44),
+            background_normal="",
+            background_color=WHITE,
+            color=TEXT,
+        )
+
+        self.valor_credito.bind(
+            text=lambda *_: self.calculate_credit()
+        )
+        self.interes.bind(
+            text=lambda *_: self.calculate_credit()
+        )
+        self.numero_cuotas.bind(
+            text=lambda *_: self.calculate_credit()
+        )
+
+        form = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(530),
+            padding=[dp(16), dp(14), dp(16), dp(16)],
+            spacing=dp(10),
+        )
+
+        form.add_widget(
+            Label(
+                text="CONDICIONES DEL NUEVO PRÉSTAMO",
+                color=BLUE,
+                bold=True,
+                font_size="14sp",
+                halign="left",
+                valign="middle",
+                size_hint_y=None,
+                height=dp(28),
+            )
+        )
+
+        for label, widget in [
+            ("Valor del nuevo préstamo", self.valor_credito),
+            ("Interés %", self.interes),
+            ("Número de cuotas", self.numero_cuotas),
+            ("Total del nuevo crédito", self.total_credito),
+            ("Valor de la cuota", self.valor_cuota),
+            ("Frecuencia de cobro", self.cobro),
+        ]:
+            box = BoxLayout(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(68),
+                spacing=dp(4),
+            )
+            box.add_widget(FieldLabel(label))
+            box.add_widget(widget)
+            form.add_widget(box)
+
+        renew_button = SmallButton(
+            "Confirmar Renovación",
+            bg_color=SUCCESS,
+        )
+        renew_button.bind(
+            on_release=lambda *_: self.renew_loan()
+        )
+        form.add_widget(renew_button)
+
+        content.add_widget(form)
+
+        for widget in [
+            self.valor_credito,
+            self.interes,
+            self.numero_cuotas,
+        ]:
+            bind_scroll_to_input(scroll, widget)
+
+        scroll.add_widget(content)
+        self.root.add_widget(scroll)
+
+    def calculate_credit(self):
+        principal = to_int(self.valor_credito.text, 0)
+        interest = to_float(self.interes.text, 0)
+        installments = to_int(self.numero_cuotas.text, 0)
+
+        total = round(principal * (1 + interest / 100))
+        installment_value = (
+            round(total / installments)
+            if installments > 0
+            else 0
+        )
+
+        self.total_credito.text = format_thousands(total)
+        self.valor_cuota.text = format_thousands(
+            installment_value
+        )
+
+    def renew_loan(self):
+        self.calculate_credit()
+
+        principal = to_int(self.valor_credito.text, 0)
+        total = to_int(self.total_credito.text, 0)
+        installment_value = to_int(self.valor_cuota.text, 0)
+        installments = to_int(self.numero_cuotas.text, 0)
+
+        if (
+            principal <= 0
+            or total <= 0
+            or installment_value <= 0
+            or installments <= 0
+        ):
+            show_popup(
+                "Datos incompletos",
+                "Revise valor, interés y número de cuotas.",
+            )
+            return
+
+        refresh_memory_from_db()
+        available_cash = current_cash_balance()
+
+        if principal > available_cash:
+            show_popup(
+                "Saldo insuficiente",
+                f"No se puede renovar el préstamo.\n"
+                f"Valor a prestar: {money(principal)}\n"
+                f"Saldo en caja: {money(available_cash)}",
+                height=300,
+            )
+            return
+
+        previous_total = int(
+            self.cliente.get("total_credito", 0)
+        )
+
+        self.cliente["valor_credito"] = principal
+        self.cliente["interes"] = to_float(
+            self.interes.text,
+            0,
+        )
+        self.cliente["total_credito"] = total
+        self.cliente["cuota"] = installment_value
+        self.cliente["numero_cuotas"] = installments
+        self.cliente["saldo"] = total
+        self.cliente["pagadas"] = 0
+        self.cliente["pendientes"] = installments
+        self.cliente["cobro"] = self.cobro.text
+        self.cliente["estado"] = "pendiente"
+        self.cliente["ultimo_tipo"] = "Préstamo renovado"
+        self.cliente["proximo_cobro"] = iso_today()
+        self.cliente["ultima_fecha_pago"] = ""
+        self.cliente["synced"] = 0
+
+        update_client_db(self.cliente)
+
+        insert_transaction_db({
+            "cliente_id": self.cliente.get("id"),
+            "cliente": self.cliente.get("nombre", ""),
+            "tipo": "Renovación",
+            "valor": principal,
+            "metodo": "Desembolso",
+            "fecha": now_text(),
+            "numero_cuotas": 0,
+            "saldo_anterior": 0,
+            "saldo_nuevo": total,
+            "cuotas_pagadas_total": 0,
+            "cuotas_pendientes_total": installments,
+            "observacion": (
+                f"Nuevo préstamo renovado. "
+                f"Crédito anterior: {money(previous_total)}"
+            ),
+            "synced": 0,
+        })
+
+        insert_movement_db({
+            "tipo": "Egreso",
+            "concepto": "Renovación préstamo",
+            "valor": principal,
+            "observaciones": (
+                f"Renovación entregada a "
+                f"{self.cliente.get('nombre', '')}"
+            ),
+            "fecha": today_text(),
+            "synced": 0,
+        })
+
+        refresh_memory_from_db()
+        App.get_running_app().request_auto_sync()
+
+        show_popup(
+            "Préstamo renovado",
+            "El nuevo préstamo fue activado y el historial anterior se conservó.",
+            height=280,
+        )
+
+        Clock.schedule_once(
+            lambda *_: self.app_ref.go("clientes"),
+            0.9,
+        )
 
 
 # ============================================================
@@ -3862,8 +4596,19 @@ class EditarClienteScreen(Screen):
             self.root.add_widget(Label(text="Cliente no encontrado", color=WHITE))
             return
 
-        scroll = ScrollView()
-        content = BoxLayout(orientation="vertical", padding=[dp(12), dp(12), dp(12), dp(24)], spacing=dp(12), size_hint_y=None)
+        scroll = ScrollView(
+            do_scroll_x=False,
+            bar_width=dp(5),
+            scroll_type=["bars", "content"],
+        )
+        self.edit_scroll = scroll
+
+        content = BoxLayout(
+            orientation="vertical",
+            padding=[dp(14), dp(16), dp(14), dp(110)],
+            spacing=dp(14),
+            size_hint_y=None,
+        )
         content.bind(minimum_height=content.setter("height"))
 
         card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(820), padding=[dp(12), dp(12), dp(12), dp(12)], spacing=dp(8))
@@ -3879,9 +4624,15 @@ class EditarClienteScreen(Screen):
         self.total_credito = MoneyTextInput(text=format_thousands(self.cliente.get("total_credito", self.cliente.get("saldo", 0))), readonly=True)
         self.valor_cuota = MoneyTextInput(text=format_thousands(self.cliente.get("cuota", 0)), readonly=True)
         self.proximo_cobro = AppTextInput(
-            text=display_date_from_iso(self.cliente.get("proximo_cobro", ""))
-                 if self.cliente.get("proximo_cobro") else "",
-            hint_text="DD/MM/AAAA - fecha base del cronograma"
+            text=(
+                display_date_from_iso(
+                    self.cliente.get("proximo_cobro", "")
+                )
+                if self.cliente.get("proximo_cobro")
+                else ""
+            ),
+            hint_text="Seleccione la fecha",
+            readonly=True,
         )
 
         self.valor_credito.bind(text=lambda *_: self.calculate_credit())
@@ -3898,12 +4649,53 @@ class EditarClienteScreen(Screen):
             ("Número de Cuotas", self.numero_cuotas),
             ("Total Crédito", self.total_credito),
             ("Valor Cuota", self.valor_cuota),
-            ("Próxima Fecha de Cobro", self.proximo_cobro),
         ]:
-            field = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(68), spacing=dp(3))
+            field = BoxLayout(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(72),
+                spacing=dp(5),
+            )
             field.add_widget(FieldLabel(label))
             field.add_widget(widget)
             card.add_widget(field)
+
+        date_field = BoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(82),
+            spacing=dp(5),
+        )
+        date_field.add_widget(
+            FieldLabel("Próxima Fecha de Cobro")
+        )
+
+        date_row = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(46),
+            spacing=dp(8),
+        )
+        date_row.add_widget(self.proximo_cobro)
+
+        calendar_button = Button(
+            text="Calendario",
+            size_hint_x=None,
+            width=dp(112),
+            background_normal="",
+            background_color=BLUE,
+            color=WHITE,
+            bold=True,
+        )
+        calendar_button.bind(
+            on_release=lambda *_: self.open_date_calendar(
+                date_field
+            )
+        )
+
+        date_row.add_widget(calendar_button)
+        date_field.add_widget(date_row)
+        card.add_widget(date_field)
 
         save = SmallButton("Guardar Cambios", bg_color=SUCCESS)
         save.bind(on_release=lambda *_: self.save_changes())
@@ -3916,6 +4708,45 @@ class EditarClienteScreen(Screen):
         scroll.add_widget(content)
         self.root.add_widget(scroll)
 
+    def open_date_calendar(self, date_field=None):
+        """
+        Abre el calendario y mantiene visible la zona de fecha.
+        """
+        if date_field is not None and hasattr(self, "edit_scroll"):
+            Clock.schedule_once(
+                lambda *_: self.edit_scroll.scroll_to(
+                    date_field,
+                    padding=dp(120),
+                    animate=True,
+                ),
+                0.05,
+            )
+
+        initial_date = normalize_date_input(
+            self.proximo_cobro.text
+        )
+
+        popup = CalendarPopup(
+            initial_date=initial_date,
+            on_select=self.set_selected_date,
+        )
+        popup.open()
+
+    def set_selected_date(self, selected_date):
+        self.proximo_cobro.text = selected_date.strftime(
+            "%d/%m/%Y"
+        )
+
+        if hasattr(self, "edit_scroll"):
+            Clock.schedule_once(
+                lambda *_: self.edit_scroll.scroll_to(
+                    self.proximo_cobro,
+                    padding=dp(120),
+                    animate=True,
+                ),
+                0.10,
+            )
+
     def calculate_credit(self):
         base = to_int(self.valor_credito.text, 0)
         interes = to_float(self.interes.text, 0)
@@ -3927,9 +4758,24 @@ class EditarClienteScreen(Screen):
 
     def save_changes(self):
         self.calculate_credit()
-        nombre = self.nombre.text.strip().upper()
+        nombre = normalize_client_name(self.nombre.text)
+
         if not nombre:
-            show_popup("Falta nombre", "Ingrese el nombre del cliente.")
+            show_popup(
+                "Falta nombre",
+                "Ingrese el nombre del cliente.",
+            )
+            return
+
+        if client_name_exists(
+            nombre,
+            exclude_client_id=self.cliente.get("id"),
+        ):
+            show_popup(
+                "Nombre duplicado",
+                "Ya existe otro cliente registrado con ese nombre.",
+                height=260,
+            )
             return
 
         valor_credito = to_int(self.valor_credito.text, 0)
@@ -3974,8 +4820,8 @@ class EditarClienteScreen(Screen):
         self.cliente["pendientes"] = nuevas_pendientes
 
         if nuevas_pendientes <= 0 or nuevo_saldo_pendiente <= 0:
-            self.cliente["estado"] = "pagado"
-            self.cliente["ultimo_tipo"] = "Crédito finalizado"
+            self.cliente["estado"] = "paz_y_salvo"
+            self.cliente["ultimo_tipo"] = "Crédito cancelado - Paz y salvo"
             self.cliente["proximo_cobro"] = ""
         else:
             # Editar la fecha no debe cambiar el estado visual ni borrar
@@ -4157,7 +5003,7 @@ class ResumenScreen(Screen):
         report.bind(minimum_height=report.setter("height"))
 
         for left, right in [
-            ("Vendedor", "CORREDOR - USUARIO"),
+            ("Vendedor", "PACHO"),
             ("Fecha de Ruta", today_text()),
             ("Clientes Ausentes", str(no_pagos)),
             ("Aplazados Sig. Día", str(aplazados)),
@@ -4435,6 +5281,7 @@ class CobrosV12App(App):
         self.sm.add_widget(HistorialClienteScreen())
         self.sm.add_widget(CuotaScreen())
         self.sm.add_widget(NuevoClienteScreen())
+        self.sm.add_widget(RenovarPrestamoScreen())
         self.sm.add_widget(EditarClienteScreen())
         self.sm.add_widget(MovimientosScreen())
         self.sm.add_widget(ResumenScreen())
