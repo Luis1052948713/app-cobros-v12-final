@@ -515,7 +515,9 @@ def publish_pdf_to_downloads(pdf_path, open_after=True):
     try:
         from importlib import import_module
 
-        autoclass = import_module("jnius").autoclass
+        jnius_module = import_module("jnius")
+        autoclass = jnius_module.autoclass
+        jarray = jnius_module.jarray
 
         PythonActivity = autoclass(
             "org.kivy.android.PythonActivity"
@@ -567,9 +569,17 @@ def publish_pdf_to_downloads(pdf_path, open_after=True):
                 "No se pudo abrir el archivo de destino."
             )
 
-        # PyJNIus convierte bytearray de Python a byte[] de Java.
-        pdf_bytes = bytearray(source.read_bytes())
-        output_stream.write(pdf_bytes)
+        # Android OutputStream.write() exige un byte[] de Java.
+        # Se convierten los bytes de Python a enteros con signo (-128 a 127)
+        # y luego a un arreglo Java compatible mediante jarray('b').
+        raw_pdf_bytes = source.read_bytes()
+        signed_pdf_bytes = [
+            value if value < 128 else value - 256
+            for value in raw_pdf_bytes
+        ]
+        java_pdf_bytes = jarray("b")(signed_pdf_bytes)
+
+        output_stream.write(java_pdf_bytes)
         output_stream.flush()
         output_stream.close()
 
@@ -599,13 +609,20 @@ def publish_pdf_to_downloads(pdf_path, open_after=True):
         return display_path, open_ok, open_message
 
     except Exception as error:
-        print("ERROR EXPORTANDO PDF A DESCARGAS:", error)
+        error_detail = (
+            f"{type(error).__name__}: {error!r}"
+        )
+        print(
+            "ERROR EXPORTANDO PDF A DESCARGAS:",
+            error_detail,
+        )
 
         return (
             str(source),
             False,
             "El PDF se generó en el almacenamiento privado, "
-            f"pero no pudo copiarse a Descargas. Detalle: {error}",
+            "pero no pudo copiarse a Descargas. "
+            f"Detalle: {error_detail}",
         )
 
 
