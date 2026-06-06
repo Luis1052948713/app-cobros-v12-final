@@ -428,10 +428,9 @@ def open_pdf_file(pdf_reference):
     Abre el PDF con el visor predeterminado.
 
     Android:
-    pdf_reference debe ser un URI de MediaStore.
-
-    Windows:
-    pdf_reference debe ser la ruta local del archivo.
+    usa directamente ACTION_VIEW sobre un content:// URI de MediaStore.
+    No utiliza Intent.createChooser para evitar incompatibilidades
+    de firmas entre PyJNIus y Android.
     """
     try:
         if platform == "android":
@@ -444,6 +443,9 @@ def open_pdf_file(pdf_reference):
             )
             Intent = autoclass("android.content.Intent")
             Uri = autoclass("android.net.Uri")
+            ActivityNotFoundException = autoclass(
+                "android.content.ActivityNotFoundException"
+            )
 
             activity = PythonActivity.mActivity
 
@@ -453,24 +455,25 @@ def open_pdf_file(pdf_reference):
                 else Uri.parse(str(pdf_reference))
             )
 
-            intent = Intent(Intent.ACTION_VIEW)
+            intent = Intent()
+            intent.setAction(Intent.ACTION_VIEW)
             intent.setDataAndType(uri, "application/pdf")
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
-            chooser = Intent.createChooser(
-                intent,
-                "Abrir reporte PDF",
-            )
-            activity.startActivity(chooser)
-            return True, "PDF abierto correctamente."
+            try:
+                activity.startActivity(intent)
+                return True, "PDF abierto correctamente."
+            except ActivityNotFoundException:
+                return (
+                    False,
+                    "No hay una aplicación instalada para abrir archivos PDF."
+                )
 
-        # Windows
         if os.name == "nt":
             os.startfile(str(pdf_reference))
             return True, "PDF abierto correctamente."
 
-        # Linux/macOS
         import subprocess
 
         command = (
@@ -485,21 +488,24 @@ def open_pdf_file(pdf_reference):
         return False, str(error)
 
 
+
 def publish_pdf_to_downloads(pdf_path, open_after=True):
     """
-    Guarda el PDF en Descargas/CobrosV12 y, opcionalmente,
-    lo abre automáticamente con el visor instalado.
+    Publica el PDF en Descargas/CobrosV12.
+
+    Android 10+:
+    usa MediaStore para respetar el almacenamiento restringido.
 
     Retorna:
-        display_path: ruta mostrada al usuario.
-        open_ok: indica si se pudo abrir.
-        open_message: detalle de apertura.
+        display_path
+        open_ok
+        open_message
     """
     source = Path(pdf_path)
 
     if platform != "android":
         open_ok = False
-        open_message = "No se intentó abrir."
+        open_message = "PDF guardado."
 
         if open_after:
             open_ok, open_message = open_pdf_file(str(source))
@@ -551,17 +557,19 @@ def publish_pdf_to_downloads(pdf_path, open_after=True):
 
         if uri is None:
             raise RuntimeError(
-                "Android no permitió crear el archivo PDF."
+                "Android no permitió crear el archivo en Descargas."
             )
 
         output_stream = resolver.openOutputStream(uri)
 
         if output_stream is None:
             raise RuntimeError(
-                "No se pudo abrir Descargas para escribir."
+                "No se pudo abrir el archivo de destino."
             )
 
-        output_stream.write(source.read_bytes())
+        # PyJNIus convierte bytearray de Python a byte[] de Java.
+        pdf_bytes = bytearray(source.read_bytes())
+        output_stream.write(pdf_bytes)
         output_stream.flush()
         output_stream.close()
 
@@ -582,28 +590,23 @@ def publish_pdf_to_downloads(pdf_path, open_after=True):
             "Descargas/CobrosV12/" + source.name
         )
 
-        open_ok = False
-        open_message = "PDF guardado sin abrir."
-
         if open_after:
             open_ok, open_message = open_pdf_file(uri)
+        else:
+            open_ok = False
+            open_message = "PDF guardado sin abrir."
 
         return display_path, open_ok, open_message
 
     except Exception as error:
         print("ERROR EXPORTANDO PDF A DESCARGAS:", error)
 
-        # El PDF privado no se pierde si falla MediaStore.
-        fallback_path = str(source)
-        open_ok = False
-        open_message = str(error)
-
-        if open_after:
-            open_ok, open_message = open_pdf_file(
-                fallback_path
-            )
-
-        return fallback_path, open_ok, open_message
+        return (
+            str(source),
+            False,
+            "El PDF se generó en el almacenamiento privado, "
+            f"pero no pudo copiarse a Descargas. Detalle: {error}",
+        )
 
 
 
