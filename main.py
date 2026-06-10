@@ -318,6 +318,99 @@ def daily_metrics(date_iso=None):
     }
 
 
+def week_bounds(date_iso=None):
+    """Retorna lunes y domingo de la semana en formato ISO."""
+    date_iso = date_iso or iso_today()
+    base_date = datetime.strptime(date_iso, "%Y-%m-%d").date()
+    monday = base_date - timedelta(days=base_date.weekday())
+    sunday = monday + timedelta(days=6)
+    return monday.isoformat(), sunday.isoformat()
+
+
+def display_week_range(date_iso=None):
+    start_iso, end_iso = week_bounds(date_iso)
+    start_date = datetime.strptime(start_iso, "%Y-%m-%d")
+    end_date = datetime.strptime(end_iso, "%Y-%m-%d")
+    return f"{start_date.strftime('%d/%m/%Y')} al {end_date.strftime('%d/%m/%Y')}"
+
+
+def records_for_period(records, start_iso, end_iso):
+    return [
+        record
+        for record in records
+        if start_iso <= record_date_iso(record.get("fecha", "")) <= end_iso
+    ]
+
+
+def weekly_metrics(date_iso=None):
+    """Calcula cobros y movimientos de lunes a domingo."""
+    start_iso, end_iso = week_bounds(date_iso)
+    transactions = records_for_period(TRANSACCIONES, start_iso, end_iso)
+    movements = records_for_period(MOVIMIENTOS_CAJA, start_iso, end_iso)
+
+    payments = [
+        transaction for transaction in transactions
+        if transaction.get("tipo") in ("Cuota", "Aporte")
+    ]
+    no_payments = [
+        transaction for transaction in transactions
+        if transaction.get("tipo") == "No Pago"
+    ]
+    postponed = [
+        transaction for transaction in transactions
+        if transaction.get("tipo") == "Siguiente Día"
+    ]
+
+    income = sum(
+        int(movement.get("valor", 0))
+        for movement in movements
+        if movement.get("tipo") == "Ingreso"
+    )
+    expenses = sum(
+        int(movement.get("valor", 0))
+        for movement in movements
+        if movement.get("tipo") == "Egreso"
+    )
+    collected = sum(int(transaction.get("valor", 0)) for transaction in payments)
+    opening_cash = cash_balance_before_date(start_iso)
+    closing_cash = opening_cash + income + collected - expenses
+
+    new_clients = [
+        client for client in CLIENTES
+        if start_iso <= record_date_iso(client.get("created_at", "")) <= end_iso
+    ]
+    active_clients = [
+        client for client in CLIENTES
+        if int(client.get("saldo", 0)) > 0 and int(client.get("pendientes", 0)) > 0
+    ]
+    outstanding_portfolio = sum(int(client.get("saldo", 0)) for client in active_clients)
+    disbursements = sum(
+        int(movement.get("valor", 0))
+        for movement in movements
+        if movement.get("tipo") == "Egreso"
+        and str(movement.get("concepto", "")).strip().lower() == "desembolso préstamo"
+    )
+
+    return {
+        "start_iso": start_iso,
+        "end_iso": end_iso,
+        "transactions": transactions,
+        "movements": movements,
+        "payments": payments,
+        "no_payments": no_payments,
+        "postponed": postponed,
+        "new_clients": new_clients,
+        "income": income,
+        "expenses": expenses,
+        "collected": collected,
+        "opening_cash": opening_cash,
+        "closing_cash": closing_cash,
+        "active_clients": len(active_clients),
+        "outstanding_portfolio": outstanding_portfolio,
+        "disbursements": disbursements,
+    }
+
+
 def next_due_date(cobro):
     """
     Calcula la próxima fecha de cobro.
@@ -1461,6 +1554,13 @@ def init_database():
             efectivo_contado INTEGER NOT NULL DEFAULT 0,
             diferencia_caja INTEGER NOT NULL DEFAULT 0,
             estado_cuadre TEXT NOT NULL DEFAULT 'sin_arqueo',
+            periodo_tipo TEXT NOT NULL DEFAULT 'diario',
+            periodo_inicio TEXT,
+            periodo_fin TEXT,
+            clientes_activos INTEGER NOT NULL DEFAULT 0,
+            cartera_pendiente INTEGER NOT NULL DEFAULT 0,
+            prestamos_nuevos INTEGER NOT NULL DEFAULT 0,
+            desembolsos INTEGER NOT NULL DEFAULT 0,
             opened_at TEXT,
             closed_at TEXT,
             created_at TEXT NOT NULL,
@@ -1485,6 +1585,13 @@ def init_database():
         ("efectivo_contado", "INTEGER NOT NULL DEFAULT 0"),
         ("diferencia_caja", "INTEGER NOT NULL DEFAULT 0"),
         ("estado_cuadre", "TEXT NOT NULL DEFAULT 'sin_arqueo'"),
+        ("periodo_tipo", "TEXT NOT NULL DEFAULT 'diario'"),
+        ("periodo_inicio", "TEXT"),
+        ("periodo_fin", "TEXT"),
+        ("clientes_activos", "INTEGER NOT NULL DEFAULT 0"),
+        ("cartera_pendiente", "INTEGER NOT NULL DEFAULT 0"),
+        ("prestamos_nuevos", "INTEGER NOT NULL DEFAULT 0"),
+        ("desembolsos", "INTEGER NOT NULL DEFAULT 0"),
         ("opened_at", "TEXT"),
         ("closed_at", "TEXT"),
         ("created_at", "TEXT NOT NULL DEFAULT ''"),
@@ -2067,132 +2174,93 @@ def clear_all_data_db():
 
 
 def get_cash_closure(date_iso=None):
-    date_iso = date_iso or iso_today()
+    """Obtiene el cierre semanal de la semana que contiene la fecha."""
+    week_start, _ = week_bounds(date_iso)
 
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-
     cursor.execute(
-        "SELECT * FROM cierres_caja WHERE fecha_iso = ?",
-        (date_iso,),
+        """
+        SELECT * FROM cierres_caja
+        WHERE fecha_iso = ?
+          AND COALESCE(periodo_tipo, 'diario') = 'semanal'
+        """,
+        (week_start,),
     )
-
     row = cursor.fetchone()
     conn.close()
-
     return dict(row) if row else None
 
 
 def get_journey_status(date_iso=None):
     closure = get_cash_closure(date_iso)
-
     if not closure:
         return "sin_abrir"
-
     return closure.get("estado", "sin_abrir")
 
 
-def open_cash_journey(
-    date_iso=None,
-    opening_cash=None,
-    observation="",
-):
-    date_iso = date_iso or iso_today()
+def open_cash_journey(date_iso=None, opening_cash=None, observation=""):
+    week_start, week_end = week_bounds(date_iso)
     existing = get_cash_closure(date_iso)
 
-    if existing and existing.get("estado") in (
-        "abierta",
-        "cerrada",
-    ):
-        raise ValueError(
-            "La jornada de esta fecha ya fue abierta."
-        )
+    if existing and existing.get("estado") in ("abierta", "cerrada"):
+        raise ValueError("La caja de esta semana ya fue abierta.")
 
-    calculated_opening = cash_balance_before_date(date_iso)
-
+    calculated_opening = cash_balance_before_date(week_start)
     if opening_cash is None:
         opening_cash = calculated_opening
-
     opening_cash = int(opening_cash)
 
     conn = get_connection()
     cursor = conn.cursor()
-
     cursor.execute("""
         INSERT INTO cierres_caja (
-            fecha_iso,
-            caja_inicial,
-            recaudo,
-            ingresos,
-            egresos,
-            saldo_final,
-            pagos,
-            no_pagos,
-            aplazados,
-            estado,
-            observacion_apertura,
-            observacion_cierre,
-            opened_at,
-            closed_at,
-            created_at,
-            updated_at
+            fecha_iso, caja_inicial, recaudo, ingresos, egresos,
+            saldo_final, pagos, no_pagos, aplazados, estado,
+            observacion_apertura, observacion_cierre,
+            efectivo_contado, diferencia_caja, estado_cuadre,
+            periodo_tipo, periodo_inicio, periodo_fin,
+            clientes_activos, cartera_pendiente, prestamos_nuevos, desembolsos,
+            opened_at, closed_at, created_at, updated_at
         )
-        VALUES (?, ?, 0, 0, 0, ?, 0, 0, 0, ?, ?, '', ?, '', ?, ?)
+        VALUES (?, ?, 0, 0, 0, ?, 0, 0, 0, ?, ?, '', 0, 0, 'sin_arqueo',
+                'semanal', ?, ?, 0, 0, 0, 0, ?, '', ?, ?)
         ON CONFLICT(fecha_iso) DO UPDATE SET
             caja_inicial = excluded.caja_inicial,
             saldo_final = excluded.saldo_final,
             estado = excluded.estado,
             observacion_apertura = excluded.observacion_apertura,
+            periodo_tipo = 'semanal',
+            periodo_inicio = excluded.periodo_inicio,
+            periodo_fin = excluded.periodo_fin,
             opened_at = excluded.opened_at,
             updated_at = excluded.updated_at
     """, (
-        date_iso,
-        opening_cash,
-        opening_cash,
-        "abierta",
-        observation.strip(),
-        now_text(),
-        now_text(),
-        now_text(),
+        week_start, opening_cash, opening_cash, "abierta",
+        observation.strip(), week_start, week_end,
+        now_text(), now_text(), now_text(),
     ))
-
     conn.commit()
     conn.close()
-
     return get_cash_closure(date_iso)
 
 
-def save_cash_closure(
-    date_iso=None,
-    observation="",
-    physical_cash=None,
-):
-    date_iso = date_iso or iso_today()
+def save_cash_closure(date_iso=None, observation="", physical_cash=None):
+    week_start, week_end = week_bounds(date_iso)
     existing = get_cash_closure(date_iso)
 
     if not existing:
-        raise ValueError(
-            "La jornada debe abrirse antes de cerrarla."
-        )
-
+        raise ValueError("La caja semanal debe abrirse antes de cerrarla.")
     if existing.get("estado") != "abierta":
-        raise ValueError(
-            "La jornada ya se encuentra cerrada."
-        )
+        raise ValueError("El cierre de esta semana ya fue realizado.")
 
-    metrics = daily_metrics(date_iso)
+    metrics = weekly_metrics(date_iso)
     opening_cash = int(existing.get("caja_inicial", 0))
-    closing_cash = (
-        opening_cash
-        + metrics["income"]
-        + metrics["collected"]
-        - metrics["expenses"]
-    )
+    closing_cash = opening_cash + metrics["income"] + metrics["collected"] - metrics["expenses"]
 
     if physical_cash is None:
         physical_cash = closing_cash
-
     physical_cash = int(physical_cash)
     cash_difference = physical_cash - closing_cash
 
@@ -2205,47 +2273,43 @@ def save_cash_closure(
 
     conn = get_connection()
     cursor = conn.cursor()
-
     cursor.execute("""
         UPDATE cierres_caja
-        SET recaudo = ?,
-            ingresos = ?,
-            egresos = ?,
-            saldo_final = ?,
-            pagos = ?,
-            no_pagos = ?,
-            aplazados = ?,
-            estado = ?,
-            observacion_cierre = ?,
-            efectivo_contado = ?,
-            diferencia_caja = ?,
-            estado_cuadre = ?,
-            closed_at = ?,
-            updated_at = ?
+        SET recaudo = ?, ingresos = ?, egresos = ?, saldo_final = ?,
+            pagos = ?, no_pagos = ?, aplazados = ?, estado = ?,
+            observacion_cierre = ?, efectivo_contado = ?,
+            diferencia_caja = ?, estado_cuadre = ?,
+            periodo_tipo = 'semanal', periodo_inicio = ?, periodo_fin = ?,
+            clientes_activos = ?, cartera_pendiente = ?,
+            prestamos_nuevos = ?, desembolsos = ?,
+            closed_at = ?, updated_at = ?
         WHERE fecha_iso = ?
     """, (
-        metrics["collected"],
-        metrics["income"],
-        metrics["expenses"],
-        closing_cash,
-        len(metrics["payments"]),
-        len(metrics["no_payments"]),
-        len(metrics["postponed"]),
-        "cerrada",
-        observation.strip(),
-        physical_cash,
-        cash_difference,
-        reconciliation_status,
-        now_text(),
-        now_text(),
-        date_iso,
+        metrics["collected"], metrics["income"], metrics["expenses"], closing_cash,
+        len(metrics["payments"]), len(metrics["no_payments"]), len(metrics["postponed"]),
+        "cerrada", observation.strip(), physical_cash, cash_difference,
+        reconciliation_status, week_start, week_end,
+        metrics["active_clients"], metrics["outstanding_portfolio"],
+        len(metrics["new_clients"]), metrics["disbursements"],
+        now_text(), now_text(), week_start,
     ))
-
     conn.commit()
     conn.close()
-
     return get_cash_closure(date_iso)
 
+
+def load_weekly_closures():
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM cierres_caja
+        WHERE COALESCE(periodo_tipo, 'diario') = 'semanal'
+        ORDER BY periodo_inicio DESC, id DESC
+    """)
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
 
 
 def mark_all_as_synced():
@@ -7217,6 +7281,90 @@ class ClientesPagaronHoyScreen(Screen):
         popup.open()
 
 
+class CierresSemanalesScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(name="cierres_semanales", **kwargs)
+        self.root = BoxLayout(orientation="vertical")
+        self.add_widget(self.root)
+
+    def on_pre_enter(self):
+        self.app_ref = App.get_running_app()
+        self.build()
+
+    def build(self):
+        self.root.clear_widgets()
+        self.root.add_widget(
+            Header(
+                "Historial de Cierres Semanales",
+                show_back=True,
+                on_back=lambda: self.app_ref.go("resumen"),
+            )
+        )
+
+        scroll = ScrollView(do_scroll_x=False, bar_width=dp(4))
+        content = BoxLayout(
+            orientation="vertical",
+            padding=[dp(12), dp(14), dp(12), dp(30)],
+            spacing=dp(12),
+            size_hint_y=None,
+        )
+        content.bind(minimum_height=content.setter("height"))
+
+        closures = load_weekly_closures()
+        if not closures:
+            empty = RoundedBox(
+                orientation="vertical", size_hint_y=None,
+                height=dp(130), padding=dp(16), spacing=dp(8),
+            )
+            title = Label(
+                text="Todavía no hay cierres semanales",
+                color=TEXT, bold=True, font_size="15sp",
+                halign="center", valign="middle",
+            )
+            title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            empty.add_widget(title)
+            content.add_widget(empty)
+        else:
+            for closure in closures:
+                content.add_widget(self.closure_card(closure))
+
+        scroll.add_widget(content)
+        self.root.add_widget(scroll)
+
+    def closure_card(self, closure):
+        status = str(closure.get("estado", "sin_abrir"))
+        difference = int(closure.get("diferencia_caja", 0) or 0)
+        card = RoundedBox(
+            orientation="vertical", size_hint_y=None,
+            height=dp(340), padding=[dp(14), dp(12), dp(14), dp(12)],
+            spacing=dp(6),
+        )
+
+        start = display_date_from_iso(closure.get("periodo_inicio", ""))
+        end = display_date_from_iso(closure.get("periodo_fin", ""))
+        title = Label(
+            text=f"Semana {start} al {end}",
+            color=BLUE, bold=True, font_size="15sp",
+            halign="left", valign="middle",
+            size_hint_y=None, height=dp(30),
+        )
+        title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        card.add_widget(title)
+        card.add_widget(DetailRow("Estado", "CERRADA" if status == "cerrada" else "ABIERTA"))
+        card.add_widget(DetailRow("Caja inicial", money(closure.get("caja_inicial", 0))))
+        card.add_widget(DetailRow("Recaudo semanal", money(closure.get("recaudo", 0))))
+        card.add_widget(DetailRow("Ingresos", money(closure.get("ingresos", 0))))
+        card.add_widget(DetailRow("Egresos", money(closure.get("egresos", 0))))
+        card.add_widget(DetailRow("Desembolsos", money(closure.get("desembolsos", 0))))
+        card.add_widget(DetailRow("Saldo final", money(closure.get("saldo_final", 0))))
+        card.add_widget(DetailRow("Efectivo contado", money(closure.get("efectivo_contado", 0))))
+        card.add_widget(DetailRow("Diferencia", money(difference)))
+        card.add_widget(DetailRow("Pagos registrados", str(closure.get("pagos", 0))))
+        card.add_widget(DetailRow("Clientes activos", str(closure.get("clientes_activos", 0))))
+        card.add_widget(DetailRow("Cartera pendiente", money(closure.get("cartera_pendiente", 0))))
+        return card
+
+
 class ResumenScreen(Screen):
     sync_status = StringProperty("Pendiente")
 
@@ -7232,26 +7380,28 @@ class ResumenScreen(Screen):
 
     def build(self):
         self.root.clear_widgets()
-        self.root.add_widget(Header("::V12:: Resumen del Día", show_back=True, on_back=lambda: self.app_ref.go("clientes")))
+        self.root.add_widget(Header("::V12:: Resumen y Caja Semanal", show_back=True, on_back=lambda: self.app_ref.go("clientes")))
 
         scroll = ScrollView()
         content = BoxLayout(orientation="vertical", padding=[dp(12), dp(12), dp(12), dp(18)], spacing=dp(10), size_hint_y=None)
         content.bind(minimum_height=content.setter("height"))
 
         metrics = daily_metrics()
+        week_metrics = weekly_metrics()
         closure = get_cash_closure()
         journey_status = get_journey_status()
 
-        if closure and journey_status in ("abierta", "cerrada"):
-            metrics["opening_cash"] = int(
-                closure.get("caja_inicial", 0)
-            )
-            metrics["closing_cash"] = (
-                metrics["opening_cash"]
-                + metrics["income"]
-                + metrics["collected"]
-                - metrics["expenses"]
-            )
+        weekly_opening_cash = (
+            int(closure.get("caja_inicial", 0))
+            if closure and journey_status in ("abierta", "cerrada")
+            else week_metrics["opening_cash"]
+        )
+        weekly_closing_cash = (
+            weekly_opening_cash
+            + week_metrics["income"]
+            + week_metrics["collected"]
+            - week_metrics["expenses"]
+        )
 
         total_clientes = len(CLIENTES)
         clientes_nuevos = len(metrics["new_clients"])
@@ -7261,9 +7411,10 @@ class ResumenScreen(Screen):
         recaudo_dia = metrics["collected"]
         ingresos = metrics["income"]
         egresos = metrics["expenses"]
-        caja_inicial = metrics["opening_cash"]
+        caja_inicial = weekly_opening_cash
         recaudo_esperado = metrics["expected"]
-        saldo_caja = metrics["closing_cash"]
+        saldo_caja = weekly_closing_cash
+        recaudo_semana = week_metrics["collected"]
         pendientes_sync = count_pending_sync()
 
         report = RoundedBox(orientation="vertical", spacing=dp(7), padding=dp(10), size_hint_y=None)
@@ -7277,14 +7428,15 @@ class ResumenScreen(Screen):
             ("Número Clientes", str(total_clientes)),
             ("Clientes Nuevos", str(clientes_nuevos)),
             ("Pagos Registrados", f"{pagos} / {total_clientes}"),
-            ("Caja Inicial", money(caja_inicial)),
+            ("Caja inicial semana", money(caja_inicial)),
             ("Recaudo Esperado", money(recaudo_esperado)),
             ("Recaudo del día", money(recaudo_dia)),
+            ("Recaudo de la semana", money(recaudo_semana)),
             ("Ingresos", money(ingresos)),
             ("Egresos", money(egresos)),
             ("Pendientes Nube", str(pendientes_sync)),
             (
-                "Estado Jornada",
+                "Estado semana",
                 {
                     "sin_abrir": "SIN ABRIR",
                     "abierta": "ABIERTA",
@@ -7295,7 +7447,7 @@ class ResumenScreen(Screen):
         ]:
             report.add_widget(MetricRow(left, right))
 
-        report.add_widget(MetricRow("Saldo en Caja", money(saldo_caja), highlight=True))
+        report.add_widget(MetricRow("Saldo semanal en caja", money(saldo_caja), highlight=True))
         content.add_widget(report)
 
         actions = RoundedBox(
@@ -7361,7 +7513,12 @@ class ResumenScreen(Screen):
         cloud.bind(
             on_release=lambda *_: self.simulate_cloud_upload()
         )
+        history_week = PillButton("Cierres Semanales", bg_color=(0.36, 0.40, 0.48, 1))
+        history_week.bind(
+            on_release=lambda *_: self.app_ref.go("cierres_semanales")
+        )
         row_cloud.add_widget(cloud)
+        row_cloud.add_widget(history_week)
 
         row_pdf = BoxLayout(
             orientation="horizontal",
@@ -7372,7 +7529,7 @@ class ResumenScreen(Screen):
 
         if journey_status == "sin_abrir":
             close_button = PillButton(
-                "Abrir Jornada",
+                "Abrir Semana",
                 bg_color=SUCCESS,
             )
             close_button.bind(
@@ -7381,7 +7538,7 @@ class ResumenScreen(Screen):
 
         elif journey_status == "abierta":
             close_button = PillButton(
-                "Cerrar Jornada",
+                "Cerrar Semana",
                 bg_color=GOLD,
             )
             close_button.bind(
@@ -7390,7 +7547,7 @@ class ResumenScreen(Screen):
 
         else:
             close_button = PillButton(
-                "Jornada Cerrada",
+                "Semana Cerrada",
                 bg_color=(0.45, 0.48, 0.55, 1),
             )
             close_button.disabled = True
@@ -7416,7 +7573,8 @@ class ResumenScreen(Screen):
         self.root.add_widget(scroll)
 
     def confirm_open_day(self):
-        calculated_opening = cash_balance_before_date()
+        week_start, week_end = week_bounds()
+        calculated_opening = cash_balance_before_date(week_start)
 
         content = BoxLayout(
             orientation="vertical",
@@ -7426,8 +7584,8 @@ class ResumenScreen(Screen):
 
         info = Label(
             text=(
-                f"Fecha: {today_text()}\n"
-                "Escribe la base con la que empieza el día.\n"
+                f"Semana: {display_week_range()}\n"
+                "Escribe la base con la que inicia la semana.\n"
                 f"Sugerencia automática: {money(calculated_opening)}"
             ),
             color=WHITE,
@@ -7439,7 +7597,7 @@ class ResumenScreen(Screen):
         )
         info.bind(size=lambda instance, value: setattr(instance, "text_size", value))
 
-        base_label = FieldLabel("Caja inicial / base del día")
+        base_label = FieldLabel("Caja inicial / base de la semana")
         base_input = MoneyTextInput(
             text=format_thousands(calculated_opening),
             hint_text="Ej: 100.000",
@@ -7460,7 +7618,7 @@ class ResumenScreen(Screen):
             bold=True,
         )
         accept = Button(
-            text="Abrir Jornada",
+            text="Abrir Semana",
             background_normal="",
             background_color=SUCCESS,
             color=WHITE,
@@ -7501,7 +7659,7 @@ class ResumenScreen(Screen):
 
             show_popup(
                 "Jornada abierta",
-                "La jornada fue abierta correctamente.\n\n"
+                "La caja semanal fue abierta correctamente.\n\n"
                 f"Caja inicial: {money(journey['caja_inicial'])}",
                 height=280,
             )
@@ -7520,20 +7678,20 @@ class ResumenScreen(Screen):
 
         if status == "sin_abrir":
             show_popup(
-                "Jornada sin abrir",
-                "Primero debes abrir la jornada.",
+                "Semana sin abrir",
+                "Primero debes abrir la caja semanal.",
             )
             return
 
         if status == "cerrada":
             show_popup(
-                "Jornada cerrada",
-                "La jornada de hoy ya fue cerrada.",
+                "Semana cerrada",
+                "El cierre de esta semana ya fue realizado.",
             )
             return
 
         closure = get_cash_closure()
-        metrics = daily_metrics()
+        metrics = weekly_metrics()
 
         opening_cash = int(closure.get("caja_inicial", 0))
         expected_cash = (
@@ -7574,7 +7732,7 @@ class ResumenScreen(Screen):
         )
         header.bg_color = (0.94, 0.97, 1, 1)
         header_title = Label(
-            text="Arqueo y cierre de caja",
+            text="Arqueo y cierre semanal",
             color=BLUE,
             bold=True,
             font_size="17sp",
@@ -7586,7 +7744,7 @@ class ResumenScreen(Screen):
         header_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
         header_text = Label(
             text=(
-                "Sigue estos 3 pasos: 1) revisa el resumen, 2) escribe el dinero en mano, "
+                "Sigue estos 3 pasos: 1) revisa toda la semana, 2) escribe el dinero en mano, "
                 "3) confirma si la caja cuadra."
             ),
             color=MUTED,
@@ -7609,7 +7767,7 @@ class ResumenScreen(Screen):
         )
 
         step1_title = Label(
-            text="Paso 1. Resumen que calcula el sistema",
+            text="Paso 1. Resumen acumulado de la semana",
             color=DARK,
             bold=True,
             font_size="14sp",
@@ -7621,11 +7779,11 @@ class ResumenScreen(Screen):
         step1_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
         system_box.add_widget(step1_title)
 
-        system_box.add_widget(DetailRow("Fecha", today_text()))
+        system_box.add_widget(DetailRow("Periodo", display_week_range()))
         system_box.add_widget(DetailRow("Caja inicial", money(opening_cash)))
-        system_box.add_widget(DetailRow("Recaudo del día", money(metrics["collected"])))
-        system_box.add_widget(DetailRow("Ingresos adicionales", money(metrics["income"])))
-        system_box.add_widget(DetailRow("Egresos del día", money(metrics["expenses"])))
+        system_box.add_widget(DetailRow("Recaudo semanal", money(metrics["collected"])))
+        system_box.add_widget(DetailRow("Ingresos de la semana", money(metrics["income"])))
+        system_box.add_widget(DetailRow("Egresos de la semana", money(metrics["expenses"])))
         system_box.add_widget(DetailRow("Pendientes de nube", str(pending_cloud)))
 
         expected_card = RoundedBox(
@@ -7864,7 +8022,7 @@ class ResumenScreen(Screen):
         outer.add_widget(buttons)
 
         popup = Popup(
-            title="Cierre de Caja",
+            title="Cierre Semanal de Caja",
             content=outer,
             size_hint=(0.94, 0.94),
             auto_dismiss=False,
@@ -7904,7 +8062,7 @@ class ResumenScreen(Screen):
                 physical_cash=physical_cash,
                 observation=observation,
             )
-            metrics = daily_metrics()
+            metrics = weekly_metrics()
 
             reconciliation_status = str(
                 closure.get("estado_cuadre", "sin_arqueo")
@@ -7936,7 +8094,7 @@ class ResumenScreen(Screen):
             )
             status_box.bg_color = (0.93, 0.98, 0.93, 1) if difference == 0 else (1.0, 0.95, 0.92, 1)
             status_title = Label(
-                text="Jornada cerrada correctamente",
+                text="Semana cerrada correctamente",
                 color=SUCCESS,
                 bold=True,
                 font_size="16sp",
@@ -7966,7 +8124,7 @@ class ResumenScreen(Screen):
                 padding=dp(12),
                 spacing=dp(4),
             )
-            result_box.add_widget(DetailRow("Fecha", today_text()))
+            result_box.add_widget(DetailRow("Periodo", display_week_range()))
             result_box.add_widget(DetailRow("Caja inicial", money(closure.get("caja_inicial", 0))))
             result_box.add_widget(DetailRow("Recaudo del día", money(metrics.get("collected", 0))))
             result_box.add_widget(DetailRow("Ingresos", money(metrics.get("income", 0))))
@@ -8219,6 +8377,7 @@ class CobrosV12App(App):
         self.sm.add_widget(EditarClienteScreen())
         self.sm.add_widget(MovimientosScreen())
         self.sm.add_widget(ClientesPagaronHoyScreen())
+        self.sm.add_widget(CierresSemanalesScreen())
         self.sm.add_widget(ResumenScreen())
 
         self.shell.add_widget(self.sm)
