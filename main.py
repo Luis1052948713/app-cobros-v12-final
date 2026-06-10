@@ -145,6 +145,178 @@ def display_date_from_iso(value):
         return "No definido"
 
 
+def record_date_iso(value):
+    """Convierte fechas de la app a YYYY-MM-DD."""
+    value = str(value or "").strip()
+
+    for date_format in (
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(
+                value,
+                date_format,
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    return ""
+
+
+def records_for_date(records, date_iso=None):
+    date_iso = date_iso or iso_today()
+
+    return [
+        record
+        for record in records
+        if record_date_iso(
+            record.get("fecha", "")
+        ) == date_iso
+    ]
+
+
+def cash_balance_before_date(date_iso=None):
+    """
+    Calcula el saldo acumulado antes de comenzar el día.
+    Ese valor se usa como caja inicial.
+    """
+    date_iso = date_iso or iso_today()
+
+    ingresos = sum(
+        int(movement.get("valor", 0))
+        for movement in MOVIMIENTOS_CAJA
+        if movement.get("tipo") == "Ingreso"
+        and record_date_iso(
+            movement.get("fecha", "")
+        ) < date_iso
+    )
+
+    egresos = sum(
+        int(movement.get("valor", 0))
+        for movement in MOVIMIENTOS_CAJA
+        if movement.get("tipo") == "Egreso"
+        and record_date_iso(
+            movement.get("fecha", "")
+        ) < date_iso
+    )
+
+    recaudos = sum(
+        int(transaction.get("valor", 0))
+        for transaction in TRANSACCIONES
+        if transaction.get("tipo") in (
+            "Cuota",
+            "Aporte",
+        )
+        and record_date_iso(
+            transaction.get("fecha", "")
+        ) < date_iso
+    )
+
+    return ingresos + recaudos - egresos
+
+
+def daily_metrics(date_iso=None):
+    """
+    Calcula únicamente la actividad de una fecha.
+    Evita mezclar el recaudo de ayer con el de hoy.
+    """
+    date_iso = date_iso or iso_today()
+
+    transactions = records_for_date(
+        TRANSACCIONES,
+        date_iso,
+    )
+    movements = records_for_date(
+        MOVIMIENTOS_CAJA,
+        date_iso,
+    )
+
+    payments = [
+        transaction
+        for transaction in transactions
+        if transaction.get("tipo") in (
+            "Cuota",
+            "Aporte",
+        )
+    ]
+
+    no_payments = [
+        transaction
+        for transaction in transactions
+        if transaction.get("tipo") == "No Pago"
+    ]
+
+    postponed = [
+        transaction
+        for transaction in transactions
+        if transaction.get("tipo") == "Siguiente Día"
+    ]
+
+    income = sum(
+        int(movement.get("valor", 0))
+        for movement in movements
+        if movement.get("tipo") == "Ingreso"
+    )
+
+    expenses = sum(
+        int(movement.get("valor", 0))
+        for movement in movements
+        if movement.get("tipo") == "Egreso"
+    )
+
+    collected = sum(
+        int(transaction.get("valor", 0))
+        for transaction in payments
+    )
+
+    opening_cash = cash_balance_before_date(date_iso)
+    closing_cash = (
+        opening_cash
+        + income
+        + collected
+        - expenses
+    )
+
+    new_clients = [
+        client
+        for client in CLIENTES
+        if record_date_iso(
+            client.get("created_at", "")
+        ) == date_iso
+    ]
+
+    expected = sum(
+        int(client.get("cuota", 0))
+        for client in CLIENTES
+        if (
+            client.get("estado") != "paz_y_salvo"
+            and int(client.get("pendientes", 0)) > 0
+            and (
+                not client.get("proximo_cobro")
+                or client.get("proximo_cobro") <= date_iso
+            )
+        )
+    )
+
+    return {
+        "date_iso": date_iso,
+        "transactions": transactions,
+        "movements": movements,
+        "payments": payments,
+        "no_payments": no_payments,
+        "postponed": postponed,
+        "new_clients": new_clients,
+        "income": income,
+        "expenses": expenses,
+        "collected": collected,
+        "opening_cash": opening_cash,
+        "closing_cash": closing_cash,
+        "expected": expected,
+    }
+
+
 def next_due_date(cobro):
     """
     Calcula la próxima fecha de cobro.
@@ -821,16 +993,19 @@ class ProfessionalPDF:
 def generate_daily_pdf_report():
     refresh_memory_from_db()
 
-    total_clientes = len(CLIENTES)
-    pagos = [t for t in TRANSACCIONES if t.get("tipo") in ("Cuota", "Aporte")]
-    no_pagos = [t for t in TRANSACCIONES if t.get("tipo") == "No Pago"]
-    aplazados = [t for t in TRANSACCIONES if t.get("tipo") == "Siguiente Día"]
+    metrics = daily_metrics()
 
-    recaudo_dia = sum(int(t.get("valor", 0)) for t in pagos)
-    ingresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Ingreso")
-    egresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Egreso")
-    recaudo_esperado = sum(int(c.get("cuota", 0)) for c in CLIENTES)
-    saldo_caja = current_cash_balance() if "current_cash_balance" in globals() else (recaudo_dia + ingresos - egresos)
+    total_clientes = len(CLIENTES)
+    pagos = metrics["payments"]
+    no_pagos = metrics["no_payments"]
+    aplazados = metrics["postponed"]
+
+    recaudo_dia = metrics["collected"]
+    ingresos = metrics["income"]
+    egresos = metrics["expenses"]
+    recaudo_esperado = metrics["expected"]
+    caja_inicial = metrics["opening_cash"]
+    saldo_caja = metrics["closing_cash"]
     pendientes_sync = count_pending_sync()
 
     filename = f"cierre_caja_{datetime.now().strftime('%Y_%m_%d_%H_%M')}.pdf"
@@ -845,6 +1020,7 @@ def generate_daily_pdf_report():
         ("Pagos registrados", str(len(pagos)), False),
         ("Clientes no pago", str(len(no_pagos)), False),
         ("Aplazados", str(len(aplazados)), False),
+        ("Caja inicial", money(caja_inicial), False),
         ("Recaudo esperado", money(recaudo_esperado), False),
         ("Recaudo del dia", money(recaudo_dia), True),
         ("Ingresos de caja", money(ingresos), False),
@@ -882,7 +1058,7 @@ def generate_daily_pdf_report():
         shorten(m.get("concepto", ""), 26),
         money(m.get("valor", 0)),
         shorten(m.get("observaciones", ""), 24),
-    ] for m in MOVIMIENTOS_CAJA[-80:]]
+    ] for m in metrics["movements"][-80:]]
     pdf.table(["Tipo", "Concepto", "Valor", "Observacion"], mov_rows, [65, 180, 90, 155])
 
     pdf.section("Clientes activos")
@@ -1093,6 +1269,7 @@ def init_database():
             updated_at TEXT NOT NULL DEFAULT '',
             proximo_cobro TEXT,
             ultima_fecha_pago TEXT,
+            aporte_acumulado INTEGER NOT NULL DEFAULT 0,
             synced INTEGER NOT NULL DEFAULT 0
         )
     """)
@@ -1124,6 +1301,7 @@ def init_database():
         ("updated_at", "TEXT NOT NULL DEFAULT ''"),
         ("proximo_cobro", "TEXT"),
         ("ultima_fecha_pago", "TEXT"),
+        ("aporte_acumulado", "INTEGER NOT NULL DEFAULT 0"),
         ("synced", "INTEGER NOT NULL DEFAULT 0"),
     ]
 
@@ -1148,6 +1326,30 @@ def init_database():
         SET numero_cuotas = pendientes
         WHERE (numero_cuotas IS NULL OR numero_cuotas = 0) AND pendientes > 0
     """)
+
+    closure_columns = [
+        ("observacion_apertura", "TEXT"),
+        ("observacion_cierre", "TEXT"),
+        ("efectivo_contado", "INTEGER NOT NULL DEFAULT 0"),
+        ("diferencia_caja", "INTEGER NOT NULL DEFAULT 0"),
+        ("estado_cuadre", "TEXT NOT NULL DEFAULT 'sin_arqueo'"),
+        ("opened_at", "TEXT"),
+        ("closed_at", "TEXT"),
+    ]
+
+    existing_closure_columns = {
+        row[1]
+        for row in cursor.execute(
+            "PRAGMA table_info(cierres_caja)"
+        ).fetchall()
+    }
+
+    for column_name, column_type in closure_columns:
+        if column_name not in existing_closure_columns:
+            cursor.execute(
+                f"ALTER TABLE cierres_caja "
+                f"ADD COLUMN {column_name} {column_type}"
+            )
 
     cursor.execute("UPDATE clientes SET created_at = ? WHERE created_at IS NULL OR created_at = ''", (now_text(),))
     cursor.execute("UPDATE clientes SET updated_at = ? WHERE updated_at IS NULL OR updated_at = ''", (now_text(),))
@@ -1221,6 +1423,31 @@ def init_database():
         ensure_column(cursor, "movimientos_caja", name, definition)
 
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cierres_caja (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha_iso TEXT NOT NULL UNIQUE,
+            caja_inicial INTEGER NOT NULL DEFAULT 0,
+            recaudo INTEGER NOT NULL DEFAULT 0,
+            ingresos INTEGER NOT NULL DEFAULT 0,
+            egresos INTEGER NOT NULL DEFAULT 0,
+            saldo_final INTEGER NOT NULL DEFAULT 0,
+            pagos INTEGER NOT NULL DEFAULT 0,
+            no_pagos INTEGER NOT NULL DEFAULT 0,
+            aplazados INTEGER NOT NULL DEFAULT 0,
+            estado TEXT NOT NULL DEFAULT 'sin_abrir',
+            observacion_apertura TEXT,
+            observacion_cierre TEXT,
+            efectivo_contado INTEGER NOT NULL DEFAULT 0,
+            diferencia_caja INTEGER NOT NULL DEFAULT 0,
+            estado_cuadre TEXT NOT NULL DEFAULT 'sin_arqueo',
+            opened_at TEXT,
+            closed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS eliminados (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             entidad TEXT NOT NULL,
@@ -1247,7 +1474,7 @@ def load_clients_from_db():
                saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
                codeudor_documento, codeudor_nombre, codeudor_movil,
                valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-               proximo_cobro, ultima_fecha_pago, synced
+               proximo_cobro, ultima_fecha_pago, aporte_acumulado, synced
         FROM clientes
         ORDER BY nombre ASC
     """)
@@ -1309,9 +1536,9 @@ def insert_client_db(cliente):
             saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
             codeudor_documento, codeudor_nombre, codeudor_movil,
             valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-            proximo_cobro, ultima_fecha_pago, synced
+            proximo_cobro, ultima_fecha_pago, aporte_acumulado, synced
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         cliente.get("documento", ""),
         cliente.get("nombre", "SIN NOMBRE"),
@@ -1335,10 +1562,11 @@ def insert_client_db(cliente):
         int(cliente.get("valor_seguro", 0)),
         cliente.get("beneficiario", ""),
         cliente.get("obs_seguro", ""),
-        now_text(),
+        cliente.get("created_at", now_text()),
         now_text(),
         cliente.get("proximo_cobro", iso_today()),
         cliente.get("ultima_fecha_pago", ""),
+        int(cliente.get("aporte_acumulado", 0)),
         int(cliente.get("synced", 0)),
     ))
 
@@ -1359,7 +1587,8 @@ def update_client_db(cliente):
             saldo = ?, pagadas = ?, pendientes = ?, cobro = ?, estado = ?, ultimo_tipo = ?,
             codeudor_documento = ?, codeudor_nombre = ?, codeudor_movil = ?,
             valor_seguro = ?, beneficiario = ?, obs_seguro = ?, updated_at = ?,
-            proximo_cobro = ?, ultima_fecha_pago = ?, synced = ?
+            proximo_cobro = ?, ultima_fecha_pago = ?,
+            aporte_acumulado = ?, synced = ?
         WHERE id = ?
     """, (
         cliente.get("documento", ""),
@@ -1387,6 +1616,7 @@ def update_client_db(cliente):
         now_text(),
         cliente.get("proximo_cobro", ""),
         cliente.get("ultima_fecha_pago", ""),
+        int(cliente.get("aporte_acumulado", 0)),
         int(cliente.get("synced", 0)),
         int(cliente.get("id")),
     ))
@@ -1421,16 +1651,82 @@ def mark_deleted_local(entidad, entidad_id):
         print("ERROR mark_deleted_local:", error)
 
 
-def get_deleted_ids(entidad):
+def get_deleted_ids(entidad, only_pending=False):
+    """
+    Obtiene IDs marcados como eliminados.
+
+    only_pending=True:
+        solo devuelve eliminaciones que todavía no han sido confirmadas
+        en Supabase. Las marcas antiguas synced=1 no deben impedir que un
+        registro existente en la nube vuelva a descargarse.
+    """
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT entidad_id FROM eliminados WHERE entidad = ?", (entidad,))
-        ids = {int(row[0]) for row in cursor.fetchall()}
+
+        if only_pending:
+            cursor.execute(
+                """
+                SELECT entidad_id
+                FROM eliminados
+                WHERE entidad = ?
+                  AND synced = 0
+                """,
+                (entidad,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT entidad_id
+                FROM eliminados
+                WHERE entidad = ?
+                """,
+                (entidad,),
+            )
+
+        ids = {
+            int(row[0])
+            for row in cursor.fetchall()
+        }
         conn.close()
         return ids
+
     except Exception:
         return set()
+
+
+def clear_obsolete_deleted_marks(entidad, remote_ids):
+    """
+    Elimina marcas antiguas synced=1 cuando el registro vuelve a existir
+    en Supabase. Esto permite restaurar datos legítimos en otros equipos.
+    """
+    if not remote_ids:
+        return 0
+
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        placeholders = ",".join("?" for _ in remote_ids)
+
+        cursor.execute(
+            f"""
+            DELETE FROM eliminados
+            WHERE entidad = ?
+              AND synced = 1
+              AND entidad_id IN ({placeholders})
+            """,
+            [entidad, *sorted(remote_ids)],
+        )
+
+        deleted_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return deleted_count
+
+    except Exception as error:
+        print("ERROR clear_obsolete_deleted_marks:", error)
+        return 0
 
 
 def mark_deleted_synced(entidad, entidad_id):
@@ -1506,7 +1802,7 @@ def get_client_by_id(cliente_id):
                saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
                codeudor_documento, codeudor_nombre, codeudor_movil,
                valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-               proximo_cobro, ultima_fecha_pago, synced
+               proximo_cobro, ultima_fecha_pago, aporte_acumulado, synced
         FROM clientes
         WHERE id = ?
     """, (int(cliente_id),))
@@ -1583,9 +1879,192 @@ def clear_all_data_db():
     cursor.execute("DELETE FROM transacciones")
     cursor.execute("DELETE FROM movimientos_caja")
     cursor.execute("DELETE FROM clientes")
+    cursor.execute("DELETE FROM cierres_caja")
     conn.commit()
     conn.close()
     refresh_memory_from_db()
+
+
+def get_cash_closure(date_iso=None):
+    date_iso = date_iso or iso_today()
+
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT * FROM cierres_caja WHERE fecha_iso = ?",
+        (date_iso,),
+    )
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return dict(row) if row else None
+
+
+def get_journey_status(date_iso=None):
+    closure = get_cash_closure(date_iso)
+
+    if not closure:
+        return "sin_abrir"
+
+    return closure.get("estado", "sin_abrir")
+
+
+def open_cash_journey(
+    date_iso=None,
+    opening_cash=None,
+    observation="",
+):
+    date_iso = date_iso or iso_today()
+    existing = get_cash_closure(date_iso)
+
+    if existing and existing.get("estado") in (
+        "abierta",
+        "cerrada",
+    ):
+        raise ValueError(
+            "La jornada de esta fecha ya fue abierta."
+        )
+
+    calculated_opening = cash_balance_before_date(date_iso)
+
+    if opening_cash is None:
+        opening_cash = calculated_opening
+
+    opening_cash = int(opening_cash)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO cierres_caja (
+            fecha_iso,
+            caja_inicial,
+            recaudo,
+            ingresos,
+            egresos,
+            saldo_final,
+            pagos,
+            no_pagos,
+            aplazados,
+            estado,
+            observacion_apertura,
+            observacion_cierre,
+            opened_at,
+            closed_at,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, 0, 0, 0, ?, 0, 0, 0, ?, ?, '', ?, '', ?, ?)
+        ON CONFLICT(fecha_iso) DO UPDATE SET
+            caja_inicial = excluded.caja_inicial,
+            saldo_final = excluded.saldo_final,
+            estado = excluded.estado,
+            observacion_apertura = excluded.observacion_apertura,
+            opened_at = excluded.opened_at,
+            updated_at = excluded.updated_at
+    """, (
+        date_iso,
+        opening_cash,
+        opening_cash,
+        "abierta",
+        observation.strip(),
+        now_text(),
+        now_text(),
+        now_text(),
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return get_cash_closure(date_iso)
+
+
+def save_cash_closure(
+    date_iso=None,
+    observation="",
+    physical_cash=None,
+):
+    date_iso = date_iso or iso_today()
+    existing = get_cash_closure(date_iso)
+
+    if not existing:
+        raise ValueError(
+            "La jornada debe abrirse antes de cerrarla."
+        )
+
+    if existing.get("estado") != "abierta":
+        raise ValueError(
+            "La jornada ya se encuentra cerrada."
+        )
+
+    metrics = daily_metrics(date_iso)
+    opening_cash = int(existing.get("caja_inicial", 0))
+    closing_cash = (
+        opening_cash
+        + metrics["income"]
+        + metrics["collected"]
+        - metrics["expenses"]
+    )
+
+    if physical_cash is None:
+        physical_cash = closing_cash
+
+    physical_cash = int(physical_cash)
+    cash_difference = physical_cash - closing_cash
+
+    if cash_difference == 0:
+        reconciliation_status = "cuadrada"
+    elif cash_difference > 0:
+        reconciliation_status = "sobrante"
+    else:
+        reconciliation_status = "faltante"
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE cierres_caja
+        SET recaudo = ?,
+            ingresos = ?,
+            egresos = ?,
+            saldo_final = ?,
+            pagos = ?,
+            no_pagos = ?,
+            aplazados = ?,
+            estado = ?,
+            observacion_cierre = ?,
+            efectivo_contado = ?,
+            diferencia_caja = ?,
+            estado_cuadre = ?,
+            closed_at = ?,
+            updated_at = ?
+        WHERE fecha_iso = ?
+    """, (
+        metrics["collected"],
+        metrics["income"],
+        metrics["expenses"],
+        closing_cash,
+        len(metrics["payments"]),
+        len(metrics["no_payments"]),
+        len(metrics["postponed"]),
+        "cerrada",
+        observation.strip(),
+        physical_cash,
+        cash_difference,
+        reconciliation_status,
+        now_text(),
+        now_text(),
+        date_iso,
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return get_cash_closure(date_iso)
+
 
 
 def mark_all_as_synced():
@@ -1736,6 +2215,59 @@ def supabase_get(table_name):
         return False, str(error), []
 
 
+def repair_local_cloud_client_count():
+    """
+    Repara diferencias entre Supabase y SQLite usando la nube como fuente
+    principal para los clientes ya sincronizados.
+
+    Flujo:
+    1. Sube clientes locales pendientes para no perder registros nuevos.
+    2. Limpia marcas locales antiguas de eliminación de clientes.
+    3. Descarga nuevamente todos los clientes de Supabase.
+    4. Actualiza la memoria de la aplicación.
+    """
+    try:
+        # Primero conservar cualquier alta o edición local pendiente.
+        upload_ok, upload_message = sync_clients_to_cloud()
+
+        if not upload_ok:
+            return False, (
+                "No se pudo proteger la información local antes de reparar. "
+                f"Detalle: {upload_message}"
+            )
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            DELETE FROM eliminados
+            WHERE entidad = 'cliente'
+            """
+        )
+        removed_marks = cursor.rowcount
+
+        conn.commit()
+        conn.close()
+
+        download_ok, download_message = pull_clients_from_cloud()
+        refresh_memory_from_db()
+
+        if not download_ok:
+            return False, download_message
+
+        return True, (
+            f"Reparación completada. "
+            f"Marcas locales eliminadas: {removed_marks}. "
+            f"{download_message}. "
+            f"Total local actual: {len(CLIENTES)}"
+        )
+
+    except Exception as error:
+        return False, str(error)
+
+
+
 def pull_clients_from_cloud():
     """
     Descarga clientes de Supabase y reconcilia eliminados remotos.
@@ -1748,8 +2280,30 @@ def pull_clients_from_cloud():
     if not ok:
         return False, msg
 
-    deleted_client_ids = get_deleted_ids("cliente")
-    rows = [r for r in rows if int(r.get("id")) not in deleted_client_ids]
+    # Solo las eliminaciones pendientes de subir deben bloquear
+    # temporalmente la restauración desde la nube.
+    pending_deleted_client_ids = get_deleted_ids(
+        "cliente",
+        only_pending=True,
+    )
+
+    all_remote_ids = {
+        int(row.get("id"))
+        for row in rows
+        if row.get("id") is not None
+    }
+
+    obsolete_marks_removed = clear_obsolete_deleted_marks(
+        "cliente",
+        all_remote_ids,
+    )
+
+    rows = [
+        row
+        for row in rows
+        if int(row.get("id"))
+        not in pending_deleted_client_ids
+    ]
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -1767,9 +2321,9 @@ def pull_clients_from_cloud():
                 saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
                 codeudor_documento, codeudor_nombre, codeudor_movil,
                 valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-                proximo_cobro, ultima_fecha_pago, synced
+                proximo_cobro, ultima_fecha_pago, aporte_acumulado, synced
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             client_id,
             r.get("documento", ""),
@@ -1798,13 +2352,18 @@ def pull_clients_from_cloud():
             r.get("updated_at", now_text()),
             r.get("proximo_cobro", ""),
             r.get("ultima_fecha_pago", ""),
+            int(r.get("aporte_acumulado") or 0),
             1,
         ))
 
     cursor.execute("SELECT id FROM clientes WHERE synced = 1")
     local_synced_ids = {int(row[0]) for row in cursor.fetchall()}
 
-    ids_to_delete = (local_synced_ids - remote_ids) - deleted_client_ids
+    ids_to_delete = (
+        local_synced_ids
+        - remote_ids
+        - pending_deleted_client_ids
+    )
 
     for client_id in ids_to_delete:
         cursor.execute("DELETE FROM transacciones WHERE cliente_id = ?", (client_id,))
@@ -1813,7 +2372,11 @@ def pull_clients_from_cloud():
     conn.commit()
     conn.close()
 
-    return True, f"Clientes descargados: {len(rows)} | Eliminados locales: {len(ids_to_delete)}"
+    return True, (
+        f"Clientes descargados: {len(rows)} | "
+        f"Eliminados locales: {len(ids_to_delete)} | "
+        f"Marcas obsoletas limpiadas: {obsolete_marks_removed}"
+    )
 
 
 
@@ -2078,7 +2641,7 @@ def sync_clients_to_cloud():
                saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
                codeudor_documento, codeudor_nombre, codeudor_movil,
                valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-               proximo_cobro, ultima_fecha_pago
+               proximo_cobro, ultima_fecha_pago, aporte_acumulado
         FROM clientes
         WHERE synced = 0
     """)
@@ -2822,10 +3385,14 @@ class ClientesScreen(Screen):
         )
         self.search.bind(text=lambda *_: self.render_clients())
 
+        all_clients_btn = Button(text="TODOS", size_hint_x=None, width=dp(72), background_normal="", background_color=BLUE, color=WHITE, bold=True, font_size="11sp")
+        all_clients_btn.bind(on_release=lambda *_: self.app_ref.go("todos_clientes"))
+
         summary = Button(text="RES", size_hint_x=None, width=dp(54), background_normal="", background_color=GOLD, color=DARK, bold=True, font_size="12sp")
         summary.bind(on_release=lambda *_: self.app_ref.go("resumen"))
 
         row.add_widget(self.search)
+        row.add_widget(all_clients_btn)
         row.add_widget(summary)
         tools.add_widget(row)
         root.add_widget(tools)
@@ -2953,6 +3520,308 @@ class ClientesScreen(Screen):
     def open_client(self, cliente):
         self.app_ref.selected_client = cliente
         self.app_ref.go("gestion_cliente")
+
+
+class TodosClientesScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(name="todos_clientes", **kwargs)
+        self.app_ref = None
+        self.current_filter = "todos"
+
+        root = BoxLayout(orientation="vertical")
+        root.add_widget(Header("Todos los Clientes", show_back=True, on_back=self.go_back))
+
+        top = BoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(222),
+            padding=[dp(12), dp(10), dp(12), dp(8)],
+            spacing=dp(10),
+        )
+
+        self.search = TextInput(
+            hint_text="Buscar por nombre, documento o teléfono...",
+            multiline=False,
+            background_normal="",
+            background_color=WHITE,
+            foreground_color=TEXT,
+            cursor_color=BLUE,
+            padding=[dp(10), dp(10), dp(10), dp(10)],
+            font_size="14sp",
+        )
+        self.search.bind(text=lambda *_: self.render_clients())
+        top.add_widget(self.search)
+
+        # Métricas rápidas
+        metrics_wrap = BoxLayout(orientation="vertical", spacing=dp(8), size_hint_y=None, height=dp(88))
+        self.metrics_row_1 = BoxLayout(orientation="horizontal", spacing=dp(8))
+        self.metrics_row_2 = BoxLayout(orientation="horizontal", spacing=dp(8))
+        metrics_wrap.add_widget(self.metrics_row_1)
+        metrics_wrap.add_widget(self.metrics_row_2)
+        top.add_widget(metrics_wrap)
+
+        filters = BoxLayout(orientation="vertical", spacing=dp(8), size_hint_y=None, height=dp(62))
+        self.filter_row_1 = BoxLayout(orientation="horizontal", spacing=dp(6))
+        self.filter_row_2 = BoxLayout(orientation="horizontal", spacing=dp(6))
+        filters.add_widget(self.filter_row_1)
+        filters.add_widget(self.filter_row_2)
+        top.add_widget(filters)
+
+        actions = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(42),
+            spacing=dp(8),
+        )
+
+        restore_button = Button(
+            text="Restaurar desde nube",
+            background_normal="",
+            background_color=SUCCESS,
+            color=WHITE,
+            bold=True,
+            font_size="12sp",
+        )
+        restore_button.bind(
+            on_release=lambda *_: self.confirm_cloud_restore()
+        )
+
+        refresh_button = Button(
+            text="Actualizar lista",
+            background_normal="",
+            background_color=BLUE,
+            color=WHITE,
+            bold=True,
+            font_size="12sp",
+        )
+        refresh_button.bind(
+            on_release=lambda *_: self.refresh_local_list()
+        )
+
+        actions.add_widget(restore_button)
+        actions.add_widget(refresh_button)
+        top.add_widget(actions)
+
+        root.add_widget(top)
+
+        self.info_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(28), padding=[dp(14), 0, dp(14), 0])
+        self.result_info = Label(text="", color=MUTED, font_size="11sp", halign="left", valign="middle")
+        self.result_info.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        self.info_row.add_widget(self.result_info)
+        root.add_widget(self.info_row)
+
+        self.scroll = ScrollView()
+        self.client_list = BoxLayout(
+            orientation="vertical",
+            padding=[dp(12), dp(4), dp(12), dp(84)],
+            spacing=dp(10),
+            size_hint_y=None,
+        )
+        self.client_list.bind(minimum_height=self.client_list.setter("height"))
+        self.scroll.add_widget(self.client_list)
+        root.add_widget(self.scroll)
+
+        self.add_widget(root)
+
+    def go_back(self, *_):
+        if self.app_ref:
+            self.app_ref.go("clientes")
+
+    def on_pre_enter(self):
+        self.app_ref = App.get_running_app()
+        refresh_memory_from_db()
+        self.build_filters()
+        self.render_metrics()
+        self.render_clients()
+
+    def refresh_local_list(self):
+        refresh_memory_from_db()
+        self.render_metrics()
+        self.render_clients()
+
+    def confirm_cloud_restore(self):
+        confirm_popup(
+            "Restaurar clientes",
+            "Se volverán a descargar los clientes existentes en Supabase.\n\n"
+            "Los clientes locales nuevos se subirán primero para evitar pérdidas.",
+            self.restore_clients_from_cloud,
+        )
+
+    def restore_clients_from_cloud(self):
+        if not supabase_configured():
+            show_popup(
+                "Supabase no configurado",
+                "No se puede restaurar desde la nube.",
+            )
+            return
+
+        show_popup(
+            "Restauración iniciada",
+            "La app está conciliando la base local con Supabase.\n"
+            "La lista se actualizará al terminar.",
+            height=260,
+        )
+
+        def worker():
+            ok, message = repair_local_cloud_client_count()
+            Clock.schedule_once(
+                lambda *_: self.finish_cloud_restore(ok, message),
+                0,
+            )
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+        ).start()
+
+    def finish_cloud_restore(self, ok, message):
+        refresh_memory_from_db()
+        self.render_metrics()
+        self.render_clients()
+
+        show_popup(
+            "Restauración completada" if ok else "No se pudo restaurar",
+            message,
+            height=330,
+        )
+
+    def build_filters(self):
+        self.filter_row_1.clear_widgets()
+        self.filter_row_2.clear_widgets()
+
+        row_1 = [
+            ("Todos", "todos"),
+            ("Activos", "activos"),
+            ("Verdes", "verdes"),
+        ]
+        row_2 = [
+            ("No pago", "no_pago"),
+            ("Paz y salvo", "paz_y_salvo"),
+            ("Sig. día", "siguiente"),
+        ]
+
+        for text, key in row_1:
+            self.filter_row_1.add_widget(self.filter_button(text, key))
+        for text, key in row_2:
+            self.filter_row_2.add_widget(self.filter_button(text, key))
+
+    def filter_button(self, text, key):
+        active = self.current_filter == key
+        btn = Button(
+            text=text,
+            size_hint_y=None,
+            height=dp(28),
+            background_normal="",
+            background_color=BLUE if active else (0.87, 0.89, 0.93, 1),
+            color=WHITE if active else TEXT,
+            bold=True,
+            font_size="11sp",
+        )
+        btn.bind(on_release=lambda *_: self.set_filter(key))
+        return btn
+
+    def set_filter(self, key):
+        self.current_filter = key
+        self.build_filters()
+        self.render_clients()
+
+    def metric_card(self, title, value, bg):
+        box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(40), padding=[dp(8), dp(4), dp(8), dp(4)])
+        with box.canvas.before:
+            Color(*bg)
+            box._bg = RoundedRectangle(pos=box.pos, size=box.size, radius=[dp(8)])
+        box.bind(pos=lambda instance, *_: setattr(instance._bg, 'pos', instance.pos),
+                 size=lambda instance, *_: setattr(instance._bg, 'size', instance.size))
+
+        title_lbl = Label(text=title, color=MUTED if bg != (0.12, 0.22, 0.54, 1) else WHITE, font_size="9sp", halign="center", valign="middle", size_hint_y=0.45)
+        value_lbl = Label(text=str(value), color=TEXT if bg != (0.12, 0.22, 0.54, 1) else WHITE, bold=True, font_size="14sp", halign="center", valign="middle", size_hint_y=0.55)
+        title_lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        value_lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        box.add_widget(title_lbl)
+        box.add_widget(value_lbl)
+        return box
+
+    def render_metrics(self):
+        self.metrics_row_1.clear_widgets()
+        self.metrics_row_2.clear_widgets()
+
+        total = len(CLIENTES)
+        activos = len([c for c in CLIENTES if int(c.get("saldo", 0)) > 0 and int(c.get("pendientes", 0)) > 0])
+        verdes = len([c for c in CLIENTES if c.get("estado") in ("pagado", "aporte")])
+        no_pago = len([c for c in CLIENTES if c.get("estado") == "no_pago"])
+        paz = len([c for c in CLIENTES if c.get("estado") == "paz_y_salvo" or int(c.get("saldo", 0)) <= 0 or int(c.get("pendientes", 0)) <= 0])
+        sig = len([c for c in CLIENTES if c.get("estado") == "siguiente"])
+
+        self.metrics_row_1.add_widget(self.metric_card("Total", total, (0.12, 0.22, 0.54, 1)))
+        self.metrics_row_1.add_widget(self.metric_card("Activos", activos, (0.95, 0.96, 0.99, 1)))
+        self.metrics_row_1.add_widget(self.metric_card("Verdes", verdes, (0.90, 0.98, 0.92, 1)))
+
+        self.metrics_row_2.add_widget(self.metric_card("No pago", no_pago, (1.0, 0.93, 0.93, 1)))
+        self.metrics_row_2.add_widget(self.metric_card("Paz y salvo", paz, (0.91, 0.97, 1.0, 1)))
+        self.metrics_row_2.add_widget(self.metric_card("Sig. día", sig, (1.0, 0.97, 0.88, 1)))
+
+    def apply_filter(self, cliente):
+        estado = cliente.get("estado", "pendiente")
+        saldo = int(cliente.get("saldo", 0))
+        pendientes = int(cliente.get("pendientes", 0))
+
+        if self.current_filter == "todos":
+            return True
+        if self.current_filter == "activos":
+            return saldo > 0 and pendientes > 0
+        if self.current_filter == "verdes":
+            return estado in ("pagado", "aporte")
+        if self.current_filter == "no_pago":
+            return estado == "no_pago"
+        if self.current_filter == "paz_y_salvo":
+            return estado == "paz_y_salvo" or saldo <= 0 or pendientes <= 0
+        if self.current_filter == "siguiente":
+            return estado == "siguiente"
+        return True
+
+    def render_clients(self):
+        self.client_list.clear_widgets()
+        query = (self.search.text or "").strip().lower()
+
+        filtered = []
+        for cliente in CLIENTES:
+            if query:
+                searchable = " ".join([
+                    str(cliente.get("nombre", "")),
+                    str(cliente.get("telefono", "")),
+                    str(cliente.get("documento", "")),
+                ]).lower()
+                if query not in searchable:
+                    continue
+
+            if not self.apply_filter(cliente):
+                continue
+            filtered.append(cliente)
+
+        filtered.sort(key=lambda c: str(c.get("nombre", "")).lower())
+
+        self.result_info.text = (
+            f"Mostrando {len(filtered)} de {len(CLIENTES)} clientes locales"
+        )
+
+        if not filtered:
+            empty = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(140), padding=dp(14), spacing=dp(8))
+            title = Label(text="No hay clientes para este filtro", color=TEXT, bold=True, font_size="15sp", halign="center", size_hint_y=None, height=dp(30))
+            msg = Label(text="Prueba cambiando el filtro o escribiendo otro nombre en el buscador.", color=MUTED, font_size="12sp", halign="center", valign="middle")
+            title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            msg.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            empty.add_widget(title)
+            empty.add_widget(msg)
+            self.client_list.add_widget(empty)
+            return
+
+        for cliente in filtered:
+            self.client_list.add_widget(ClienteCard(cliente, self.open_client))
+
+    def open_client(self, cliente):
+        self.app_ref.selected_client = cliente
+        self.app_ref.go("gestion_cliente")
+
 
 
 # ============================================================
@@ -3198,6 +4067,12 @@ class HistorialClienteScreen(Screen):
         summary.add_widget(DetailRow("Fecha final", actual_or_projected_end_date(self.cliente, transactions)))
         summary.add_widget(DetailRow("Tipo de cobro", self.cliente.get("cobro", "Diario")))
         summary.add_widget(DetailRow("Valor de cuota", money(self.cliente.get("cuota", 0))))
+        summary.add_widget(
+            DetailRow(
+                "Aporte acumulado",
+                money(self.cliente.get("aporte_acumulado", 0)),
+            )
+        )
         summary.add_widget(DetailRow("Cuotas pagadas", str(self.cliente.get("pagadas", 0))))
         summary.add_widget(DetailRow("Cuotas pendientes", str(self.cliente.get("pendientes", 0))))
         summary.add_widget(DetailRow("Saldo actual", money(self.cliente.get("saldo", 0))))
@@ -3278,7 +4153,7 @@ class HistorialClienteScreen(Screen):
             accent = GOLD
         elif tipo == "No Pago":
             accent = DANGER
-        elif tipo == "Renovación":
+        elif tipo in ("Renovación", "Migración"):
             accent = BLUE
         else:
             accent = (0.45, 0.48, 0.55, 1)
@@ -3680,8 +4555,25 @@ class CuotaScreen(Screen):
                 btn.background_color = (0.88, 0.90, 0.94, 1)
                 btn.color = DARK
 
-        if selected in ("Cuota", "Aporte"):
+        if selected == "Cuota":
+            self.numero_cuotas.readonly = False
+            if not str(self.numero_cuotas.text or "").strip():
+                self.numero_cuotas.text = "1"
             self.on_installments_changed()
+
+        elif selected == "Aporte":
+            # En aporte, las cuotas se calculan según el valor entregado.
+            self.numero_cuotas.readonly = True
+            self.numero_cuotas.text = "0"
+            self.warning.text = (
+                "Ingrese cualquier valor. El sistema acumulará el aporte "
+                "y acreditará cuotas completas automáticamente."
+            )
+            self.warning.color = MUTED
+
+        else:
+            self.numero_cuotas.readonly = True
+            self.numero_cuotas.text = "0"
 
     def selected_tipo(self):
         for btn in self.tipo_buttons:
@@ -3706,7 +4598,7 @@ class CuotaScreen(Screen):
             return
 
         tipo = self.selected_tipo()
-        if tipo not in ("Cuota", "Aporte"):
+        if tipo != "Cuota":
             return
 
         raw_value = str(self.numero_cuotas.text or "").strip()
@@ -3745,16 +4637,48 @@ class CuotaScreen(Screen):
         self.nuevo_saldo.text = format_thousands(max(saldo - pago, 0))
 
     def register_transaction(self):
+        if get_journey_status() != "abierta":
+            show_popup(
+                "Jornada no abierta",
+                "Debes abrir la jornada antes de registrar cobros.",
+                height=260,
+            )
+            return
+
         tipo = self.selected_tipo()
         pago = to_int(self.valor_pagar.text, 0)
         estado_actual = self.cliente.get("estado", "pendiente")
-        raw_cuotas = str(self.numero_cuotas.text or "").strip()
+        pendientes_actuales = max(
+            int(self.cliente.get("pendientes", 0)),
+            0,
+        )
+        saldo_anterior = int(self.cliente.get("saldo", 0))
+        pagadas_anteriores = int(self.cliente.get("pagadas", 0))
+        cuota_unitaria = max(int(self.cliente.get("cuota", 0)), 0)
+        aporte_anterior = max(
+            int(self.cliente.get("aporte_acumulado", 0)),
+            0,
+        )
 
-        if tipo in ("Cuota", "Aporte"):
+        if pendientes_actuales <= 0 or saldo_anterior <= 0:
+            show_popup(
+                "Crédito finalizado",
+                "Este cliente ya no tiene deuda pendiente.",
+            )
+            return
+
+        cantidad_cuotas = 0
+        aporte_nuevo = aporte_anterior
+
+        if tipo == "Cuota":
+            raw_cuotas = str(
+                self.numero_cuotas.text or ""
+            ).strip()
+
             if raw_cuotas == "":
                 show_popup(
                     "Número de cuotas requerido",
-                    "Ingrese cuántas cuotas desea acreditar."
+                    "Ingrese cuántas cuotas desea acreditar.",
                 )
                 return
 
@@ -3763,83 +4687,129 @@ class CuotaScreen(Screen):
             except ValueError:
                 show_popup(
                     "Número de cuotas inválido",
-                    "Ingrese un número entero, por ejemplo: 1, 2 o 3."
+                    "Ingrese un número entero.",
                 )
                 return
 
             if cantidad_cuotas <= 0:
                 show_popup(
                     "Número de cuotas inválido",
-                    "El número de cuotas debe ser mayor que cero."
+                    "El número de cuotas debe ser mayor que cero.",
                 )
-                return
-        else:
-            cantidad_cuotas = 0
-
-        if estado_actual in ("pagado", "aporte", "no_pago"):
-            tipo = "Aporte"
-
-        pendientes_actuales = max(int(self.cliente.get("pendientes", 0)), 0)
-
-        if tipo in ("Cuota", "Aporte"):
-            if pendientes_actuales <= 0:
-                show_popup("Crédito finalizado", "Este cliente ya no tiene cuotas pendientes.")
                 return
 
             if cantidad_cuotas > pendientes_actuales:
                 show_popup(
                     "Número de cuotas inválido",
-                    f"Solo quedan {pendientes_actuales} cuotas pendientes."
+                    f"Solo quedan {pendientes_actuales} cuotas pendientes.",
                 )
                 return
 
-            valor_minimo = int(self.cliente.get("cuota", 0)) * cantidad_cuotas
+            valor_minimo = cuota_unitaria * cantidad_cuotas
 
             if pago < valor_minimo:
                 show_popup(
                     "Valor insuficiente",
-                    f"Para acreditar {cantidad_cuotas} cuota(s), debe pagar mínimo {money(valor_minimo)}."
+                    f"Para acreditar {cantidad_cuotas} cuota(s), "
+                    f"debe pagar mínimo {money(valor_minimo)}.",
                 )
                 return
-        else:
-            cantidad_cuotas = 0
-            pago = 0
 
-        saldo_anterior = int(self.cliente.get("saldo", 0))
-        pagadas_anteriores = int(self.cliente.get("pagadas", 0))
-
-        if tipo in ("Cuota", "Aporte"):
-            self.cliente["saldo"] = max(saldo_anterior - pago, 0)
-            self.cliente["pagadas"] = pagadas_anteriores + cantidad_cuotas
-            self.cliente["pendientes"] = max(pendientes_actuales - cantidad_cuotas, 0)
-            self.cliente["estado"] = "pagado" if tipo == "Cuota" else "aporte"
+            self.cliente["saldo"] = max(
+                saldo_anterior - pago,
+                0,
+            )
+            self.cliente["pagadas"] = (
+                pagadas_anteriores + cantidad_cuotas
+            )
+            self.cliente["pendientes"] = max(
+                pendientes_actuales - cantidad_cuotas,
+                0,
+            )
+            self.cliente["aporte_acumulado"] = aporte_anterior
+            self.cliente["estado"] = "pagado"
             self.cliente["ultimo_tipo"] = (
                 f"{cantidad_cuotas} cuota(s) pagada(s)"
-                if tipo == "Cuota"
-                else f"Aporte aplicado a {cantidad_cuotas} cuota(s)"
             )
-            self.cliente["ultima_fecha_pago"] = iso_today()
-            # El cronograma avanza desde la fecha programada actual,
-            # no desde la fecha del dispositivo.
-            if (
-                self.cliente["pendientes"] <= 0
-                or self.cliente["saldo"] <= 0
-            ):
-                self.cliente["estado"] = "paz_y_salvo"
-                self.cliente["ultimo_tipo"] = "Crédito cancelado - Paz y salvo"
-                self.cliente["proximo_cobro"] = ""
+
+        elif tipo == "Aporte":
+            if pago <= 0:
+                show_popup(
+                    "Valor inválido",
+                    "Ingrese un aporte mayor que cero.",
+                )
+                return
+
+            # El saldo disminuye por todo el dinero recibido.
+            self.cliente["saldo"] = max(
+                saldo_anterior - pago,
+                0,
+            )
+
+            total_acumulado = aporte_anterior + pago
+
+            if cuota_unitaria > 0:
+                cuotas_completas = (
+                    total_acumulado // cuota_unitaria
+                )
+                cantidad_cuotas = min(
+                    int(cuotas_completas),
+                    pendientes_actuales,
+                )
+                aporte_nuevo = (
+                    total_acumulado
+                    - cantidad_cuotas * cuota_unitaria
+                )
             else:
-                self.cliente["proximo_cobro"] = next_due_from_anchor(
-                    self.cliente.get("proximo_cobro", ""),
-                    self.cliente.get("cobro", "Diario"),
-                    cantidad_cuotas,
+                cantidad_cuotas = 0
+                aporte_nuevo = total_acumulado
+
+            self.cliente["pagadas"] = (
+                pagadas_anteriores + cantidad_cuotas
+            )
+            self.cliente["pendientes"] = max(
+                pendientes_actuales - cantidad_cuotas,
+                0,
+            )
+
+            # Si terminó el crédito, no debe quedar aporte residual.
+            if (
+                self.cliente["saldo"] <= 0
+                or self.cliente["pendientes"] <= 0
+            ):
+                aporte_nuevo = 0
+
+            self.cliente["aporte_acumulado"] = aporte_nuevo
+
+            if cantidad_cuotas > 0:
+                self.cliente["estado"] = "aporte"
+                self.cliente["ultimo_tipo"] = (
+                    f"Aporte de {money(pago)}: "
+                    f"{cantidad_cuotas} cuota(s) acreditada(s). "
+                    f"Acumulado restante: {money(aporte_nuevo)}"
+                )
+            else:
+                # Sigue amarillo porque aún no completó una cuota.
+                self.cliente["estado"] = "pendiente"
+                faltante = max(
+                    cuota_unitaria - aporte_nuevo,
+                    0,
+                )
+                self.cliente["ultimo_tipo"] = (
+                    f"Aporte parcial de {money(pago)}. "
+                    f"Acumulado: {money(aporte_nuevo)}. "
+                    f"Faltan {money(faltante)} para completar una cuota."
                 )
 
         elif tipo == "No Pago":
+            pago = 0
+            cantidad_cuotas = 0
             self.cliente["estado"] = "no_pago"
             self.cliente["ultimo_tipo"] = "No pago"
 
         elif tipo == "Siguiente Día":
+            pago = 0
+            cantidad_cuotas = 0
             self.cliente["estado"] = "siguiente"
             self.cliente["ultimo_tipo"] = "Siguiente día"
             self.cliente["proximo_cobro"] = next_due_from_anchor(
@@ -3847,6 +4817,29 @@ class CuotaScreen(Screen):
                 "Diario",
                 1,
             )
+
+        if tipo in ("Cuota", "Aporte"):
+            self.cliente["ultima_fecha_pago"] = iso_today()
+
+            if (
+                self.cliente["pendientes"] <= 0
+                or self.cliente["saldo"] <= 0
+            ):
+                self.cliente["estado"] = "paz_y_salvo"
+                self.cliente["ultimo_tipo"] = (
+                    "Crédito cancelado - Paz y salvo"
+                )
+                self.cliente["proximo_cobro"] = ""
+                self.cliente["aporte_acumulado"] = 0
+
+            elif cantidad_cuotas > 0:
+                # Solo avanza el cronograma cuando se completa al menos
+                # una cuota. Un aporte parcial no cambia la fecha.
+                self.cliente["proximo_cobro"] = next_due_from_anchor(
+                    self.cliente.get("proximo_cobro", ""),
+                    self.cliente.get("cobro", "Diario"),
+                    cantidad_cuotas,
+                )
 
         self.cliente["synced"] = 0
         update_client_db(self.cliente)
@@ -3860,27 +4853,64 @@ class CuotaScreen(Screen):
             "fecha": now_text(),
             "numero_cuotas": cantidad_cuotas,
             "saldo_anterior": saldo_anterior,
-            "saldo_nuevo": int(self.cliente.get("saldo", 0)),
-            "cuotas_pagadas_total": int(self.cliente.get("pagadas", 0)),
-            "cuotas_pendientes_total": int(self.cliente.get("pendientes", 0)),
-            "observacion": self.cliente.get("ultimo_tipo", ""),
+            "saldo_nuevo": int(
+                self.cliente.get("saldo", 0)
+            ),
+            "cuotas_pagadas_total": int(
+                self.cliente.get("pagadas", 0)
+            ),
+            "cuotas_pendientes_total": int(
+                self.cliente.get("pendientes", 0)
+            ),
+            "observacion": self.cliente.get(
+                "ultimo_tipo",
+                "",
+            ),
             "synced": 0,
         })
 
         refresh_memory_from_db()
         App.get_running_app().request_auto_sync()
 
-        if tipo in ("Cuota", "Aporte"):
+        if tipo == "Aporte":
+            faltante = max(
+                cuota_unitaria
+                - int(self.cliente.get("aporte_acumulado", 0)),
+                0,
+            )
+
+            show_popup(
+                "Aporte registrado",
+                f"Valor recibido: {money(pago)}.\n"
+                f"Cuotas acreditadas: {cantidad_cuotas}.\n"
+                f"Aporte acumulado: "
+                f"{money(self.cliente.get('aporte_acumulado', 0))}.\n"
+                f"Faltante próxima cuota: {money(faltante)}.\n"
+                f"Nuevo saldo: {money(self.cliente.get('saldo', 0))}.",
+                height=360,
+            )
+
+        elif tipo == "Cuota":
             show_popup(
                 "Transacción registrada",
                 f"Cuotas acreditadas: {cantidad_cuotas}.\n"
-                f"Pendientes: {self.cliente.get('pendientes', 0)}.\n"
-                f"Nuevo saldo: {money(self.cliente.get('saldo', 0))}."
+                f"Pendientes: "
+                f"{self.cliente.get('pendientes', 0)}.\n"
+                f"Nuevo saldo: "
+                f"{money(self.cliente.get('saldo', 0))}.",
             )
-        else:
-            show_popup("Transacción registrada", "La novedad fue guardada correctamente.")
 
-        Clock.schedule_once(lambda *_: self.app_ref.go("clientes"), 0.9)
+        else:
+            show_popup(
+                "Transacción registrada",
+                "La novedad fue guardada correctamente.",
+            )
+
+        Clock.schedule_once(
+            lambda *_: self.app_ref.go("clientes"),
+            0.9,
+        )
+
 
 
 # ============================================================
@@ -3919,6 +4949,57 @@ class NuevoClienteScreen(Screen):
         self.beneficiario = AppTextInput(hint_text="Nombre beneficiario")
         self.obs_seguro = AppTextInput(hint_text="Observaciones", multiline=True)
 
+        # Tipo de registro:
+        # - Nuevo préstamo: genera desembolso y descuenta caja.
+        # - Préstamo existente: migra un cartón viejo sin afectar caja.
+        self.tipo_registro = Spinner(
+            text="Nuevo préstamo",
+            values=["Nuevo préstamo", "Préstamo existente"],
+            size_hint_y=None,
+            height=dp(44),
+            background_normal="",
+            background_color=WHITE,
+            color=TEXT,
+        )
+        self.tipo_registro.bind(
+            text=lambda *_: self.on_record_type_changed()
+        )
+
+        self.fecha_inicio_existente = AppTextInput(
+            hint_text="Seleccione fecha de inicio",
+            readonly=True,
+        )
+        self.cuotas_pagadas_existente = AppTextInput(
+            hint_text="Ej: 7",
+            input_filter="int",
+        )
+        self.cuotas_pendientes_existente = AppTextInput(
+            text="0",
+            readonly=True,
+        )
+        self.total_pagado_existente = MoneyTextInput(
+            text="0",
+            readonly=True,
+        )
+        self.saldo_existente = MoneyTextInput(
+            text="0",
+            readonly=True,
+        )
+        self.aporte_existente = MoneyTextInput(
+            hint_text="Aporte parcial acumulado",
+        )
+        self.proximo_cobro_existente = AppTextInput(
+            hint_text="Seleccione próxima fecha",
+            readonly=True,
+        )
+
+        self.cuotas_pagadas_existente.bind(
+            text=lambda *_: self.calculate_existing_status()
+        )
+        self.aporte_existente.bind(
+            text=lambda *_: self.calculate_existing_status()
+        )
+
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
 
@@ -3953,6 +5034,112 @@ class NuevoClienteScreen(Screen):
         self.beneficiario.text = ""
         self.obs_seguro.text = ""
 
+        self.tipo_registro.text = "Nuevo préstamo"
+        self.fecha_inicio_existente.text = ""
+        self.cuotas_pagadas_existente.text = ""
+        self.cuotas_pendientes_existente.text = "0"
+        self.total_pagado_existente.text = "0"
+        self.saldo_existente.text = "0"
+        self.aporte_existente.text = ""
+        self.proximo_cobro_existente.text = ""
+
+    def is_existing_loan(self):
+        return self.tipo_registro.text == "Préstamo existente"
+
+    def on_record_type_changed(self):
+        """
+        Reconstruye el formulario para mostrar u ocultar los campos
+        especiales del préstamo existente.
+        """
+        if hasattr(self, "root") and self.root.children:
+            self.build()
+
+    def calculate_existing_status(self):
+        """
+        Calcula automáticamente el estado económico del cartón viejo.
+
+        Cuotas pendientes:
+            cuotas totales - cuotas pagadas
+
+        Total pagado acumulado:
+            cuotas pagadas * valor de cuota + aporte parcial
+
+        Saldo actual:
+            total del crédito - total pagado acumulado
+        """
+        total_installments = max(
+            to_int(self.numero_cuotas.text, 0),
+            0,
+        )
+        paid_installments = max(
+            to_int(self.cuotas_pagadas_existente.text, 0),
+            0,
+        )
+        installment_value = max(
+            to_int(self.valor_cuota.text, 0),
+            0,
+        )
+        total_credit = max(
+            to_int(self.total_credito.text, 0),
+            0,
+        )
+        partial_contribution = max(
+            to_int(self.aporte_existente.text, 0),
+            0,
+        )
+
+        # Evitar mostrar valores incoherentes mientras se escribe.
+        paid_installments_for_calculation = min(
+            paid_installments,
+            total_installments,
+        )
+
+        pending_installments = max(
+            total_installments - paid_installments,
+            0,
+        )
+
+        paid_by_installments = (
+            paid_installments_for_calculation
+            * installment_value
+        )
+
+        total_paid = min(
+            paid_by_installments + partial_contribution,
+            total_credit,
+        )
+
+        current_balance = max(
+            total_credit - total_paid,
+            0,
+        )
+
+        self.cuotas_pendientes_existente.text = str(
+            pending_installments
+        )
+        self.total_pagado_existente.text = format_thousands(
+            total_paid
+        )
+        self.saldo_existente.text = format_thousands(
+            current_balance
+        )
+
+
+    def open_existing_date_calendar(self, target_input):
+        initial_date = normalize_date_input(target_input.text)
+
+        CalendarPopup(
+            initial_date=initial_date,
+            on_select=lambda selected: self.set_existing_date(
+                target_input,
+                selected,
+            ),
+        ).open()
+
+    @staticmethod
+    def set_existing_date(target_input, selected_date):
+        target_input.text = selected_date.strftime("%d/%m/%Y")
+
     def calculate_credit(self):
         base = to_int(self.valor_credito.text, 0)
         interes = to_float(self.interes.text, 0)
@@ -3963,6 +5150,7 @@ class NuevoClienteScreen(Screen):
 
         self.total_credito.text = format_thousands(total)
         self.valor_cuota.text = format_thousands(cuota)
+        self.calculate_existing_status()
 
     def build(self):
         self.root.clear_widgets()
@@ -4028,6 +5216,17 @@ class NuevoClienteScreen(Screen):
 
         content.add_widget(
             self.form_card(
+                "0",
+                "TIPO DE REGISTRO",
+                [
+                    ("Seleccione una opción", self.tipo_registro),
+                ],
+                height=dp(138),
+            )
+        )
+
+        content.add_widget(
+            self.form_card(
                 "1",
                 "DATOS DEL CLIENTE",
                 [
@@ -4056,6 +5255,107 @@ class NuevoClienteScreen(Screen):
                 height=dp(536),
             )
         )
+
+        if self.is_existing_loan():
+            existing_card = RoundedBox(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(668),
+                padding=[dp(12), dp(10), dp(12), dp(14)],
+                spacing=dp(8),
+            )
+
+            existing_header = Label(
+                text="ESTADO ACTUAL DEL CARTÓN VIEJO",
+                color=BLUE,
+                bold=True,
+                font_size="14sp",
+                halign="left",
+                valign="middle",
+                size_hint_y=None,
+                height=dp(36),
+            )
+            existing_header.bind(
+                size=lambda instance, value: setattr(
+                    instance,
+                    "text_size",
+                    value,
+                )
+            )
+            existing_card.add_widget(existing_header)
+
+            for label, widget in [
+                ("Fecha original de inicio", self.fecha_inicio_existente),
+                ("Cuotas ya pagadas", self.cuotas_pagadas_existente),
+                ("Cuotas pendientes calculadas", self.cuotas_pendientes_existente),
+                ("Aporte parcial acumulado", self.aporte_existente),
+                ("Total pagado acumulado", self.total_pagado_existente),
+                ("Saldo actual calculado", self.saldo_existente),
+                ("Próxima fecha real de cobro", self.proximo_cobro_existente),
+            ]:
+                field = BoxLayout(
+                    orientation="vertical",
+                    size_hint_y=None,
+                    height=dp(72),
+                    spacing=dp(5),
+                )
+                field.add_widget(FieldLabel(label))
+
+                if widget in (
+                    self.fecha_inicio_existente,
+                    self.proximo_cobro_existente,
+                ):
+                    date_row = BoxLayout(
+                        orientation="horizontal",
+                        size_hint_y=None,
+                        height=dp(44),
+                        spacing=dp(8),
+                    )
+                    detach_widget(widget)
+                    date_row.add_widget(widget)
+
+                    date_button = Button(
+                        text="Calendario",
+                        size_hint_x=None,
+                        width=dp(108),
+                        background_normal="",
+                        background_color=BLUE,
+                        color=WHITE,
+                        bold=True,
+                    )
+                    date_button.bind(
+                        on_release=lambda _button, target=widget:
+                        self.open_existing_date_calendar(target)
+                    )
+                    date_row.add_widget(date_button)
+                    field.add_widget(date_row)
+                else:
+                    detach_widget(widget)
+                    field.add_widget(widget)
+
+                existing_card.add_widget(field)
+
+            note = Label(
+                text=(
+                    "Este modo no genera un nuevo egreso de caja. "
+                    "Solo carga el estado real del préstamo anterior."
+                ),
+                color=MUTED,
+                font_size="11sp",
+                halign="left",
+                valign="middle",
+                size_hint_y=None,
+                height=dp(50),
+            )
+            note.bind(
+                size=lambda instance, value: setattr(
+                    instance,
+                    "text_size",
+                    value,
+                )
+            )
+            existing_card.add_widget(note)
+            content.add_widget(existing_card)
 
         content.add_widget(
             self.form_card(
@@ -4109,6 +5409,12 @@ class NuevoClienteScreen(Screen):
             self.valor_seguro,
             self.beneficiario,
             self.obs_seguro,
+            self.fecha_inicio_existente,
+            self.cuotas_pagadas_existente,
+            self.aporte_existente,
+            self.total_pagado_existente,
+            self.saldo_existente,
+            self.proximo_cobro_existente,
         ]:
             bind_scroll_to_input(scroll, input_widget)
 
@@ -4188,6 +5494,14 @@ class NuevoClienteScreen(Screen):
             self.build()
 
     def create_client(self):
+        if get_journey_status() != "abierta":
+            show_popup(
+                "Jornada no abierta",
+                "Debes abrir la jornada antes de crear un préstamo.",
+                height=260,
+            )
+            return
+
         self.calculate_credit()
 
         nombre = normalize_client_name(self.nombre.text)
@@ -4213,75 +5527,234 @@ class NuevoClienteScreen(Screen):
         cuota = to_int(self.valor_cuota.text, 0)
         numero_cuotas = to_int(self.numero_cuotas.text, 0)
 
-        if valor_credito <= 0 or total_credito <= 0 or cuota <= 0 or numero_cuotas <= 0:
+        if (
+            valor_credito <= 0
+            or total_credito <= 0
+            or cuota <= 0
+            or numero_cuotas <= 0
+        ):
             show_popup(
                 "Datos incompletos",
-                "Revise valor crédito, interés y número de cuotas."
+                "Revise valor crédito, interés y número de cuotas.",
             )
             return
 
-        refresh_memory_from_db()
-        saldo_caja = current_cash_balance()
+        existing_loan = self.is_existing_loan()
 
-        if valor_credito > saldo_caja:
-            show_popup(
-                "Saldo insuficiente",
-                f"No se puede crear el préstamo.\n"
-                f"Valor a prestar: {money(valor_credito)}\n"
-                f"Saldo en caja: {money(saldo_caja)}\n\n"
-                f"Primero registre un INGRESO o CAJA INICIAL."
+        if existing_loan:
+            fecha_inicio_iso = normalize_date_input(
+                self.fecha_inicio_existente.text
             )
-            return
+            proximo_cobro_iso = normalize_date_input(
+                self.proximo_cobro_existente.text
+            )
+            pagadas = max(
+                to_int(self.cuotas_pagadas_existente.text, 0),
+                0,
+            )
+            pendientes = max(numero_cuotas - pagadas, 0)
+            self.calculate_existing_status()
+
+            saldo_actual = to_int(self.saldo_existente.text, 0)
+            total_pagado_acumulado = to_int(
+                self.total_pagado_existente.text,
+                0,
+            )
+            aporte_acumulado = max(
+                to_int(self.aporte_existente.text, 0),
+                0,
+            )
+
+            if not fecha_inicio_iso:
+                show_popup(
+                    "Fecha requerida",
+                    "Seleccione la fecha original de inicio.",
+                )
+                return
+
+            if not proximo_cobro_iso and pendientes > 0:
+                show_popup(
+                    "Próxima fecha requerida",
+                    "Seleccione la próxima fecha real de cobro.",
+                )
+                return
+
+            if pagadas > numero_cuotas:
+                show_popup(
+                    "Cuotas inválidas",
+                    "Las cuotas pagadas no pueden superar el total.",
+                )
+                return
+
+            if saldo_actual < 0 or saldo_actual > total_credito:
+                show_popup(
+                    "Saldo inválido",
+                    "El saldo actual debe estar entre cero y el total del crédito.",
+                )
+                return
+
+            if aporte_acumulado >= cuota and cuota > 0:
+                show_popup(
+                    "Aporte acumulado inválido",
+                    "El aporte parcial debe ser menor que una cuota. "
+                    "Las cuotas completas deben registrarse como pagadas.",
+                    height=290,
+                )
+                return
+
+            if saldo_actual <= 0 or pendientes <= 0:
+                estado = "paz_y_salvo"
+                ultimo_tipo = "Crédito cancelado - Paz y salvo"
+                proximo_cobro_iso = ""
+                aporte_acumulado = 0
+            else:
+                today = datetime.now().date()
+                next_date = datetime.strptime(
+                    proximo_cobro_iso,
+                    "%Y-%m-%d",
+                ).date()
+
+                # Si la fecha ya llegó, aparece amarillo.
+                # Si es futura, queda oculto hasta ese día.
+                estado = (
+                    "pendiente"
+                    if next_date <= today
+                    else "pagado"
+                )
+                ultimo_tipo = "Préstamo existente cargado"
+
+            created_at = datetime.strptime(
+                fecha_inicio_iso,
+                "%Y-%m-%d",
+            ).strftime("%d/%m/%Y 00:00")
+
+        else:
+            refresh_memory_from_db()
+            saldo_caja = current_cash_balance()
+
+            if valor_credito > saldo_caja:
+                show_popup(
+                    "Saldo insuficiente",
+                    f"No se puede crear el préstamo.\n"
+                    f"Valor a prestar: {money(valor_credito)}\n"
+                    f"Saldo en caja: {money(saldo_caja)}\n\n"
+                    f"Primero registre un INGRESO o CAJA INICIAL.",
+                )
+                return
+
+            pagadas = 0
+            pendientes = numero_cuotas
+            saldo_actual = total_credito
+            aporte_acumulado = 0
+            estado = "pendiente"
+            ultimo_tipo = "Pendiente por cobrar"
+            proximo_cobro_iso = iso_today()
+            created_at = now_text()
 
         cliente = {
             "documento": self.documento.text.strip(),
             "nombre": nombre,
-            "telefono": f"+57 {self.movil.text.strip()}" if self.movil.text.strip() else "",
+            "telefono": (
+                f"+57 {self.movil.text.strip()}"
+                if self.movil.text.strip()
+                else ""
+            ),
             "direccion": self.direccion.text.strip(),
-            "producto": self.producto.text.strip() or "5 - CREDITO EN EFECTIVO",
+            "producto": (
+                self.producto.text.strip()
+                or "5 - CREDITO EN EFECTIVO"
+            ),
             "valor_credito": valor_credito,
             "interes": to_float(self.interes.text, 0),
             "total_credito": total_credito,
             "cuota": cuota,
             "numero_cuotas": numero_cuotas,
-            "saldo": total_credito,
-            "pagadas": 0,
-            "pendientes": numero_cuotas,
+            "saldo": saldo_actual,
+            "pagadas": pagadas,
+            "pendientes": pendientes,
             "cobro": self.cobro.text,
-            "estado": "pendiente",
-            "ultimo_tipo": "Pendiente por cobrar",
-            "proximo_cobro": iso_today(),
+            "estado": estado,
+            "ultimo_tipo": ultimo_tipo,
+            "proximo_cobro": proximo_cobro_iso,
             "ultima_fecha_pago": "",
+            "aporte_acumulado": aporte_acumulado,
+            "created_at": created_at,
             "synced": 0,
-            "codeudor_documento": self.documento_codeudor.text.strip(),
-            "codeudor_nombre": self.nombre_codeudor.text.strip(),
-            "codeudor_movil": self.movil_codeudor.text.strip(),
-            "valor_seguro": to_int(self.valor_seguro.text, 0),
+            "codeudor_documento": (
+                self.documento_codeudor.text.strip()
+            ),
+            "codeudor_nombre": (
+                self.nombre_codeudor.text.strip()
+            ),
+            "codeudor_movil": (
+                self.movil_codeudor.text.strip()
+            ),
+            "valor_seguro": to_int(
+                self.valor_seguro.text,
+                0,
+            ),
             "beneficiario": self.beneficiario.text.strip(),
             "obs_seguro": self.obs_seguro.text.strip(),
         }
 
         cliente_id = insert_client_db(cliente)
 
-        insert_movement_db({
-            "tipo": "Egreso",
-            "concepto": "Desembolso préstamo",
-            "valor": valor_credito,
-            "observaciones": f"Préstamo entregado a {nombre}",
-            "fecha": today_text(),
-            "synced": 0,
-        })
+        if existing_loan:
+            # Registro inicial para que el historial explique cómo entró.
+            insert_transaction_db({
+                "cliente_id": cliente_id,
+                "cliente": nombre,
+                "tipo": "Migración",
+                "valor": 0,
+                "metodo": "Cartón anterior",
+                "fecha": now_text(),
+                "numero_cuotas": pagadas,
+                "saldo_anterior": total_credito,
+                "saldo_nuevo": saldo_actual,
+                "cuotas_pagadas_total": pagadas,
+                "cuotas_pendientes_total": pendientes,
+                "observacion": (
+                    "Préstamo existente cargado al sistema. "
+                    f"Fecha original: "
+                    f"{self.fecha_inicio_existente.text}. "
+                    f"Total pagado acumulado: "
+                    f"{money(total_pagado_acumulado)}. "
+                    "No generó egreso de caja."
+                ),
+                "synced": 0,
+            })
+        else:
+            insert_movement_db({
+                "tipo": "Egreso",
+                "concepto": "Desembolso préstamo",
+                "valor": valor_credito,
+                "observaciones": (
+                    f"Préstamo entregado a {nombre}"
+                ),
+                "fecha": today_text(),
+                "synced": 0,
+            })
 
         refresh_memory_from_db()
         App.get_running_app().request_auto_sync()
 
-        # El siguiente registro debe iniciar completamente vacío.
         self.reset_on_next_entry = True
 
+        if existing_loan:
+            message = (
+                "Préstamo existente cargado correctamente.\n"
+                "No se descontó dinero de la caja."
+            )
+        else:
+            message = (
+                "Cliente y crédito activados correctamente.\n"
+                "El desembolso fue descontado de caja."
+            )
+
         show_popup(
-            "Cliente creado",
-            "Cliente y crédito activados correctamente.\n"
-            "El desembolso fue descontado de caja.",
+            "Registro completado",
+            message,
+            height=280,
         )
         Clock.schedule_once(
             lambda *_: self.app_ref.go("clientes"),
@@ -4491,6 +5964,14 @@ class RenovarPrestamoScreen(Screen):
         )
 
     def renew_loan(self):
+        if get_journey_status() != "abierta":
+            show_popup(
+                "Jornada no abierta",
+                "Debes abrir la jornada antes de renovar un préstamo.",
+                height=260,
+            )
+            return
+
         self.calculate_credit()
 
         principal = to_int(self.valor_credito.text, 0)
@@ -4926,6 +6407,14 @@ class MovimientosScreen(Screen):
         self.ingreso.background_color = GOLD if self.ingreso.state == "down" else (0.88, 0.90, 0.94, 1)
 
     def save_movement(self):
+        if get_journey_status() != "abierta":
+            show_popup(
+                "Jornada no abierta",
+                "Debes abrir la jornada antes de registrar movimientos.",
+                height=260,
+            )
+            return
+
         tipo = "Egreso" if self.egreso.state == "down" else "Ingreso"
         valor = to_int(self.valor.text, 0)
         if valor <= 0:
@@ -4985,6 +6474,424 @@ class MetricRow(BoxLayout):
         self.bg.size = self.size
 
 
+
+class ClientesPagaronHoyScreen(Screen):
+    """
+    Muestra únicamente los pagos realizados en la fecha actual.
+
+    Los pagos no se eliminan de la base de datos: al cambiar el día dejan de
+    aparecer aquí, pero permanecen en el historial completo del cliente.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(name="clientes_pagaron_hoy", **kwargs)
+        self.root = BoxLayout(orientation="vertical")
+        self.add_widget(self.root)
+
+    def on_pre_enter(self):
+        self.app_ref = App.get_running_app()
+        refresh_memory_from_db()
+        self.build()
+
+    def build(self):
+        self.root.clear_widgets()
+
+        self.root.add_widget(
+            Header(
+                "Clientes que Pagaron Hoy",
+                show_back=True,
+                on_back=lambda: self.app_ref.go("resumen"),
+            )
+        )
+
+        metrics = daily_metrics()
+        payments = metrics["payments"]
+
+        # Cantidad real de clientes, evitando contar dos veces a quien pagó
+        # más de una vez durante el mismo día.
+        unique_clients = {
+            str(payment.get("cliente", "")).strip().upper()
+            for payment in payments
+            if str(payment.get("cliente", "")).strip()
+        }
+
+        total_paid = sum(
+            int(payment.get("valor", 0))
+            for payment in payments
+        )
+
+        scroll = ScrollView(
+            do_scroll_x=False,
+            bar_width=dp(4),
+            scroll_type=["bars", "content"],
+        )
+
+        content = BoxLayout(
+            orientation="vertical",
+            padding=[dp(12), dp(14), dp(12), dp(32)],
+            spacing=dp(12),
+            size_hint_y=None,
+        )
+        content.bind(minimum_height=content.setter("height"))
+
+        summary = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(174),
+            padding=[dp(14), dp(12), dp(14), dp(12)],
+            spacing=dp(8),
+        )
+
+        summary.add_widget(DetailRow("Fecha consultada", today_text()))
+        summary.add_widget(
+            DetailRow("Clientes que pagaron", str(len(unique_clients)))
+        )
+        summary.add_widget(
+            DetailRow("Pagos registrados", str(len(payments)))
+        )
+        summary.add_widget(
+            DetailRow("Total recaudado", money(total_paid))
+        )
+        summary.add_widget(
+            DetailRow(
+                "Estado jornada",
+                {
+                    "sin_abrir": "SIN ABRIR",
+                    "abierta": "ABIERTA",
+                    "cerrada": "CERRADA",
+                }.get(get_journey_status(), "SIN ABRIR"),
+            )
+        )
+        content.add_widget(summary)
+
+        notice = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(72),
+            padding=[dp(12), dp(8), dp(12), dp(8)],
+            spacing=dp(2),
+        )
+        notice.bg_color = (0.92, 0.96, 1, 1)
+
+        notice_title = Label(
+            text="LISTADO SOLO DEL DÍA ACTUAL",
+            color=BLUE,
+            bold=True,
+            font_size="12sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(22),
+        )
+        notice_title.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
+
+        notice_text = Label(
+            text=(
+                "Mañana esta lista comenzará vacía. "
+                "Los pagos seguirán disponibles en el historial del cliente."
+            ),
+            color=MUTED,
+            font_size="11sp",
+            halign="left",
+            valign="middle",
+        )
+        notice_text.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
+
+        notice.add_widget(notice_title)
+        notice.add_widget(notice_text)
+        content.add_widget(notice)
+
+        if not payments:
+            empty = RoundedBox(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(132),
+                padding=dp(16),
+                spacing=dp(8),
+            )
+
+            empty_title = Label(
+                text="No hay pagos registrados hoy",
+                color=TEXT,
+                bold=True,
+                font_size="15sp",
+                halign="center",
+                valign="middle",
+                size_hint_y=None,
+                height=dp(32),
+            )
+            empty_title.bind(
+                size=lambda instance, value: setattr(
+                    instance, "text_size", value
+                )
+            )
+
+            empty_message = Label(
+                text=(
+                    "Los clientes aparecerán aquí después de registrar "
+                    "una cuota o un aporte."
+                ),
+                color=MUTED,
+                font_size="12sp",
+                halign="center",
+                valign="middle",
+            )
+            empty_message.bind(
+                size=lambda instance, value: setattr(
+                    instance, "text_size", value
+                )
+            )
+
+            empty.add_widget(empty_title)
+            empty.add_widget(empty_message)
+            content.add_widget(empty)
+
+        else:
+            for payment in reversed(payments):
+                content.add_widget(self.payment_card(payment))
+
+        scroll.add_widget(content)
+        self.root.add_widget(scroll)
+
+    def payment_card(self, payment):
+        payment_type = str(payment.get("tipo", "Pago") or "Pago")
+        accent = GOLD if payment_type.lower() == "aporte" else SUCCESS
+
+        client_name = str(
+            payment.get("cliente", "SIN NOMBRE") or "SIN NOMBRE"
+        ).strip()
+
+        amount = money(payment.get("valor", 0))
+        payment_date = str(payment.get("fecha", "") or "")
+        payment_time = (
+            payment_date.split(" ")[1]
+            if " " in payment_date
+            else payment_date
+        )
+
+        card = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(132),
+            padding=[dp(14), dp(10), dp(14), dp(10)],
+            spacing=dp(6),
+        )
+
+        header = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(34),
+            spacing=dp(8),
+        )
+
+        name_label = Label(
+            text=client_name,
+            color=TEXT,
+            bold=True,
+            font_size="15sp",
+            halign="left",
+            valign="middle",
+            size_hint_x=0.62,
+        )
+        name_label.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
+
+        amount_label = Label(
+            text=amount,
+            color=accent,
+            bold=True,
+            font_size="15sp",
+            halign="right",
+            valign="middle",
+            size_hint_x=0.38,
+        )
+        amount_label.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
+
+        header.add_widget(name_label)
+        header.add_widget(amount_label)
+        card.add_widget(header)
+
+        information = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(28),
+            spacing=dp(8),
+        )
+
+        type_label = Label(
+            text=f"{payment_type}",
+            color=MUTED,
+            font_size="12sp",
+            halign="left",
+            valign="middle",
+            size_hint_x=0.5,
+        )
+        type_label.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
+
+        time_label = Label(
+            text=f"Hora: {payment_time}",
+            color=MUTED,
+            font_size="12sp",
+            halign="right",
+            valign="middle",
+            size_hint_x=0.5,
+        )
+        time_label.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
+
+        information.add_widget(type_label)
+        information.add_widget(time_label)
+        card.add_widget(information)
+
+        view_button = SmallButton(
+            "Ver comprobante de pago",
+            bg_color=BLUE,
+        )
+        view_button.height = dp(42)
+        view_button.bind(
+            on_release=lambda *_: self.show_payment_receipt(payment)
+        )
+        card.add_widget(view_button)
+
+        return card
+
+    def show_payment_receipt(self, payment):
+        client_name = str(
+            payment.get("cliente", "SIN NOMBRE") or "SIN NOMBRE"
+        )
+        payment_type = str(payment.get("tipo", "Pago") or "Pago")
+        payment_date = str(payment.get("fecha", "") or "")
+        amount = money(payment.get("valor", 0))
+        installments = str(payment.get("numero_cuotas", 0))
+        balance_before = money(payment.get("saldo_anterior", 0))
+        balance_after = money(payment.get("saldo_nuevo", 0))
+        method = str(payment.get("metodo") or "No aplica")
+        detail = str(
+            payment.get("observacion")
+            or payment.get("detalle")
+            or "Pago registrado correctamente"
+        )
+
+        content = BoxLayout(
+            orientation="vertical",
+            padding=[dp(14), dp(12), dp(14), dp(12)],
+            spacing=dp(8),
+        )
+
+        title = Label(
+            text=client_name,
+            color=WHITE,
+            bold=True,
+            font_size="17sp",
+            halign="center",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(38),
+        )
+        title.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
+        content.add_widget(title)
+
+        receipt = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(260),
+            padding=dp(12),
+            spacing=dp(6),
+        )
+        receipt.add_widget(DetailRow("Tipo de pago", payment_type))
+        receipt.add_widget(DetailRow("Valor recibido", amount))
+        receipt.add_widget(DetailRow("Fecha y hora", payment_date))
+        receipt.add_widget(DetailRow("Cuotas acreditadas", installments))
+        receipt.add_widget(DetailRow("Saldo anterior", balance_before))
+        receipt.add_widget(DetailRow("Saldo después", balance_after))
+        receipt.add_widget(DetailRow("Método", method))
+
+        detail_box = BoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(62),
+            spacing=dp(2),
+        )
+        detail_title = Label(
+            text="Detalle",
+            color=MUTED,
+            bold=True,
+            font_size="12sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(20),
+        )
+        detail_title.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
+        detail_value = Label(
+            text=detail,
+            color=TEXT,
+            font_size="12sp",
+            halign="left",
+            valign="top",
+        )
+        detail_value.bind(
+            size=lambda instance, value: setattr(
+                instance, "text_size", value
+            )
+        )
+        detail_box.add_widget(detail_title)
+        detail_box.add_widget(detail_value)
+        receipt.add_widget(detail_box)
+        content.add_widget(receipt)
+
+        close_button = Button(
+            text="Cerrar comprobante",
+            background_normal="",
+            background_color=BLUE,
+            color=WHITE,
+            bold=True,
+            size_hint_y=None,
+            height=dp(46),
+        )
+        content.add_widget(close_button)
+
+        popup = Popup(
+            title="Constancia del Pago",
+            content=content,
+            size_hint=(0.92, None),
+            height=dp(470),
+            auto_dismiss=False,
+        )
+        close_button.bind(on_release=popup.dismiss)
+        popup.open()
+
+
 class ResumenScreen(Screen):
     sync_status = StringProperty("Pendiente")
 
@@ -5006,17 +6913,32 @@ class ResumenScreen(Screen):
         content = BoxLayout(orientation="vertical", padding=[dp(12), dp(12), dp(12), dp(18)], spacing=dp(10), size_hint_y=None)
         content.bind(minimum_height=content.setter("height"))
 
+        metrics = daily_metrics()
+        closure = get_cash_closure()
+        journey_status = get_journey_status()
+
+        if closure and journey_status in ("abierta", "cerrada"):
+            metrics["opening_cash"] = int(
+                closure.get("caja_inicial", 0)
+            )
+            metrics["closing_cash"] = (
+                metrics["opening_cash"]
+                + metrics["income"]
+                + metrics["collected"]
+                - metrics["expenses"]
+            )
+
         total_clientes = len(CLIENTES)
-        clientes_nuevos = len([c for c in CLIENTES if str(c.get("created_at", "")).startswith(today_text())])
-        pagos = len([t for t in TRANSACCIONES if t["tipo"] in ("Cuota", "Aporte")])
-        no_pagos = len([t for t in TRANSACCIONES if t["tipo"] == "No Pago"])
-        aplazados = len([t for t in TRANSACCIONES if t["tipo"] == "Siguiente Día"])
-        recaudo_dia = sum(int(t.get("valor", 0)) for t in TRANSACCIONES if t["tipo"] in ("Cuota", "Aporte"))
-        ingresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m["tipo"] == "Ingreso")
-        egresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m["tipo"] == "Egreso")
-        caja_inicial = 0
-        recaudo_esperado = sum(int(c.get("cuota", 0)) for c in CLIENTES)
-        saldo_caja = current_cash_balance()
+        clientes_nuevos = len(metrics["new_clients"])
+        pagos = len(metrics["payments"])
+        no_pagos = len(metrics["no_payments"])
+        aplazados = len(metrics["postponed"])
+        recaudo_dia = metrics["collected"]
+        ingresos = metrics["income"]
+        egresos = metrics["expenses"]
+        caja_inicial = metrics["opening_cash"]
+        recaudo_esperado = metrics["expected"]
+        saldo_caja = metrics["closing_cash"]
         pendientes_sync = count_pending_sync()
 
         report = RoundedBox(orientation="vertical", spacing=dp(7), padding=dp(10), size_hint_y=None)
@@ -5036,6 +6958,14 @@ class ResumenScreen(Screen):
             ("Ingresos", money(ingresos)),
             ("Egresos", money(egresos)),
             ("Pendientes Nube", str(pendientes_sync)),
+            (
+                "Estado Jornada",
+                {
+                    "sin_abrir": "SIN ABRIR",
+                    "abierta": "ABIERTA",
+                    "cerrada": "CERRADA",
+                }.get(journey_status, "SIN ABRIR"),
+            ),
             ("Sincronización", self.sync_status),
         ]:
             report.add_widget(MetricRow(left, right))
@@ -5043,7 +6973,13 @@ class ResumenScreen(Screen):
         report.add_widget(MetricRow("Saldo en Caja", money(saldo_caja), highlight=True))
         content.add_widget(report)
 
-        actions = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(176), spacing=dp(8))
+        actions = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(230),
+            spacing=dp(8),
+        )
+
         row1 = BoxLayout(
             orientation="horizontal",
             spacing=dp(8),
@@ -5051,18 +6987,23 @@ class ResumenScreen(Screen):
             height=dp(46),
         )
 
+        paid_today_button = PillButton(
+            "Pagaron Hoy",
+            bg_color=SUCCESS,
+        )
+        paid_today_button.bind(
+            on_release=lambda *_: self.app_ref.go(
+                "clientes_pagaron_hoy"
+            )
+        )
+
         no_payments_button = PillButton("No Pagos")
         no_payments_button.bind(
             on_release=lambda *_: self.show_no_payments()
         )
 
-        settings_button = PillButton("Configuración")
-        settings_button.bind(
-            on_release=lambda *_: self.show_settings()
-        )
-
+        row1.add_widget(paid_today_button)
         row1.add_widget(no_payments_button)
-        row1.add_widget(settings_button)
 
         row2 = BoxLayout(
             orientation="horizontal",
@@ -5071,28 +7012,673 @@ class ResumenScreen(Screen):
             height=dp(46),
         )
 
+        settings_button = PillButton("Configuración")
+        settings_button.bind(
+            on_release=lambda *_: self.show_settings()
+        )
+
         readjust_button = PillButton("Reajuste")
         readjust_button.bind(
             on_release=lambda *_: self.run_readjustment()
         )
+
+        row2.add_widget(settings_button)
         row2.add_widget(readjust_button)
 
-        cloud = PillButton("Carga Completa", bg_color=BLUE)
-        cloud.bind(on_release=lambda *_: self.simulate_cloud_upload())
-        row2.add_widget(cloud)
+        row_cloud = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(8),
+            size_hint_y=None,
+            height=dp(46),
+        )
 
-        row_pdf = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
-        pdf_btn = PillButton("Generar PDF", bg_color=SUCCESS)
-        pdf_btn.bind(on_release=lambda *_: self.generate_pdf())
+        cloud = PillButton("Carga Completa", bg_color=BLUE)
+        cloud.bind(
+            on_release=lambda *_: self.simulate_cloud_upload()
+        )
+        row_cloud.add_widget(cloud)
+
+        row_pdf = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(8),
+            size_hint_y=None,
+            height=dp(46),
+        )
+
+        if journey_status == "sin_abrir":
+            close_button = PillButton(
+                "Abrir Jornada",
+                bg_color=SUCCESS,
+            )
+            close_button.bind(
+                on_release=lambda *_: self.confirm_open_day()
+            )
+
+        elif journey_status == "abierta":
+            close_button = PillButton(
+                "Cerrar Jornada",
+                bg_color=GOLD,
+            )
+            close_button.bind(
+                on_release=lambda *_: self.confirm_close_day()
+            )
+
+        else:
+            close_button = PillButton(
+                "Jornada Cerrada",
+                bg_color=(0.45, 0.48, 0.55, 1),
+            )
+            close_button.disabled = True
+
+        pdf_btn = PillButton(
+            "Generar PDF",
+            bg_color=SUCCESS,
+        )
+        pdf_btn.bind(
+            on_release=lambda *_: self.generate_pdf()
+        )
+
+        row_pdf.add_widget(close_button)
         row_pdf.add_widget(pdf_btn)
 
         actions.add_widget(row1)
         actions.add_widget(row2)
+        actions.add_widget(row_cloud)
         actions.add_widget(row_pdf)
         content.add_widget(actions)
 
         scroll.add_widget(content)
         self.root.add_widget(scroll)
+
+    def confirm_open_day(self):
+        calculated_opening = cash_balance_before_date()
+
+        content = BoxLayout(
+            orientation="vertical",
+            padding=dp(14),
+            spacing=dp(12),
+        )
+
+        info = Label(
+            text=(
+                f"Fecha: {today_text()}\n"
+                "Escribe la base con la que empieza el día.\n"
+                f"Sugerencia automática: {money(calculated_opening)}"
+            ),
+            color=WHITE,
+            font_size="14sp",
+            halign="center",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(78),
+        )
+        info.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+        base_label = FieldLabel("Caja inicial / base del día")
+        base_input = MoneyTextInput(
+            text=format_thousands(calculated_opening),
+            hint_text="Ej: 100.000",
+        )
+
+        buttons = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(46),
+            spacing=dp(8),
+        )
+
+        cancel = Button(
+            text="Cancelar",
+            background_normal="",
+            background_color=(0.55, 0.58, 0.63, 1),
+            color=WHITE,
+            bold=True,
+        )
+        accept = Button(
+            text="Abrir Jornada",
+            background_normal="",
+            background_color=SUCCESS,
+            color=WHITE,
+            bold=True,
+        )
+
+        buttons.add_widget(cancel)
+        buttons.add_widget(accept)
+
+        content.add_widget(info)
+        content.add_widget(base_label)
+        content.add_widget(base_input)
+        content.add_widget(buttons)
+
+        popup = Popup(
+            title="Abrir Jornada",
+            content=content,
+            size_hint=(0.90, None),
+            height=dp(310),
+            auto_dismiss=False,
+        )
+
+        cancel.bind(on_release=popup.dismiss)
+        accept.bind(
+            on_release=lambda *_: self.open_day(
+                popup,
+                to_int(base_input.text, calculated_opening),
+            )
+        )
+        popup.open()
+
+    def open_day(self, popup=None, opening_cash=None):
+        try:
+            journey = open_cash_journey(opening_cash=opening_cash)
+
+            if popup is not None:
+                popup.dismiss()
+
+            show_popup(
+                "Jornada abierta",
+                "La jornada fue abierta correctamente.\n\n"
+                f"Caja inicial: {money(journey['caja_inicial'])}",
+                height=280,
+            )
+
+            self.build()
+
+        except Exception as error:
+            show_popup(
+                "No se pudo abrir",
+                str(error),
+                height=260,
+            )
+
+    def confirm_close_day(self):
+        status = get_journey_status()
+
+        if status == "sin_abrir":
+            show_popup(
+                "Jornada sin abrir",
+                "Primero debes abrir la jornada.",
+            )
+            return
+
+        if status == "cerrada":
+            show_popup(
+                "Jornada cerrada",
+                "La jornada de hoy ya fue cerrada.",
+            )
+            return
+
+        closure = get_cash_closure()
+        metrics = daily_metrics()
+
+        opening_cash = int(closure.get("caja_inicial", 0))
+        expected_cash = (
+            opening_cash
+            + metrics["income"]
+            + metrics["collected"]
+            - metrics["expenses"]
+        )
+
+        pending_cloud = count_pending_sync()
+
+        outer = BoxLayout(
+            orientation="vertical",
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(8),
+        )
+
+        scroll = ScrollView(
+            do_scroll_x=False,
+            bar_width=dp(4),
+            scroll_type=["bars", "content"],
+        )
+        content = BoxLayout(
+            orientation="vertical",
+            spacing=dp(10),
+            size_hint_y=None,
+            padding=[dp(2), dp(2), dp(2), dp(8)],
+        )
+        content.bind(minimum_height=content.setter("height"))
+
+        # Encabezado
+        header = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(90),
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(4),
+        )
+        header.bg_color = (0.94, 0.97, 1, 1)
+        header_title = Label(
+            text="Arqueo y cierre de caja",
+            color=BLUE,
+            bold=True,
+            font_size="17sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(28),
+        )
+        header_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        header_text = Label(
+            text=(
+                "Sigue estos 3 pasos: 1) revisa el resumen, 2) escribe el dinero en mano, "
+                "3) confirma si la caja cuadra."
+            ),
+            color=MUTED,
+            font_size="11sp",
+            halign="left",
+            valign="middle",
+        )
+        header_text.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        header.add_widget(header_title)
+        header.add_widget(header_text)
+        content.add_widget(header)
+
+        # Paso 1: Resumen del sistema
+        system_box = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(300),
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(6),
+        )
+
+        step1_title = Label(
+            text="Paso 1. Resumen que calcula el sistema",
+            color=DARK,
+            bold=True,
+            font_size="14sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(24),
+        )
+        step1_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        system_box.add_widget(step1_title)
+
+        system_box.add_widget(DetailRow("Fecha", today_text()))
+        system_box.add_widget(DetailRow("Caja inicial", money(opening_cash)))
+        system_box.add_widget(DetailRow("Recaudo del día", money(metrics["collected"])))
+        system_box.add_widget(DetailRow("Ingresos adicionales", money(metrics["income"])))
+        system_box.add_widget(DetailRow("Egresos del día", money(metrics["expenses"])))
+        system_box.add_widget(DetailRow("Pendientes de nube", str(pending_cloud)))
+
+        expected_card = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(76),
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(2),
+        )
+        expected_card.bg_color = (0.99, 0.97, 0.88, 1)
+        expected_lbl_1 = Label(
+            text="Saldo esperado por el sistema",
+            color=MUTED,
+            font_size="11sp",
+            halign="center",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(20),
+        )
+        expected_lbl_1.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        expected_lbl_2 = Label(
+            text=money(expected_cash),
+            color=DARK,
+            bold=True,
+            font_size="22sp",
+            halign="center",
+            valign="middle",
+        )
+        expected_lbl_2.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        expected_card.add_widget(expected_lbl_1)
+        expected_card.add_widget(expected_lbl_2)
+        system_box.add_widget(expected_card)
+        content.add_widget(system_box)
+
+        # Paso 2: Arqueo físico
+        count_box = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(168),
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(6),
+        )
+        count_box.bg_color = (0.99, 0.98, 0.94, 1)
+
+        step2_title = Label(
+            text="Paso 2. Escribe el dinero que tienes en mano",
+            color=DARK,
+            bold=True,
+            font_size="14sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(24),
+        )
+        step2_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        step2_help = Label(
+            text="Cuenta el efectivo físico y escríbelo aquí. Puedes editar el valor libremente.",
+            color=MUTED,
+            font_size="11sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(32),
+        )
+        step2_help.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        count_box.add_widget(step2_title)
+        count_box.add_widget(step2_help)
+
+        physical_cash_input = MoneyTextInput(
+            hint_text="Ej: 2.080.000",
+            text=format_thousands(expected_cash),
+        )
+        count_box.add_widget(physical_cash_input)
+        content.add_widget(count_box)
+
+        # Paso 3: Resultado de comparación
+        result_box = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(222),
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(6),
+        )
+
+        step3_title = Label(
+            text="Paso 3. Resultado del arqueo",
+            color=DARK,
+            bold=True,
+            font_size="14sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(24),
+        )
+        step3_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        result_box.add_widget(step3_title)
+
+        comparison_card = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(76),
+            padding=[dp(10), dp(8), dp(10), dp(8)],
+            spacing=dp(4),
+        )
+        comparison_card.bg_color = (0.94, 0.97, 1, 1)
+        comparison_label = Label(
+            text="",
+            color=TEXT,
+            bold=True,
+            font_size="16sp",
+            halign="center",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(26),
+        )
+        comparison_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        difference_label = Label(
+            text="",
+            color=MUTED,
+            font_size="12sp",
+            halign="center",
+            valign="middle",
+        )
+        difference_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        comparison_card.add_widget(comparison_label)
+        comparison_card.add_widget(difference_label)
+        result_box.add_widget(comparison_card)
+
+        recap_box = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(82),
+            padding=[dp(10), dp(8), dp(10), dp(8)],
+            spacing=dp(2),
+        )
+        recap_box.bg_color = (0.97, 0.98, 1, 1)
+        recap_expected = Label(text="", color=TEXT, font_size="11sp", halign="left", valign="middle", size_hint_y=None, height=dp(20))
+        recap_counted = Label(text="", color=TEXT, font_size="11sp", halign="left", valign="middle", size_hint_y=None, height=dp(20))
+        recap_diff = Label(text="", color=TEXT, font_size="11sp", halign="left", valign="middle", size_hint_y=None, height=dp(20))
+        for lbl in (recap_expected, recap_counted, recap_diff):
+            lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            recap_box.add_widget(lbl)
+        result_box.add_widget(recap_box)
+
+        observation_label = FieldLabel(
+            "Observación (solo si hay sobrante o faltante)"
+        )
+        observation_input = AppTextInput(
+            hint_text="Ej: faltante pendiente de verificar",
+            multiline=True,
+        )
+        observation_input.height = dp(56)
+        result_box.add_widget(observation_label)
+        result_box.add_widget(observation_input)
+        content.add_widget(result_box)
+
+        def refresh_comparison(*_):
+            physical = to_int(physical_cash_input.text, 0)
+            difference = physical - expected_cash
+
+            recap_expected.text = f"Sistema espera: {money(expected_cash)}"
+            recap_counted.text = f"Dinero contado: {money(physical)}"
+            recap_diff.text = f"Diferencia: {money(abs(difference)) if difference != 0 else money(0)}"
+
+            if difference == 0:
+                comparison_label.text = "CAJA CUADRADA"
+                comparison_label.color = SUCCESS
+                difference_label.text = "El dinero físico coincide con el sistema."
+                difference_label.color = SUCCESS
+                comparison_card.bg_color = (0.93, 0.98, 0.93, 1)
+            elif difference > 0:
+                comparison_label.text = "HAY SOBRANTE"
+                comparison_label.color = BLUE
+                difference_label.text = f"Sobran {money(difference)} frente al sistema."
+                difference_label.color = BLUE
+                comparison_card.bg_color = (0.92, 0.97, 1, 1)
+            else:
+                comparison_label.text = "HAY FALTANTE"
+                comparison_label.color = DANGER
+                difference_label.text = f"Faltan {money(abs(difference))} frente al sistema."
+                difference_label.color = DANGER
+                comparison_card.bg_color = (1.0, 0.94, 0.94, 1)
+
+        physical_cash_input.bind(text=refresh_comparison)
+        Clock.schedule_once(refresh_comparison, 0)
+
+        # Aviso de sincronización
+        notice = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(70),
+            padding=dp(10),
+        )
+        notice.bg_color = (1.0, 0.95, 0.95, 1) if pending_cloud > 0 else (0.93, 0.98, 0.93, 1)
+        notice_text = (
+            "Hay registros pendientes de sincronizar. Recomendación: ejecuta Carga Completa antes del cierre."
+            if pending_cloud > 0
+            else "Todo está sincronizado. Si el efectivo cuadra, puedes confirmar el cierre."
+        )
+        notice_label = Label(
+            text=notice_text,
+            color=TEXT,
+            font_size="11sp",
+            halign="left",
+            valign="middle",
+        )
+        notice_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        notice.add_widget(notice_label)
+        content.add_widget(notice)
+
+        scroll.add_widget(content)
+        outer.add_widget(scroll)
+
+        buttons = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(8),
+            size_hint_y=None,
+            height=dp(48),
+        )
+        cancel = Button(
+            text="Seguir revisando",
+            background_normal="",
+            background_color=(0.56, 0.60, 0.66, 1),
+            color=WHITE,
+            bold=True,
+        )
+        confirm = Button(
+            text="Confirmar cierre",
+            background_normal="",
+            background_color=DANGER,
+            color=WHITE,
+            bold=True,
+        )
+        buttons.add_widget(cancel)
+        buttons.add_widget(confirm)
+        outer.add_widget(buttons)
+
+        popup = Popup(
+            title="Cierre de Caja",
+            content=outer,
+            size_hint=(0.94, 0.94),
+            auto_dismiss=False,
+        )
+        cancel.bind(on_release=popup.dismiss)
+
+        def validate_and_close(*_):
+            physical = to_int(physical_cash_input.text, -1)
+            difference = physical - expected_cash
+            observation = observation_input.text.strip()
+
+            if physical < 0:
+                show_popup(
+                    "Monto requerido",
+                    "Escribe cuánto dinero tienes físicamente en mano.",
+                )
+                return
+
+            if difference != 0 and not observation:
+                show_popup(
+                    "Observación requerida",
+                    "La caja presenta una diferencia. Escribe una observación antes de cerrar.",
+                    height=270,
+                )
+                return
+
+            popup.dismiss()
+            self.close_day(physical, observation)
+
+        confirm.bind(on_release=validate_and_close)
+        popup.open()
+
+    def close_day(self, physical_cash=None, observation=""):
+
+        try:
+            closure = save_cash_closure(
+                physical_cash=physical_cash,
+                observation=observation,
+            )
+            metrics = daily_metrics()
+
+            reconciliation_status = str(
+                closure.get("estado_cuadre", "sin_arqueo")
+            )
+            difference = int(closure.get("diferencia_caja", 0))
+
+            if reconciliation_status == "cuadrada":
+                status_text = "CAJA CUADRADA"
+                status_color = SUCCESS
+            elif reconciliation_status == "sobrante":
+                status_text = f"SOBRANTE: {money(difference)}"
+                status_color = BLUE
+            else:
+                status_text = f"FALTANTE: {money(abs(difference))}"
+                status_color = DANGER
+
+            content = BoxLayout(
+                orientation="vertical",
+                padding=[dp(14), dp(12), dp(14), dp(12)],
+                spacing=dp(10),
+            )
+
+            status_box = RoundedBox(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(94),
+                padding=dp(12),
+                spacing=dp(4),
+            )
+            status_box.bg_color = (0.93, 0.98, 0.93, 1) if difference == 0 else (1.0, 0.95, 0.92, 1)
+            status_title = Label(
+                text="Jornada cerrada correctamente",
+                color=SUCCESS,
+                bold=True,
+                font_size="16sp",
+                halign="center",
+                valign="middle",
+                size_hint_y=None,
+                height=dp(28),
+            )
+            status_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            reconciliation_label = Label(
+                text=status_text,
+                color=status_color,
+                bold=True,
+                font_size="15sp",
+                halign="center",
+                valign="middle",
+            )
+            reconciliation_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            status_box.add_widget(status_title)
+            status_box.add_widget(reconciliation_label)
+            content.add_widget(status_box)
+
+            result_box = RoundedBox(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(236),
+                padding=dp(12),
+                spacing=dp(4),
+            )
+            result_box.add_widget(DetailRow("Fecha", today_text()))
+            result_box.add_widget(DetailRow("Caja inicial", money(closure.get("caja_inicial", 0))))
+            result_box.add_widget(DetailRow("Recaudo del día", money(metrics.get("collected", 0))))
+            result_box.add_widget(DetailRow("Ingresos", money(metrics.get("income", 0))))
+            result_box.add_widget(DetailRow("Egresos", money(metrics.get("expenses", 0))))
+            result_box.add_widget(DetailRow("Saldo esperado", money(closure.get("saldo_final", 0))))
+            result_box.add_widget(DetailRow("Efectivo contado", money(closure.get("efectivo_contado", 0))))
+            result_box.add_widget(DetailRow("Diferencia", money(difference)))
+            content.add_widget(result_box)
+
+            close_btn = Button(
+                text="Aceptar",
+                background_normal="",
+                background_color=BLUE,
+                color=WHITE,
+                bold=True,
+                size_hint_y=None,
+                height=dp(46),
+            )
+            content.add_widget(close_btn)
+
+            popup = Popup(
+                title="Cierre guardado",
+                content=content,
+                size_hint=(0.90, None),
+                height=dp(440),
+                auto_dismiss=False,
+            )
+            close_btn.bind(on_release=popup.dismiss)
+            popup.open()
+            self.build()
+
+        except Exception as error:
+            show_popup(
+                "No se pudo cerrar",
+                str(error),
+                height=260,
+            )
 
     def show_no_payments(self):
         refresh_memory_from_db()
@@ -5297,6 +7883,7 @@ class CobrosV12App(App):
         self.sm = ScreenManager(transition=NoTransition(), size_hint=size_hint, width=width)
 
         self.sm.add_widget(ClientesScreen())
+        self.sm.add_widget(TodosClientesScreen())
         self.sm.add_widget(GestionClienteScreen())
         self.sm.add_widget(HistorialClienteScreen())
         self.sm.add_widget(CuotaScreen())
@@ -5304,6 +7891,7 @@ class CobrosV12App(App):
         self.sm.add_widget(RenovarPrestamoScreen())
         self.sm.add_widget(EditarClienteScreen())
         self.sm.add_widget(MovimientosScreen())
+        self.sm.add_widget(ClientesPagaronHoyScreen())
         self.sm.add_widget(ResumenScreen())
 
         self.shell.add_widget(self.sm)
