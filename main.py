@@ -1518,10 +1518,79 @@ def load_movimientos_from_db():
     conn.close()
 
 
+def normalize_clients_with_latest_transactions():
+    """
+    Asegura que la ficha del cliente quede alineada con su último movimiento.
+    Esto evita que un aporte quede bien en historial, pero no reflejado en la
+    lista principal, en gestión o en el saldo general.
+    """
+    try:
+        if not CLIENTES or not TRANSACCIONES:
+            return
+
+        latest_by_client = {}
+        for tx in TRANSACCIONES:
+            client_id = int(tx.get("cliente_id") or 0)
+            if client_id <= 0:
+                continue
+            latest_by_client[client_id] = tx
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        changed = False
+
+        for cliente in CLIENTES:
+            client_id = int(cliente.get("id") or 0)
+            latest_tx = latest_by_client.get(client_id)
+            if not latest_tx:
+                continue
+
+            nuevo_saldo = int(latest_tx.get("saldo_nuevo", cliente.get("saldo", 0)) or 0)
+            nuevas_pagadas = int(latest_tx.get("cuotas_pagadas_total", cliente.get("pagadas", 0)) or 0)
+            nuevas_pendientes = int(latest_tx.get("cuotas_pendientes_total", cliente.get("pendientes", 0)) or 0)
+
+            saldo_actual = int(cliente.get("saldo", 0) or 0)
+            pagadas_actual = int(cliente.get("pagadas", 0) or 0)
+            pendientes_actual = int(cliente.get("pendientes", 0) or 0)
+
+            if (
+                saldo_actual != nuevo_saldo
+                or pagadas_actual != nuevas_pagadas
+                or pendientes_actual != nuevas_pendientes
+            ):
+                cursor.execute(
+                    """
+                    UPDATE clientes
+                    SET saldo = ?,
+                        pagadas = ?,
+                        pendientes = ?,
+                        synced = 0,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        nuevo_saldo,
+                        nuevas_pagadas,
+                        nuevas_pendientes,
+                        now_text(),
+                        client_id,
+                    ),
+                )
+                changed = True
+
+        if changed:
+            conn.commit()
+        conn.close()
+    except Exception as error:
+        print("NORMALIZE CLIENTS ERROR:", error)
+
+
 def refresh_memory_from_db():
     update_due_statuses()
     load_clients_from_db()
     load_transacciones_from_db()
+    normalize_clients_with_latest_transactions()
+    load_clients_from_db()
     load_movimientos_from_db()
 
 
@@ -3836,7 +3905,10 @@ class GestionClienteScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
+        refresh_memory_from_db()
         self.cliente = get_client_by_id(self.app_ref.selected_client.get("id")) if self.app_ref.selected_client else None
+        if self.cliente:
+            self.app_ref.selected_client = self.cliente
         self.build()
 
     def build(self):
@@ -3985,11 +4057,27 @@ class HistorialClienteScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        self.cliente = (
-            get_client_by_id(self.app_ref.selected_client.get("id"))
-            if self.app_ref.selected_client else None
-        )
+
+        # Primero refrescar SQLite y la memoria. Después volver a consultar
+        # el cliente para evitar mostrar saldo, cuotas o estado anteriores.
         refresh_memory_from_db()
+
+        selected_id = (
+            self.app_ref.selected_client.get("id")
+            if self.app_ref.selected_client
+            else None
+        )
+
+        self.cliente = (
+            get_client_by_id(selected_id)
+            if selected_id is not None
+            else None
+        )
+
+        # Mantener actualizado el cliente seleccionado para las demás pantallas.
+        if self.cliente:
+            self.app_ref.selected_client = self.cliente
+
         self.build()
 
     def build(self):
@@ -4011,6 +4099,32 @@ class HistorialClienteScreen(Screen):
             if int(t.get("cliente_id") or 0) == int(self.cliente.get("id"))
         ]
         transactions.sort(key=lambda item: int(item.get("id") or 0))
+
+        # El último movimiento es la referencia inmediata del saldo y cuotas.
+        # Si la ficha del cliente quedó temporalmente desactualizada, mostrar
+        # los valores confirmados por la transacción más reciente.
+        latest_transaction = transactions[-1] if transactions else None
+
+        current_balance = int(self.cliente.get("saldo", 0))
+        current_paid = int(self.cliente.get("pagadas", 0))
+        current_pending = int(self.cliente.get("pendientes", 0))
+
+        if latest_transaction:
+            current_balance = int(
+                latest_transaction.get("saldo_nuevo", current_balance) or 0
+            )
+            current_paid = int(
+                latest_transaction.get(
+                    "cuotas_pagadas_total",
+                    current_paid,
+                ) or 0
+            )
+            current_pending = int(
+                latest_transaction.get(
+                    "cuotas_pendientes_total",
+                    current_pending,
+                ) or 0
+            )
 
         scroll = ScrollView(
             do_scroll_x=False,
@@ -4073,9 +4187,9 @@ class HistorialClienteScreen(Screen):
                 money(self.cliente.get("aporte_acumulado", 0)),
             )
         )
-        summary.add_widget(DetailRow("Cuotas pagadas", str(self.cliente.get("pagadas", 0))))
-        summary.add_widget(DetailRow("Cuotas pendientes", str(self.cliente.get("pendientes", 0))))
-        summary.add_widget(DetailRow("Saldo actual", money(self.cliente.get("saldo", 0))))
+        summary.add_widget(DetailRow("Cuotas pagadas", str(current_paid)))
+        summary.add_widget(DetailRow("Cuotas pendientes", str(current_pending)))
+        summary.add_widget(DetailRow("Saldo actual", money(current_balance)))
         content.add_widget(summary)
 
         section_box = RoundedBox(
@@ -4144,6 +4258,54 @@ class HistorialClienteScreen(Screen):
         scroll.add_widget(content)
         self.root.add_widget(scroll)
 
+    def transaction_summary(self, tx):
+        tipo = tx.get("tipo", "Movimiento")
+        valor = money(tx.get("valor", 0))
+        cuotas = int(tx.get("numero_cuotas", 0) or 0)
+        pagadas = int(tx.get("cuotas_pagadas_total", 0) or 0)
+        pendientes = int(tx.get("cuotas_pendientes_total", 0) or 0)
+        saldo_anterior = money(tx.get("saldo_anterior", 0))
+        saldo_nuevo = money(tx.get("saldo_nuevo", 0))
+        observacion = " ".join(str(tx.get("observacion", "") or "").split())
+
+        if tipo == "Cuota":
+            return (
+                f"Se registró un pago por {valor}. "
+                f"Se acreditó {cuotas} cuota(s). "
+                f"Ahora el cliente lleva {pagadas} pagadas y {pendientes} pendientes. "
+                f"El saldo bajó de {saldo_anterior} a {saldo_nuevo}."
+            )
+
+        if tipo == "Aporte":
+            base = (
+                f"Se recibió un aporte por {valor}. "
+                f"Cuotas acreditadas con este movimiento: {cuotas}. "
+                f"El saldo cambió de {saldo_anterior} a {saldo_nuevo}."
+            )
+            if observacion:
+                return f"{base} {observacion}"
+            return base
+
+        if tipo == "No Pago":
+            return (
+                "El cliente no realizó pago en esta visita. "
+                f"Queda con {pendientes} cuota(s) pendiente(s) y saldo actual de {saldo_nuevo}."
+            )
+
+        if tipo == "Siguiente Día":
+            return (
+                "La visita fue aplazada para el siguiente cobro. "
+                f"El saldo se mantiene en {saldo_nuevo} con {pendientes} cuota(s) pendientes."
+            )
+
+        if tipo == "Renovación":
+            return observacion or "Se registró una renovación del préstamo."
+
+        if tipo == "Migración":
+            return observacion or "Se cargó un préstamo anterior al sistema."
+
+        return observacion or f"Movimiento registrado: {tipo}."
+
     def transaction_card(self, tx):
         tipo = tx.get("tipo", "Movimiento")
 
@@ -4161,7 +4323,7 @@ class HistorialClienteScreen(Screen):
         card = RoundedBox(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(315),
+            height=dp(380),
             padding=[dp(16), dp(14), dp(16), dp(14)],
             spacing=dp(10),
         )
@@ -4229,7 +4391,47 @@ class HistorialClienteScreen(Screen):
             )
         )
         card.add_widget(DetailRow("Método", tx.get("metodo") or "No aplica"))
-        card.add_widget(DetailRow("Detalle", tx.get("observacion") or tipo))
+
+        summary_box = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(108),
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(6),
+        )
+        if tipo == "Cuota":
+            summary_box.bg_color = (0.93, 0.98, 0.94, 1)
+        elif tipo == "Aporte":
+            summary_box.bg_color = (1.0, 0.98, 0.91, 1)
+        elif tipo == "No Pago":
+            summary_box.bg_color = (1.0, 0.94, 0.94, 1)
+        else:
+            summary_box.bg_color = (0.95, 0.97, 1, 1)
+
+        summary_title = Label(
+            text="Resumen del movimiento",
+            color=DARK,
+            bold=True,
+            font_size="12sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(20),
+        )
+        summary_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+        summary_text = Label(
+            text=self.transaction_summary(tx),
+            color=TEXT,
+            font_size="11sp",
+            halign="left",
+            valign="top",
+        )
+        summary_text.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+        summary_box.add_widget(summary_title)
+        summary_box.add_widget(summary_text)
+        card.add_widget(summary_box)
 
         return card
 
@@ -4244,7 +4446,10 @@ class CuotaScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
+        refresh_memory_from_db()
         self.cliente = get_client_by_id(self.app_ref.selected_client.get("id")) if self.app_ref.selected_client else None
+        if self.cliente:
+            self.app_ref.selected_client = self.cliente
         self.build()
 
     def build(self):
@@ -4870,6 +5075,12 @@ class CuotaScreen(Screen):
         })
 
         refresh_memory_from_db()
+
+        cliente_actualizado = get_client_by_id(self.cliente.get("id"))
+        if cliente_actualizado:
+            self.cliente = cliente_actualizado
+            self.app_ref.selected_client = cliente_actualizado
+
         App.get_running_app().request_auto_sync()
 
         if tipo == "Aporte":
@@ -6086,7 +6297,10 @@ class EditarClienteScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
+        refresh_memory_from_db()
         self.cliente = get_client_by_id(self.app_ref.selected_client.get("id")) if self.app_ref.selected_client else None
+        if self.cliente:
+            self.app_ref.selected_client = self.cliente
         self.build()
 
     def build(self):
