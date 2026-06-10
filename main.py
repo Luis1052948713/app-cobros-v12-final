@@ -1327,30 +1327,6 @@ def init_database():
         WHERE (numero_cuotas IS NULL OR numero_cuotas = 0) AND pendientes > 0
     """)
 
-    closure_columns = [
-        ("observacion_apertura", "TEXT"),
-        ("observacion_cierre", "TEXT"),
-        ("efectivo_contado", "INTEGER NOT NULL DEFAULT 0"),
-        ("diferencia_caja", "INTEGER NOT NULL DEFAULT 0"),
-        ("estado_cuadre", "TEXT NOT NULL DEFAULT 'sin_arqueo'"),
-        ("opened_at", "TEXT"),
-        ("closed_at", "TEXT"),
-    ]
-
-    existing_closure_columns = {
-        row[1]
-        for row in cursor.execute(
-            "PRAGMA table_info(cierres_caja)"
-        ).fetchall()
-    }
-
-    for column_name, column_type in closure_columns:
-        if column_name not in existing_closure_columns:
-            cursor.execute(
-                f"ALTER TABLE cierres_caja "
-                f"ADD COLUMN {column_name} {column_type}"
-            )
-
     cursor.execute("UPDATE clientes SET created_at = ? WHERE created_at IS NULL OR created_at = ''", (now_text(),))
     cursor.execute("UPDATE clientes SET updated_at = ? WHERE updated_at IS NULL OR updated_at = ''", (now_text(),))
 
@@ -1446,6 +1422,30 @@ def init_database():
             updated_at TEXT NOT NULL
         )
     """)
+
+    # Migración segura: la tabla ya existe antes de agregar columnas.
+    for name, definition in [
+        ("fecha_iso", "TEXT"),
+        ("caja_inicial", "INTEGER NOT NULL DEFAULT 0"),
+        ("recaudo", "INTEGER NOT NULL DEFAULT 0"),
+        ("ingresos", "INTEGER NOT NULL DEFAULT 0"),
+        ("egresos", "INTEGER NOT NULL DEFAULT 0"),
+        ("saldo_final", "INTEGER NOT NULL DEFAULT 0"),
+        ("pagos", "INTEGER NOT NULL DEFAULT 0"),
+        ("no_pagos", "INTEGER NOT NULL DEFAULT 0"),
+        ("aplazados", "INTEGER NOT NULL DEFAULT 0"),
+        ("estado", "TEXT NOT NULL DEFAULT 'sin_abrir'"),
+        ("observacion_apertura", "TEXT"),
+        ("observacion_cierre", "TEXT"),
+        ("efectivo_contado", "INTEGER NOT NULL DEFAULT 0"),
+        ("diferencia_caja", "INTEGER NOT NULL DEFAULT 0"),
+        ("estado_cuadre", "TEXT NOT NULL DEFAULT 'sin_arqueo'"),
+        ("opened_at", "TEXT"),
+        ("closed_at", "TEXT"),
+        ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+    ]:
+        ensure_column(cursor, "cierres_caja", name, definition)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS eliminados (
