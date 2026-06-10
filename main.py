@@ -29,6 +29,7 @@ import certifi
 import urllib.parse
 import threading
 import calendar
+import time
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -663,15 +664,10 @@ def open_pdf_file(pdf_reference):
 
 def publish_pdf_to_downloads(pdf_path, open_after=True):
     """
-    Publica el PDF en Descargas/CobrosV12.
+    Publica el PDF en Descargas/CobrosV12 mediante MediaStore.
 
-    Android 10+:
-    usa MediaStore para respetar el almacenamiento restringido.
-
-    Retorna:
-        display_path
-        open_ok
-        open_message
+    La copia se ejecuta completamente en Java usando FileChannel.transferTo,
+    evitando conversiones Python -> byte[] que fallan en algunos Android.
     """
     source = Path(pdf_path)
 
@@ -684,25 +680,30 @@ def publish_pdf_to_downloads(pdf_path, open_after=True):
 
         return str(source), open_ok, open_message
 
+    uri = None
+    input_stream = None
+    input_channel = None
+    output_stream = None
+    output_channel = None
+
     try:
         from importlib import import_module
 
-        jnius_module = import_module("jnius")
-        autoclass = jnius_module.autoclass
-        jarray = jnius_module.jarray
+        autoclass = import_module("jnius").autoclass
 
         PythonActivity = autoclass(
             "org.kivy.android.PythonActivity"
         )
         MediaStore = autoclass("android.provider.MediaStore")
-        ContentValues = autoclass(
-            "android.content.ContentValues"
-        )
+        ContentValues = autoclass("android.content.ContentValues")
         BuildVersion = autoclass("android.os.Build$VERSION")
         Environment = autoclass("android.os.Environment")
+        FileInputStream = autoclass("java.io.FileInputStream")
+        Channels = autoclass("java.nio.channels.Channels")
 
         activity = PythonActivity.mActivity
         resolver = activity.getContentResolver()
+        sdk_int = int(BuildVersion.SDK_INT)
 
         values = ContentValues()
         values.put(
@@ -714,7 +715,7 @@ def publish_pdf_to_downloads(pdf_path, open_after=True):
             "application/pdf",
         )
 
-        if BuildVersion.SDK_INT >= 29:
+        if sdk_int >= 29:
             values.put(
                 MediaStore.MediaColumns.RELATIVE_PATH,
                 Environment.DIRECTORY_DOWNLOADS + "/CobrosV12",
@@ -723,39 +724,67 @@ def publish_pdf_to_downloads(pdf_path, open_after=True):
                 MediaStore.MediaColumns.IS_PENDING,
                 1,
             )
+            collection_uri = (
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            )
+        else:
+            # Compatibilidad para Android 8 y 9.
+            collection_uri = MediaStore.Files.getContentUri(
+                "external"
+            )
 
-        uri = resolver.insert(
-            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-            values,
-        )
+        uri = resolver.insert(collection_uri, values)
 
         if uri is None:
             raise RuntimeError(
-                "Android no permitió crear el archivo en Descargas."
+                "Android no permitió crear el PDF en Descargas."
             )
 
-        output_stream = resolver.openOutputStream(uri)
-
+        output_stream = resolver.openOutputStream(uri, "w")
         if output_stream is None:
             raise RuntimeError(
-                "No se pudo abrir el archivo de destino."
+                "Android no permitió escribir el PDF en Descargas."
             )
 
-        # Android OutputStream.write() exige un byte[] de Java.
-        # Se convierten los bytes de Python a enteros con signo (-128 a 127)
-        # y luego a un arreglo Java compatible mediante jarray('b').
-        raw_pdf_bytes = source.read_bytes()
-        signed_pdf_bytes = [
-            value if value < 128 else value - 256
-            for value in raw_pdf_bytes
-        ]
-        java_pdf_bytes = jarray("b")(signed_pdf_bytes)
+        # Copia directa Java -> Java. No convierte el PDF a bytearray.
+        input_stream = FileInputStream(str(source))
+        input_channel = input_stream.getChannel()
+        output_channel = Channels.newChannel(output_stream)
 
-        output_stream.write(java_pdf_bytes)
+        total_size = input_channel.size()
+        position = 0
+
+        while position < total_size:
+            copied = input_channel.transferTo(
+                position,
+                total_size - position,
+                output_channel,
+            )
+
+            if copied <= 0:
+                raise RuntimeError(
+                    "La copia del PDF se interrumpió antes de terminar."
+                )
+
+            position += copied
+
         output_stream.flush()
-        output_stream.close()
 
-        if BuildVersion.SDK_INT >= 29:
+        # Cerrar antes de marcar el archivo como terminado.
+        if input_channel is not None:
+            input_channel.close()
+            input_channel = None
+        if input_stream is not None:
+            input_stream.close()
+            input_stream = None
+        if output_channel is not None:
+            output_channel.close()
+            output_channel = None
+        if output_stream is not None:
+            output_stream.close()
+            output_stream = None
+
+        if sdk_int >= 29:
             completed_values = ContentValues()
             completed_values.put(
                 MediaStore.MediaColumns.IS_PENDING,
@@ -768,9 +797,7 @@ def publish_pdf_to_downloads(pdf_path, open_after=True):
                 None,
             )
 
-        display_path = (
-            "Descargas/CobrosV12/" + source.name
-        )
+        display_path = "Descargas/CobrosV12/" + source.name
 
         if open_after:
             open_ok, open_message = open_pdf_file(uri)
@@ -781,9 +808,27 @@ def publish_pdf_to_downloads(pdf_path, open_after=True):
         return display_path, open_ok, open_message
 
     except Exception as error:
-        error_detail = (
-            f"{type(error).__name__}: {error!r}"
-        )
+        # Cerrar recursos sin ocultar el error original.
+        for resource in (
+            input_channel,
+            input_stream,
+            output_channel,
+            output_stream,
+        ):
+            try:
+                if resource is not None:
+                    resource.close()
+            except Exception:
+                pass
+
+        # Eliminar el registro incompleto creado en MediaStore.
+        try:
+            if uri is not None:
+                resolver.delete(uri, None, None)
+        except Exception:
+            pass
+
+        error_detail = f"{type(error).__name__}: {error}"
         print(
             "ERROR EXPORTANDO PDF A DESCARGAS:",
             error_detail,
@@ -793,8 +838,8 @@ def publish_pdf_to_downloads(pdf_path, open_after=True):
             str(source),
             False,
             "El PDF se generó en el almacenamiento privado, "
-            "pero no pudo copiarse a Descargas. "
-            f"Detalle: {error_detail}",
+            "pero Android no permitió copiarlo a Descargas. "
+            f"Detalle técnico: {error_detail}",
         )
 
 
@@ -1458,6 +1503,21 @@ def init_database():
         )
     """)
 
+    # Índices para acelerar búsquedas, filtros, historial y sincronización.
+    for index_sql in [
+        "CREATE INDEX IF NOT EXISTS idx_clientes_nombre ON clientes(nombre)",
+        "CREATE INDEX IF NOT EXISTS idx_clientes_estado ON clientes(estado)",
+        "CREATE INDEX IF NOT EXISTS idx_clientes_proximo_cobro ON clientes(proximo_cobro)",
+        "CREATE INDEX IF NOT EXISTS idx_clientes_synced ON clientes(synced)",
+        "CREATE INDEX IF NOT EXISTS idx_transacciones_cliente ON transacciones(cliente_id)",
+        "CREATE INDEX IF NOT EXISTS idx_transacciones_fecha ON transacciones(fecha)",
+        "CREATE INDEX IF NOT EXISTS idx_transacciones_synced ON transacciones(synced)",
+        "CREATE INDEX IF NOT EXISTS idx_movimientos_fecha ON movimientos_caja(fecha)",
+        "CREATE INDEX IF NOT EXISTS idx_movimientos_synced ON movimientos_caja(synced)",
+        "CREATE INDEX IF NOT EXISTS idx_eliminados_estado ON eliminados(entidad, synced)",
+    ]:
+        cursor.execute(index_sql)
+
     conn.commit()
     conn.close()
 
@@ -1585,13 +1645,65 @@ def normalize_clients_with_latest_transactions():
         print("NORMALIZE CLIENTS ERROR:", error)
 
 
-def refresh_memory_from_db():
+def refresh_memory_from_db(
+    *,
+    clients=True,
+    transactions=True,
+    movements=True,
+    normalize=False,
+):
+    """
+    Refresco selectivo de la memoria local.
+
+    La normalización global es costosa, por eso solo se ejecuta al iniciar
+    la app o después de una sincronización completa con Supabase.
+    """
     update_due_statuses()
-    load_clients_from_db()
-    load_transacciones_from_db()
-    normalize_clients_with_latest_transactions()
-    load_clients_from_db()
-    load_movimientos_from_db()
+
+    if clients:
+        load_clients_from_db()
+
+    if transactions:
+        load_transacciones_from_db()
+
+    if normalize:
+        # La normalización necesita clientes y transacciones cargados.
+        if not clients:
+            load_clients_from_db()
+        if not transactions:
+            load_transacciones_from_db()
+        normalize_clients_with_latest_transactions()
+        load_clients_from_db()
+
+    if movements:
+        load_movimientos_from_db()
+
+
+def refresh_clients_cache():
+    refresh_memory_from_db(
+        clients=True,
+        transactions=False,
+        movements=False,
+        normalize=False,
+    )
+
+
+def refresh_client_history_cache():
+    refresh_memory_from_db(
+        clients=True,
+        transactions=True,
+        movements=False,
+        normalize=False,
+    )
+
+
+def refresh_daily_cache():
+    refresh_memory_from_db(
+        clients=True,
+        transactions=True,
+        movements=True,
+        normalize=False,
+    )
 
 
 def insert_client_db(cliente):
@@ -3484,7 +3596,7 @@ class ClientesScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        refresh_memory_from_db()
+        refresh_clients_cache()
 
         # Cada vez que se vuelve a la lista principal, limpiar la búsqueda.
         # Así, después de pagar, editar, renovar, eliminar o reajustar,
@@ -3497,7 +3609,7 @@ class ClientesScreen(Screen):
         if not CLIENTES and supabase_configured():
             ok, msg = pull_all_from_cloud()
             print("RESTORE FROM CLOUD CLIENTES:", ok, msg)
-            refresh_memory_from_db()
+            refresh_memory_from_db(normalize=True)
 
         self.nav_container.clear_widgets()
         self.nav_container.add_widget(BottomNav(self.app_ref, active="clientes"))
@@ -3698,13 +3810,13 @@ class TodosClientesScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        refresh_memory_from_db()
+        refresh_clients_cache()
         self.build_filters()
         self.render_metrics()
         self.render_clients()
 
     def refresh_local_list(self):
-        refresh_memory_from_db()
+        refresh_clients_cache()
         self.render_metrics()
         self.render_clients()
 
@@ -3905,7 +4017,7 @@ class GestionClienteScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        refresh_memory_from_db()
+        refresh_clients_cache()
         self.cliente = get_client_by_id(self.app_ref.selected_client.get("id")) if self.app_ref.selected_client else None
         if self.cliente:
             self.app_ref.selected_client = self.cliente
@@ -4058,9 +4170,8 @@ class HistorialClienteScreen(Screen):
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
 
-        # Primero refrescar SQLite y la memoria. Después volver a consultar
-        # el cliente para evitar mostrar saldo, cuotas o estado anteriores.
-        refresh_memory_from_db()
+        # Refrescar solo clientes y transacciones del historial.
+        refresh_client_history_cache()
 
         selected_id = (
             self.app_ref.selected_client.get("id")
@@ -6704,7 +6815,7 @@ class ClientesPagaronHoyScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        refresh_memory_from_db()
+        refresh_daily_cache()
         self.build()
 
     def build(self):
@@ -7116,7 +7227,7 @@ class ResumenScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
-        refresh_memory_from_db()
+        refresh_daily_cache()
         self.build()
 
     def build(self):
@@ -8076,12 +8187,14 @@ class CobrosV12App(App):
     sync_in_progress = False
     last_sync_ok = False
     last_sync_message = "Pendiente"
+    last_sync_request_at = 0.0
+    minimum_sync_gap_seconds = 4.0
 
     def build(self):
         self.title = "Cobros V12 Mobile"
         try:
             init_database()
-            refresh_memory_from_db()
+            refresh_memory_from_db(normalize=True)
         except Exception as error:
             print("ERROR SQLITE:", error)
 
@@ -8177,6 +8290,15 @@ class CobrosV12App(App):
         if self.sync_in_progress:
             return
 
+        now_monotonic = time.monotonic()
+        if (
+            not force_pull
+            and now_monotonic - self.last_sync_request_at
+            < self.minimum_sync_gap_seconds
+        ):
+            return
+
+        self.last_sync_request_at = now_monotonic
         self.sync_in_progress = True
 
         worker = threading.Thread(
@@ -8224,30 +8346,39 @@ class CobrosV12App(App):
 
     def _after_background_sync(self, ok):
         """
-        Actualiza memoria y pantalla después de una sincronización exitosa.
-        No muestra ventanas emergentes en sincronización automática.
+        Actualiza la caché después de sincronizar sin reconstruir formularios
+        donde el usuario pueda estar escribiendo.
         """
         try:
-            refresh_memory_from_db()
+            refresh_memory_from_db(normalize=True)
 
-            if hasattr(self, "sm"):
-                current_screen = self.sm.current_screen
+            if not hasattr(self, "sm"):
+                return
 
-                if current_screen and hasattr(
-                    current_screen,
-                    "sync_status",
-                ):
-                    current_screen.sync_status = (
-                        "Sincronizado correctamente"
-                        if ok
-                        else "Pendiente"
-                    )
+            current_screen = self.sm.current_screen
+            if not current_screen:
+                return
 
-                if current_screen and hasattr(
-                    current_screen,
-                    "build",
-                ):
-                    current_screen.build()
+            if hasattr(current_screen, "sync_status"):
+                current_screen.sync_status = (
+                    "Sincronizado correctamente"
+                    if ok
+                    else "Pendiente"
+                )
+
+            # Solo reconstruir pantallas de consulta. No tocar formularios.
+            safe_to_rebuild = {
+                "clientes",
+                "todos_clientes",
+                "resumen",
+                "clientes_pagaron_hoy",
+            }
+
+            if (
+                current_screen.name in safe_to_rebuild
+                and hasattr(current_screen, "build")
+            ):
+                current_screen.build()
 
         except Exception as error:
             print("ERROR REFRESH POST SYNC:", error)
