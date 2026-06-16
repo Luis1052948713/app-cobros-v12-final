@@ -7365,6 +7365,629 @@ class CierresSemanalesScreen(Screen):
         return card
 
 
+class CarteraCalleScreen(Screen):
+    """Resumen visual y profesional de la cartera pendiente por recuperar."""
+
+    def __init__(self, **kwargs):
+        super().__init__(name="cartera_calle", **kwargs)
+        self.root = BoxLayout(orientation="vertical")
+        self.add_widget(self.root)
+        self.current_filter = "todos"
+
+    def on_pre_enter(self):
+        self.app_ref = App.get_running_app()
+        refresh_clients_cache()
+        self.build()
+
+    def get_debtors_data(self):
+        today = iso_today()
+        debtors = [
+            cliente for cliente in CLIENTES
+            if (
+                int(cliente.get("saldo", 0) or 0) > 0
+                and int(cliente.get("pendientes", 0) or 0) > 0
+                and cliente.get("estado") != "paz_y_salvo"
+            )
+        ]
+
+        overdue = [
+            cliente for cliente in debtors
+            if (
+                cliente.get("estado") == "no_pago"
+                or (
+                    cliente.get("proximo_cobro")
+                    and cliente.get("proximo_cobro") < today
+                )
+            )
+        ]
+        due_today = [
+            cliente for cliente in debtors
+            if cliente.get("proximo_cobro") == today
+        ]
+        up_to_date = [
+            cliente for cliente in debtors
+            if cliente not in overdue and cliente not in due_today
+        ]
+
+        return {
+            "today": today,
+            "debtors": debtors,
+            "overdue": overdue,
+            "due_today": due_today,
+            "up_to_date": up_to_date,
+            "total_outstanding": sum(int(c.get("saldo", 0) or 0) for c in debtors),
+            "overdue_amount": sum(int(c.get("saldo", 0) or 0) for c in overdue),
+            "today_amount": sum(int(c.get("saldo", 0) or 0) for c in due_today),
+            "up_to_date_amount": sum(int(c.get("saldo", 0) or 0) for c in up_to_date),
+            "average_balance": (sum(int(c.get("saldo", 0) or 0) for c in debtors) // len(debtors)) if debtors else 0,
+        }
+
+    def build(self):
+        self.root.clear_widgets()
+        self.root.add_widget(
+            Header(
+                "Cartera en la Calle",
+                show_back=True,
+                on_back=lambda: self.app_ref.go("resumen"),
+            )
+        )
+
+        data = self.get_debtors_data()
+        debtors = data["debtors"]
+        overdue = data["overdue"]
+        due_today = data["due_today"]
+        up_to_date = data["up_to_date"]
+        total_outstanding = data["total_outstanding"]
+        overdue_amount = data["overdue_amount"]
+        today_amount = data["today_amount"]
+        up_to_date_amount = data["up_to_date_amount"]
+        average_balance = data["average_balance"]
+
+        scroll = ScrollView(
+            do_scroll_x=False,
+            bar_width=dp(4),
+            scroll_type=["bars", "content"],
+        )
+        content = BoxLayout(
+            orientation="vertical",
+            padding=[dp(12), dp(14), dp(12), dp(34)],
+            spacing=dp(12),
+            size_hint_y=None,
+        )
+        content.bind(minimum_height=content.setter("height"))
+
+        hero = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(150),
+            padding=[dp(16), dp(14), dp(16), dp(14)],
+            spacing=dp(6),
+        )
+        hero.bg_color = (0.93, 0.96, 1, 1)
+        title = Label(
+            text="CARTERA TOTAL PENDIENTE",
+            color=BLUE,
+            bold=True,
+            font_size="12sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(24),
+        )
+        amount = Label(
+            text=money(total_outstanding),
+            color=DARK,
+            bold=True,
+            font_size="28sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(44),
+        )
+        subtitle = Label(
+            text=(
+                f"{len(debtors)} cliente(s) con saldo pendiente. "
+                f"Promedio por cliente: {money(average_balance)}"
+            ),
+            color=MUTED,
+            font_size="11sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(32),
+        )
+        note = Label(
+            text="Este panel te muestra cuánto dinero tienes prestado actualmente en la calle.",
+            color=TEXT,
+            font_size="11sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(26),
+        )
+        for lbl in (title, amount, subtitle, note):
+            lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        hero.add_widget(title)
+        hero.add_widget(amount)
+        hero.add_widget(subtitle)
+        hero.add_widget(note)
+        content.add_widget(hero)
+
+        row_a = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(82))
+        row_a.add_widget(self.metric_tile("Vencida", money(overdue_amount), f"{len(overdue)} cliente(s)", (1.00, 0.94, 0.94, 1), DANGER))
+        row_a.add_widget(self.metric_tile("Para hoy", money(today_amount), f"{len(due_today)} cliente(s)", (1.00, 0.97, 0.88, 1), GOLD))
+        content.add_widget(row_a)
+
+        row_b = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(82))
+        row_b.add_widget(self.metric_tile("Al día", money(up_to_date_amount), f"{len(up_to_date)} cliente(s)", (0.92, 0.98, 0.94, 1), SUCCESS))
+        row_b.add_widget(self.metric_tile("Promedio", money(average_balance), "por cliente", (0.94, 0.95, 0.98, 1), BLUE))
+        content.add_widget(row_b)
+
+        filter_box = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(116),
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(8),
+        )
+        filter_title = Label(
+            text="Filtra y revisa la cartera",
+            color=TEXT,
+            bold=True,
+            font_size="13sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(24),
+        )
+        filter_help = Label(
+            text="Puedes ver toda la cartera o concentrarte en los clientes vencidos, para hoy o al día.",
+            color=MUTED,
+            font_size="10.5sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(22),
+        )
+        for lbl in (filter_title, filter_help):
+            lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        filter_box.add_widget(filter_title)
+        filter_box.add_widget(filter_help)
+
+        row = BoxLayout(orientation="horizontal", spacing=dp(6), size_hint_y=None, height=dp(42))
+        for text_btn, key in [
+            ("Todos", "todos"),
+            ("Vencidos", "vencidos"),
+            ("Hoy", "hoy"),
+            ("Al día", "al_dia"),
+        ]:
+            row.add_widget(self.filter_button(text_btn, key))
+        filter_box.add_widget(row)
+        content.add_widget(filter_box)
+
+        if self.current_filter == "vencidos":
+            visible = overdue
+            filter_name = "vencidos"
+        elif self.current_filter == "hoy":
+            visible = due_today
+            filter_name = "para cobro hoy"
+        elif self.current_filter == "al_dia":
+            visible = up_to_date
+            filter_name = "al día"
+        else:
+            visible = debtors
+            filter_name = "en cartera"
+
+        visible = sorted(visible, key=lambda c: int(c.get("saldo", 0) or 0), reverse=True)
+        visible_amount = sum(int(c.get("saldo", 0) or 0) for c in visible)
+
+        section_card = RoundedBox(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(76),
+            padding=[dp(14), dp(10), dp(14), dp(10)],
+            spacing=dp(12),
+        )
+        left_box = BoxLayout(
+            orientation="vertical",
+            spacing=dp(4),
+            size_hint_x=0.66,
+        )
+        section_title = Label(
+            text=f"Detalle de clientes {filter_name}",
+            color=TEXT,
+            bold=True,
+            font_size="13sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(26),
+        )
+        section_sub = Label(
+            text=f"Mostrando {len(visible)} cliente(s)",
+            color=MUTED,
+            font_size="10.5sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(22),
+        )
+        for lbl in (section_title, section_sub):
+            lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        left_box.add_widget(section_title)
+        left_box.add_widget(section_sub)
+
+        right_value = Label(
+            text=money(visible_amount),
+            color=BLUE,
+            bold=True,
+            font_size="17sp",
+            halign="right",
+            valign="middle",
+            size_hint_x=0.34,
+            text_size=(None, None),
+        )
+        right_value.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+        section_card.add_widget(left_box)
+        section_card.add_widget(right_value)
+        content.add_widget(section_card)
+
+        if not visible:
+            empty = RoundedBox(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(120),
+                padding=[dp(16), dp(18), dp(16), dp(18)],
+                spacing=dp(8),
+            )
+            empty.bg_color = (0.97, 0.98, 1, 1)
+            empty_title = Label(
+                text="No hay clientes en este filtro",
+                color=TEXT,
+                bold=True,
+                font_size="14sp",
+                halign="center",
+                valign="middle",
+            )
+            empty_help = Label(
+                text="Prueba otro filtro o vuelve a la lista principal para seguir gestionando clientes.",
+                color=MUTED,
+                font_size="11sp",
+                halign="center",
+                valign="middle",
+            )
+            for lbl in (empty_title, empty_help):
+                lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            empty.add_widget(empty_title)
+            empty.add_widget(empty_help)
+            content.add_widget(empty)
+        else:
+            for cliente in visible:
+                content.add_widget(self.debtor_card(cliente, data["today"]))
+
+        scroll.add_widget(content)
+        self.root.add_widget(scroll)
+
+    def metric_tile(self, title, value, subtitle, bg_color, accent_color):
+        card = RoundedBox(
+            orientation="vertical",
+            size_hint_x=0.5,
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(4),
+        )
+        card.bg_color = bg_color
+
+        lbl_title = Label(
+            text=title,
+            color=MUTED,
+            bold=True,
+            font_size="11sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(18),
+        )
+        lbl_value = Label(
+            text=str(value),
+            color=accent_color,
+            bold=True,
+            font_size="18sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(28),
+        )
+        lbl_sub = Label(
+            text=subtitle,
+            color=TEXT,
+            font_size="10sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(18),
+        )
+        for lbl in (lbl_title, lbl_value, lbl_sub):
+            lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        card.add_widget(lbl_title)
+        card.add_widget(lbl_value)
+        card.add_widget(lbl_sub)
+        return card
+
+    def filter_button(self, text_btn, key):
+        active = self.current_filter == key
+        if key == "vencidos":
+            active_color = DANGER
+        elif key == "hoy":
+            active_color = GOLD
+        elif key == "al_dia":
+            active_color = SUCCESS
+        else:
+            active_color = BLUE
+        button = Button(
+            text=text_btn,
+            background_normal="",
+            background_color=active_color if active else (0.90, 0.92, 0.95, 1),
+            color=WHITE if active else TEXT,
+            bold=True,
+            font_size="11sp",
+        )
+        button.bind(on_release=lambda _btn, selected=key: self.set_filter(selected))
+        return button
+
+    def status_meta(self, cliente, today):
+        status = cliente.get("estado", "pendiente")
+        due_date = cliente.get("proximo_cobro", "")
+        is_overdue = status == "no_pago" or (due_date and due_date < today)
+        is_today = due_date == today
+
+        if is_overdue:
+            return {
+                "text": "VENCIDO",
+                "accent": DANGER,
+                "soft": (1.00, 0.94, 0.94, 1),
+                "note": "Este cliente necesita seguimiento prioritario.",
+            }
+        if is_today:
+            return {
+                "text": "COBRAR HOY",
+                "accent": GOLD,
+                "soft": (1.00, 0.97, 0.88, 1),
+                "note": "Está programado para cobro en la fecha actual.",
+            }
+        return {
+            "text": "AL DÍA",
+            "accent": SUCCESS,
+            "soft": (0.92, 0.98, 0.94, 1),
+            "note": "Va bien y todavía no está vencido.",
+        }
+
+    def debtor_card(self, cliente, today):
+        meta = self.status_meta(cliente, today)
+        name_text = str(cliente.get("nombre", "SIN NOMBRE"))
+        phone_text = str(cliente.get("telefono", "")).strip() or "Sin teléfono"
+        due_date = display_date_from_iso(cliente.get("proximo_cobro", ""))
+        balance_text = money(cliente.get("saldo", 0))
+        cuota_text = money(cliente.get("cuota", 0))
+        pending_text = str(cliente.get("pendientes", 0) or 0)
+
+        card = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(316),
+            padding=[dp(14), dp(14), dp(14), dp(14)],
+            spacing=dp(10),
+        )
+        card.bg_color = WHITE
+
+        # Encabezado: nombre y estado separados y legibles.
+        top = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(54),
+            spacing=dp(10),
+            padding=[dp(10), dp(6), dp(10), dp(6)],
+        )
+        with top.canvas.before:
+            Color(*BLUE)
+            top.bg = RoundedRectangle(pos=top.pos, size=top.size, radius=[dp(12)])
+        top.bind(pos=lambda w, *_: setattr(w.bg, "pos", w.pos))
+        top.bind(size=lambda w, *_: setattr(w.bg, "size", w.size))
+
+        name_box = BoxLayout(
+            orientation="vertical",
+            spacing=dp(2),
+            size_hint_x=0.67,
+        )
+        name_lbl = Label(
+            text=name_text,
+            color=WHITE,
+            bold=True,
+            font_size="15sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(26),
+        )
+        phone_lbl = Label(
+            text=phone_text,
+            color=(0.90, 0.94, 1, 1),
+            font_size="10.5sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(18),
+        )
+        for lbl in (name_lbl, phone_lbl):
+            lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        name_box.add_widget(name_lbl)
+        name_box.add_widget(phone_lbl)
+
+        badge = Button(
+            text=meta["text"],
+            size_hint_x=0.33,
+            size_hint_y=None,
+            height=dp(38),
+            background_normal="",
+            background_color=meta["accent"],
+            color=WHITE,
+            bold=True,
+            font_size="10.5sp",
+            disabled=True,
+        )
+        top.add_widget(name_box)
+        top.add_widget(badge)
+        card.add_widget(top)
+
+        line = Widget(size_hint_y=None, height=dp(2))
+        with line.canvas.before:
+            Color(*meta["accent"])
+            line.rect = Rectangle(pos=line.pos, size=line.size)
+        line.bind(
+            pos=lambda inst, *_: setattr(inst.rect, "pos", inst.pos),
+            size=lambda inst, *_: setattr(inst.rect, "size", inst.size),
+        )
+        card.add_widget(line)
+
+        hint = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(42),
+            padding=[dp(10), dp(7), dp(10), dp(7)],
+        )
+        hint.bg_color = meta["soft"]
+        hint_lbl = Label(
+            text=meta["note"],
+            color=TEXT,
+            font_size="10.5sp",
+            halign="left",
+            valign="middle",
+        )
+        hint_lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        hint.add_widget(hint_lbl)
+        card.add_widget(hint)
+
+        info_row1 = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(8),
+            size_hint_y=None,
+            height=dp(62),
+        )
+        info_row1.add_widget(
+            self.metric_tile_inline(
+                "Saldo pendiente",
+                balance_text,
+                meta["accent"],
+                meta["soft"],
+            )
+        )
+        info_row1.add_widget(
+            self.metric_tile_inline(
+                "Próximo cobro",
+                due_date or "Sin fecha",
+                BLUE,
+                (0.94, 0.96, 1, 1),
+            )
+        )
+        card.add_widget(info_row1)
+
+        info_row2 = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(8),
+            size_hint_y=None,
+            height=dp(62),
+        )
+        info_row2.add_widget(
+            self.metric_tile_inline(
+                "Valor de la cuota",
+                cuota_text,
+                DARK,
+                (0.95, 0.96, 0.98, 1),
+            )
+        )
+        info_row2.add_widget(
+            self.metric_tile_inline(
+                "Cuotas pendientes",
+                pending_text,
+                GOLD,
+                (1.00, 0.97, 0.88, 1),
+            )
+        )
+        card.add_widget(info_row2)
+
+        footer = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(48),
+            spacing=dp(10),
+        )
+        quick = Label(
+            text="Consulta el préstamo, historial y próximos cobros.",
+            color=MUTED,
+            font_size="10sp",
+            halign="left",
+            valign="middle",
+            size_hint_x=0.56,
+        )
+        quick.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        button = SmallButton("ABRIR CLIENTE", bg_color=BLUE)
+        button.size_hint_x = 0.44
+        button.height = dp(46)
+        button.bind(on_release=lambda *_: self.open_client(cliente))
+        footer.add_widget(quick)
+        footer.add_widget(button)
+        card.add_widget(footer)
+        return card
+
+    def metric_tile_inline(self, title, value, accent, bg_color):
+        box = RoundedBox(
+            orientation="vertical",
+            size_hint_x=0.5,
+            padding=[dp(10), dp(8), dp(10), dp(8)],
+            spacing=dp(4),
+        )
+        box.bg_color = bg_color
+        title_label = Label(
+            text=title,
+            color=MUTED,
+            bold=True,
+            font_size="10sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(18),
+        )
+        value_label = Label(
+            text=str(value),
+            color=accent,
+            bold=True,
+            font_size="13sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(24),
+        )
+        for lbl in (title_label, value_label):
+            lbl.bind(
+                size=lambda instance, value: setattr(
+                    instance,
+                    "text_size",
+                    value,
+                )
+            )
+        box.add_widget(title_label)
+        box.add_widget(value_label)
+        return box
+
+    def set_filter(self, selected):
+        self.current_filter = selected
+        self.build()
+
+    def open_client(self, cliente):
+        self.app_ref.selected_client = cliente
+        self.app_ref.go("gestion_cliente")
+
+
 class ResumenScreen(Screen):
     sync_status = StringProperty("Pendiente")
 
@@ -7447,13 +8070,24 @@ class ResumenScreen(Screen):
         ]:
             report.add_widget(MetricRow(left, right))
 
+        cartera_total = sum(
+            max(int(cliente.get("saldo", 0) or 0), 0)
+            for cliente in CLIENTES
+            if (
+                int(cliente.get("saldo", 0) or 0) > 0
+                and int(cliente.get("pendientes", 0) or 0) > 0
+                and cliente.get("estado") != "paz_y_salvo"
+            )
+        )
+
         report.add_widget(MetricRow("Saldo semanal en caja", money(saldo_caja), highlight=True))
+        report.add_widget(MetricRow("Cartera en la calle", money(cartera_total), highlight=True))
         content.add_widget(report)
 
         actions = RoundedBox(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(230),
+            height=dp(284),
             spacing=dp(8),
         )
 
@@ -7563,8 +8197,24 @@ class ResumenScreen(Screen):
         row_pdf.add_widget(close_button)
         row_pdf.add_widget(pdf_btn)
 
+        row_cartera = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(8),
+            size_hint_y=None,
+            height=dp(46),
+        )
+        cartera_button = PillButton(
+            "Cartera en la Calle",
+            bg_color=(0.22, 0.42, 0.72, 1),
+        )
+        cartera_button.bind(
+            on_release=lambda *_: self.app_ref.go("cartera_calle")
+        )
+        row_cartera.add_widget(cartera_button)
+
         actions.add_widget(row1)
         actions.add_widget(row2)
+        actions.add_widget(row_cartera)
         actions.add_widget(row_cloud)
         actions.add_widget(row_pdf)
         content.add_widget(actions)
@@ -8378,6 +9028,7 @@ class CobrosV12App(App):
         self.sm.add_widget(MovimientosScreen())
         self.sm.add_widget(ClientesPagaronHoyScreen())
         self.sm.add_widget(CierresSemanalesScreen())
+        self.sm.add_widget(CarteraCalleScreen())
         self.sm.add_widget(ResumenScreen())
 
         self.shell.add_widget(self.sm)
