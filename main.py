@@ -30,6 +30,8 @@ import urllib.parse
 import threading
 import calendar
 import time
+import uuid
+import shutil
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -91,6 +93,14 @@ SUPABASE_URL = "https://frvzniydfdmhltxwyknh.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZydnpuaXlkZmRtaGx0eHd5a25oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA1Nzc3NjUsImV4cCI6MjA5NjE1Mzc2NX0.2NFIkalEfGf0P7d9bT_kmNW_DvMU8I9bYTqQxabV_hI"
 COBRADOR_ID = "e058ca8f-210f-4c2e-8c7d-33ed239b3f20"
 COBRADOR_NOMBRE = "PACHO"
+
+# Versión para cliente único: el dueño es administrador y cobrador a la vez.
+MODO_DUENO_UNICO = True
+DUENO_COBRADOR_ID = COBRADOR_ID
+DUENO_NOMBRE = "PACHO"
+CENTRAL_CASH_ID = "CAJA_CENTRAL"
+CENTRAL_CASH_NAME = "CAJA CENTRAL ADMIN"
+
 
 SYNC_ENABLED = True
 SYNC_INTERVAL_SECONDS = 60
@@ -665,7 +675,11 @@ def weekly_metrics(date_iso=None):
         if movement.get("tipo") == "Egreso"
     )
     collected = sum(int(transaction.get("valor", 0)) for transaction in payments)
-    opening_cash = cash_balance_before_date(start_iso)
+    closure = get_cash_closure(date_iso)
+    if closure and closure.get("estado") in ("abierta", "cerrada"):
+        opening_cash = int(closure.get("caja_inicial", 0) or 0)
+    else:
+        opening_cash = cash_balance_before_date(start_iso)
     closing_cash = opening_cash + income + collected - expenses
 
     new_clients = [
@@ -949,7 +963,17 @@ def money(value):
 
 
 def business_name():
-    return globals().get("BUSINESS_NAME", "COBROS V12 MOBILE")
+    try:
+        return get_config_value("nombre_negocio", globals().get("BUSINESS_NAME", "COBROS V12 MOBILE"))
+    except Exception:
+        return globals().get("BUSINESS_NAME", "COBROS V12 MOBILE")
+
+
+def configured_collector_name():
+    try:
+        return get_config_value("nombre_cobrador", cobrador_nombre())
+    except Exception:
+        return cobrador_nombre()
 
 
 def client_matches_quick_filter(cliente, quick_filter, query=""):
@@ -1903,17 +1927,76 @@ def get_db_path():
             if app and getattr(app, "user_data_dir", None):
                 db_dir = Path(app.user_data_dir)
                 db_dir.mkdir(parents=True, exist_ok=True)
-                return str(db_dir / "cobros_v12.db")
+                return str(db_dir / "cobros_v12_pacho_admin_existente.db")
         except Exception:
             pass
 
-    return str(Path(__file__).resolve().parent / "cobros_v12.db")
+    return str(Path(__file__).resolve().parent / "cobros_v12_pacho_admin_existente.db")
 
 
 def get_connection():
     conn = sqlite3.connect(get_db_path())
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+DB_SCHEMA_VERSION = 9
+
+
+def backup_database_before_migration():
+    """
+    Crea una copia local antes de aplicar migraciones.
+    Evita pérdida de información si una actualización falla.
+    """
+    try:
+        db_path = Path(get_db_path())
+        if not db_path.exists():
+            return
+
+        backup_dir = db_path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        today = datetime.now().strftime("%Y_%m_%d")
+        backup_path = backup_dir / f"backup_pre_migracion_v{DB_SCHEMA_VERSION}_{today}.db"
+
+        if not backup_path.exists():
+            shutil.copy2(db_path, backup_path)
+            print("BACKUP DB:", backup_path)
+    except Exception as error:
+        print("BACKUP DB ERROR:", error)
+
+
+def ensure_uuid_values(cursor, table_name):
+    """
+    Garantiza UUID en tablas principales para futura sincronización multi-equipo.
+    """
+    try:
+        if not column_exists(cursor, table_name, "uuid"):
+            return
+
+        cursor.execute(f"SELECT id FROM {table_name} WHERE uuid IS NULL OR uuid = ''")
+        rows = cursor.fetchall()
+        for row in rows:
+            cursor.execute(
+                f"UPDATE {table_name} SET uuid = ? WHERE id = ?",
+                (str(uuid.uuid4()), row[0]),
+            )
+    except Exception as error:
+        print("UUID MIGRATION ERROR:", table_name, error)
+
+
+def set_db_meta(cursor, key, value):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    cursor.execute("""
+        INSERT INTO app_meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    """, (str(key), str(value)))
 
 
 def column_exists(cursor, table_name, column_name):
@@ -1927,6 +2010,8 @@ def ensure_column(cursor, table_name, column_name, column_definition):
 
 
 def init_database():
+    backup_database_before_migration()
+
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -2001,6 +2086,14 @@ def init_database():
         ("ultima_fecha_pago", "TEXT"),
         ("aporte_acumulado", "INTEGER NOT NULL DEFAULT 0"),
         ("synced", "INTEGER NOT NULL DEFAULT 0"),
+        ("uuid", "TEXT NOT NULL DEFAULT ''"),
+        ("sync_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("last_sync_at", "TEXT"),
+        ("sync_error", "TEXT"),
+        ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
+        ("deleted_at", "TEXT"),
+        ("deleted_reason", "TEXT"),
+        ("cobrador_id", "TEXT NOT NULL DEFAULT ''"),
     ]
 
     for name, definition in columns:
@@ -2071,6 +2164,13 @@ def init_database():
         ("cuotas_pendientes_total", "INTEGER NOT NULL DEFAULT 0"),
         ("observacion", "TEXT"),
         ("synced", "INTEGER NOT NULL DEFAULT 0"),
+        ("uuid", "TEXT NOT NULL DEFAULT ''"),
+        ("sync_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("last_sync_at", "TEXT"),
+        ("sync_error", "TEXT"),
+        ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
+        ("deleted_at", "TEXT"),
+        ("cobrador_id", "TEXT NOT NULL DEFAULT ''"),
     ]:
         ensure_column(cursor, "transacciones", name, definition)
 
@@ -2093,6 +2193,13 @@ def init_database():
         ("observaciones", "TEXT"),
         ("fecha", "TEXT NOT NULL DEFAULT ''"),
         ("synced", "INTEGER NOT NULL DEFAULT 0"),
+        ("uuid", "TEXT NOT NULL DEFAULT ''"),
+        ("sync_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("last_sync_at", "TEXT"),
+        ("sync_error", "TEXT"),
+        ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
+        ("deleted_at", "TEXT"),
+        ("cobrador_id", "TEXT NOT NULL DEFAULT ''"),
     ]:
         ensure_column(cursor, "movimientos_caja", name, definition)
 
@@ -2158,6 +2265,13 @@ def init_database():
         ("created_at", "TEXT NOT NULL DEFAULT ''"),
         ("updated_at", "TEXT NOT NULL DEFAULT ''"),
         ("synced", "INTEGER NOT NULL DEFAULT 0"),
+        ("uuid", "TEXT NOT NULL DEFAULT ''"),
+        ("sync_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("last_sync_at", "TEXT"),
+        ("sync_error", "TEXT"),
+        ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
+        ("deleted_at", "TEXT"),
+        ("cobrador_id", "TEXT NOT NULL DEFAULT ''"),
     ]:
         ensure_column(cursor, "cierres_caja", name, definition)
 
@@ -2186,21 +2300,140 @@ def init_database():
         )
     """)
 
+    for name, definition in [
+        ("uuid", "TEXT NOT NULL DEFAULT ''"),
+        ("sync_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("last_sync_at", "TEXT"),
+        ("sync_error", "TEXT"),
+        ("cobrador_id", "TEXT NOT NULL DEFAULT ''"),
+    ]:
+        ensure_column(cursor, "auditoria_acciones", name, definition)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS configuracion_app (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+    for name, definition in [
+        ("cobrador_id", "TEXT NOT NULL DEFAULT ''"),
+        ("synced", "INTEGER NOT NULL DEFAULT 0"),
+        ("sync_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("last_sync_at", "TEXT"),
+        ("sync_error", "TEXT"),
+    ]:
+        ensure_column(cursor, "configuracion_app", name, definition)
+
+    for key, value in [
+        ("nombre_negocio", "COBROS V12 MOBILE"),
+        ("nombre_cobrador", cobrador_nombre() if "cobrador_nombre" in globals() else "PACHO"),
+        ("moneda", "COP"),
+        ("ciudad", ""),
+        ("frecuencia_default", "Diario"),
+        ("interes_default", "20"),
+        ("telefono_negocio", ""),
+        ("pin_admin", "1234"),
+        ("pin_cobrador", "0000"),
+    ]:
+        cursor.execute("""
+            INSERT INTO configuracion_app (key, value, updated_at, cobrador_id, synced, sync_status)
+            VALUES (?, ?, ?, ?, 0, 'pending')
+            ON CONFLICT(key) DO NOTHING
+        """, (key, value, now_text(), COBRADOR_ID if "COBRADOR_ID" in globals() else ""))
+
+
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios_app (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT NOT NULL DEFAULT '',
+            nombre TEXT NOT NULL,
+            usuario TEXT NOT NULL UNIQUE,
+            pin TEXT NOT NULL,
+            rol TEXT NOT NULL DEFAULT 'cobrador',
+            cobrador_id TEXT NOT NULL DEFAULT '',
+            activo INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            synced INTEGER NOT NULL DEFAULT 0,
+            sync_status TEXT NOT NULL DEFAULT 'pending',
+            last_sync_at TEXT,
+            sync_error TEXT
+        )
+    """)
+
+    for name, definition in [
+        ("uuid", "TEXT NOT NULL DEFAULT ''"),
+        ("nombre", "TEXT NOT NULL DEFAULT ''"),
+        ("usuario", "TEXT NOT NULL DEFAULT ''"),
+        ("pin", "TEXT NOT NULL DEFAULT ''"),
+        ("rol", "TEXT NOT NULL DEFAULT 'cobrador'"),
+        ("cobrador_id", "TEXT NOT NULL DEFAULT ''"),
+        ("activo", "INTEGER NOT NULL DEFAULT 1"),
+        ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+        ("synced", "INTEGER NOT NULL DEFAULT 0"),
+        ("sync_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("last_sync_at", "TEXT"),
+        ("sync_error", "TEXT"),
+    ]:
+        ensure_column(cursor, "usuarios_app", name, definition)
+
+    now_seed = now_text()
+    cursor.execute("""
+        INSERT INTO usuarios_app (uuid, nombre, usuario, pin, rol, cobrador_id, activo, created_at, updated_at, synced, sync_status)
+        VALUES (?, 'Administrador', 'admin', '1234', 'administrador', ?, 1, ?, ?, 0, 'pending')
+        ON CONFLICT(usuario) DO NOTHING
+    """, (str(uuid.uuid4()), str(uuid.uuid4()), now_seed, now_seed))
+    cursor.execute("""
+        INSERT INTO usuarios_app (uuid, nombre, usuario, pin, rol, cobrador_id, activo, created_at, updated_at, synced, sync_status)
+        VALUES (?, ?, 'pacho', '0000', 'cobrador', ?, 1, ?, ?, 0, 'pending')
+        ON CONFLICT(usuario) DO NOTHING
+    """, (str(uuid.uuid4()), COBRADOR_NOMBRE if 'COBRADOR_NOMBRE' in globals() else 'PACHO', COBRADOR_ID if 'COBRADOR_ID' in globals() else 'pacho', now_seed, now_seed))
+
+    cursor.execute("UPDATE clientes SET cobrador_id = ? WHERE cobrador_id IS NULL OR cobrador_id = ''", (COBRADOR_ID if 'COBRADOR_ID' in globals() else 'pacho',))
+    cursor.execute("UPDATE transacciones SET cobrador_id = ? WHERE cobrador_id IS NULL OR cobrador_id = ''", (COBRADOR_ID if 'COBRADOR_ID' in globals() else 'pacho',))
+    cursor.execute("UPDATE movimientos_caja SET cobrador_id = ? WHERE cobrador_id IS NULL OR cobrador_id = ''", (COBRADOR_ID if 'COBRADOR_ID' in globals() else 'pacho',))
+    cursor.execute("UPDATE cierres_caja SET cobrador_id = ? WHERE cobrador_id IS NULL OR cobrador_id = ''", (COBRADOR_ID if 'COBRADOR_ID' in globals() else 'pacho',))
+    cursor.execute("UPDATE auditoria_acciones SET cobrador_id = ? WHERE cobrador_id IS NULL OR cobrador_id = ''", (COBRADOR_ID if 'COBRADOR_ID' in globals() else 'pacho',))
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS db_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
     # Índices para acelerar búsquedas, filtros, historial y sincronización.
     for index_sql in [
         "CREATE INDEX IF NOT EXISTS idx_clientes_nombre ON clientes(nombre)",
+        "CREATE INDEX IF NOT EXISTS idx_clientes_documento ON clientes(documento)",
+        "CREATE INDEX IF NOT EXISTS idx_clientes_telefono ON clientes(telefono)",
+        "CREATE INDEX IF NOT EXISTS idx_clientes_barrio ON clientes(barrio)",
+        "CREATE INDEX IF NOT EXISTS idx_clientes_ruta ON clientes(ruta)",
+        "CREATE INDEX IF NOT EXISTS idx_clientes_uuid ON clientes(uuid)",
+        "CREATE INDEX IF NOT EXISTS idx_clientes_deleted ON clientes(is_deleted)",
         "CREATE INDEX IF NOT EXISTS idx_clientes_estado ON clientes(estado)",
         "CREATE INDEX IF NOT EXISTS idx_clientes_proximo_cobro ON clientes(proximo_cobro)",
         "CREATE INDEX IF NOT EXISTS idx_clientes_synced ON clientes(synced)",
+        "CREATE INDEX IF NOT EXISTS idx_clientes_sync_status ON clientes(sync_status)",
         "CREATE INDEX IF NOT EXISTS idx_transacciones_cliente ON transacciones(cliente_id)",
         "CREATE INDEX IF NOT EXISTS idx_transacciones_fecha ON transacciones(fecha)",
         "CREATE INDEX IF NOT EXISTS idx_transacciones_synced ON transacciones(synced)",
+        "CREATE INDEX IF NOT EXISTS idx_transacciones_uuid ON transacciones(uuid)",
+        "CREATE INDEX IF NOT EXISTS idx_transacciones_tipo ON transacciones(tipo)",
         "CREATE INDEX IF NOT EXISTS idx_movimientos_fecha ON movimientos_caja(fecha)",
+        "CREATE INDEX IF NOT EXISTS idx_movimientos_uuid ON movimientos_caja(uuid)",
         "CREATE INDEX IF NOT EXISTS idx_movimientos_synced ON movimientos_caja(synced)",
         "CREATE INDEX IF NOT EXISTS idx_cierres_synced ON cierres_caja(synced)",
         "CREATE INDEX IF NOT EXISTS idx_cierres_periodo ON cierres_caja(periodo_inicio, periodo_fin)",
         "CREATE INDEX IF NOT EXISTS idx_eliminados_estado ON eliminados(entidad, synced)",
         "CREATE INDEX IF NOT EXISTS idx_auditoria_fecha ON auditoria_acciones(fecha)",
+        "CREATE INDEX IF NOT EXISTS idx_configuracion_synced ON configuracion_app(synced)",
+        "CREATE INDEX IF NOT EXISTS idx_configuracion_cobrador ON configuracion_app(cobrador_id)",
     ]:
         cursor.execute(index_sql)
 
@@ -2210,6 +2443,27 @@ def init_database():
             value TEXT NOT NULL DEFAULT ''
         )
     """)
+
+    for table_name in [
+        "clientes",
+        "transacciones",
+        "movimientos_caja",
+        "cierres_caja",
+        "auditoria_acciones",
+    ]:
+        ensure_uuid_values(cursor, table_name)
+
+    set_db_meta(cursor, "db_schema_version", DB_SCHEMA_VERSION)
+    set_db_meta(cursor, "db_last_migration_at", now_text())
+
+    cursor.execute("""
+        INSERT OR IGNORE INTO db_migrations (version, applied_at, description)
+        VALUES (?, ?, ?)
+    """, (
+        DB_SCHEMA_VERSION,
+        now_text(),
+        "Migración segura: UUIDs, configuración, sync_status, índices y backups.",
+    ))
 
     conn.commit()
     conn.close()
@@ -2227,10 +2481,12 @@ def load_clients_from_db():
                saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
                codeudor_documento, codeudor_nombre, codeudor_movil,
                valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-               proximo_cobro, ultima_fecha_pago, aporte_acumulado, synced
+               proximo_cobro, ultima_fecha_pago, aporte_acumulado, synced, cobrador_id
         FROM clientes
+        WHERE COALESCE(is_deleted, 0) = 0
+          AND (? = '' OR COALESCE(cobrador_id, '') = ?)
         ORDER BY nombre ASC
-    """)
+    """, (active_cobrador_id(), active_cobrador_id()))
 
     CLIENTES = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -2246,10 +2502,11 @@ def load_transacciones_from_db():
         SELECT id, cliente_id, cliente, tipo, valor, metodo, fecha,
                numero_cuotas, saldo_anterior, saldo_nuevo,
                cuotas_pagadas_total, cuotas_pendientes_total,
-               observacion, synced
+               observacion, synced, cobrador_id
         FROM transacciones
+        WHERE (? = '' OR COALESCE(cobrador_id, '') = ?)
         ORDER BY id ASC
-    """)
+    """, (active_cobrador_id(), active_cobrador_id()))
 
     TRANSACCIONES = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -2262,10 +2519,11 @@ def load_movimientos_from_db():
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT id, tipo, concepto, valor, observaciones, fecha, synced
+        SELECT id, tipo, concepto, valor, observaciones, fecha, synced, cobrador_id
         FROM movimientos_caja
+        WHERE (? = '' OR COALESCE(cobrador_id, '') = ?)
         ORDER BY id ASC
-    """)
+    """, (active_cobrador_id(), active_cobrador_id()))
 
     MOVIMIENTOS_CAJA = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -2410,9 +2668,9 @@ def insert_client_db(cliente):
             saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
             codeudor_documento, codeudor_nombre, codeudor_movil,
             valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-            proximo_cobro, ultima_fecha_pago, aporte_acumulado, synced
+            proximo_cobro, ultima_fecha_pago, aporte_acumulado, synced, cobrador_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         cliente.get("documento", ""),
         cliente.get("nombre", "SIN NOMBRE"),
@@ -2446,9 +2704,17 @@ def insert_client_db(cliente):
         cliente.get("ultima_fecha_pago", ""),
         int(cliente.get("aporte_acumulado", 0)),
         int(cliente.get("synced", 0)),
+        cliente.get("cobrador_id") or active_cobrador_id() or COBRADOR_ID,
     ))
 
     new_id = cursor.lastrowid
+    cursor.execute("""
+        UPDATE clientes
+        SET uuid = CASE WHEN uuid IS NULL OR uuid = '' THEN ? ELSE uuid END,
+            sync_status = 'pending',
+            cobrador_id = CASE WHEN cobrador_id IS NULL OR cobrador_id = '' THEN ? ELSE cobrador_id END
+        WHERE id = ?
+    """, (str(uuid.uuid4()), active_cobrador_id() or COBRADOR_ID, new_id))
     conn.commit()
     conn.close()
     return new_id
@@ -2466,7 +2732,8 @@ def update_client_db(cliente):
             codeudor_documento = ?, codeudor_nombre = ?, codeudor_movil = ?,
             valor_seguro = ?, beneficiario = ?, obs_seguro = ?, updated_at = ?,
             proximo_cobro = ?, ultima_fecha_pago = ?,
-            aporte_acumulado = ?, synced = ?
+            aporte_acumulado = ?, synced = ?, sync_status = 'pending',
+            cobrador_id = CASE WHEN cobrador_id IS NULL OR cobrador_id = '' THEN ? ELSE cobrador_id END
         WHERE id = ?
     """, (
         cliente.get("documento", ""),
@@ -2500,6 +2767,7 @@ def update_client_db(cliente):
         cliente.get("ultima_fecha_pago", ""),
         int(cliente.get("aporte_acumulado", 0)),
         int(cliente.get("synced", 0)),
+        cliente.get("cobrador_id", active_cobrador_id() or COBRADOR_ID),
         int(cliente.get("id")),
     ))
 
@@ -2684,10 +2952,12 @@ def get_client_by_id(cliente_id):
                saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
                codeudor_documento, codeudor_nombre, codeudor_movil,
                valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-               proximo_cobro, ultima_fecha_pago, aporte_acumulado, synced
+               proximo_cobro, ultima_fecha_pago, aporte_acumulado, synced, cobrador_id
         FROM clientes
         WHERE id = ?
-    """, (int(cliente_id),))
+          AND COALESCE(is_deleted, 0) = 0
+          AND (? = '' OR COALESCE(cobrador_id, '') = ?)
+    """, (int(cliente_id), active_cobrador_id(), active_cobrador_id()))
 
     row = cursor.fetchone()
     conn.close()
@@ -2867,6 +3137,13 @@ def insert_transaction_db(transaccion):
     ))
 
     new_id = cursor.lastrowid
+    cursor.execute("""
+        UPDATE transacciones
+        SET uuid = CASE WHEN uuid IS NULL OR uuid = '' THEN ? ELSE uuid END,
+            sync_status = 'pending',
+            cobrador_id = CASE WHEN cobrador_id IS NULL OR cobrador_id = '' THEN ? ELSE cobrador_id END
+        WHERE id = ?
+    """, (str(uuid.uuid4()), active_cobrador_id() or COBRADOR_ID, new_id))
     conn.commit()
     conn.close()
     return new_id
@@ -2876,10 +3153,12 @@ def insert_movement_db(movimiento):
     conn = get_connection()
     cursor = conn.cursor()
 
+    owner_id = str(movimiento.get("cobrador_id") or active_cobrador_id() or COBRADOR_ID).strip()
+
     cursor.execute("""
         INSERT INTO movimientos_caja
-        (tipo, concepto, valor, observaciones, fecha, synced)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (tipo, concepto, valor, observaciones, fecha, synced, cobrador_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
         movimiento.get("tipo", ""),
         movimiento.get("concepto", ""),
@@ -2887,10 +3166,21 @@ def insert_movement_db(movimiento):
         movimiento.get("observaciones", ""),
         movimiento.get("fecha", today_text()),
         int(movimiento.get("synced", 0)),
+        owner_id,
     ))
+
+    new_id = cursor.lastrowid
+    cursor.execute("""
+        UPDATE movimientos_caja
+        SET uuid = CASE WHEN uuid IS NULL OR uuid = '' THEN ? ELSE uuid END,
+            sync_status = 'pending',
+            cobrador_id = CASE WHEN cobrador_id IS NULL OR cobrador_id = '' THEN ? ELSE cobrador_id END
+        WHERE id = ?
+    """, (str(uuid.uuid4()), owner_id, new_id))
 
     conn.commit()
     conn.close()
+    return new_id
 
 
 def clear_all_data_db():
@@ -2905,24 +3195,414 @@ def clear_all_data_db():
     refresh_memory_from_db()
 
 
-def get_cash_closure(date_iso=None):
-    """Obtiene el cierre semanal de la semana que contiene la fecha."""
+
+def cash_owner_id():
+    """
+    Propietario operativo de la caja.
+    - Modo dueño único: admin y cobrador usan la misma caja del dueño.
+    - Multiusuario: cada cobrador usa su propia caja y admin ve consolidado.
+    """
+    if MODO_DUENO_UNICO:
+        return active_cobrador_id() or DUENO_COBRADOR_ID or COBRADOR_ID
+    return active_cobrador_id()
+
+
+def cash_owner_label():
+    if MODO_DUENO_UNICO and is_admin_role():
+        return active_cobrador_name() or DUENO_NOMBRE
+    if is_admin_role():
+        return "ADMINISTRADOR / CONSOLIDADO"
+    return active_cobrador_name() or "COBRADOR"
+
+
+def cash_period_key(date_iso=None, owner_id=None):
+    """
+    Llave única de caja por semana y cobrador.
+    periodo_inicio conserva la fecha real; fecha_iso queda única por cobrador.
+    """
     week_start, _ = week_bounds(date_iso)
+    owner = str(owner_id if owner_id is not None else cash_owner_id() or COBRADOR_ID).strip()
+    owner_short = owner.replace("-", "")[:12] or "principal"
+    return f"{week_start}_{owner_short}"
+
+
+def can_operate_cash():
+    """
+    Define quién puede abrir/cerrar caja.
+    - Modo dueño único: el mismo usuario admin puede operar caja.
+    - Multiusuario: solo cobradores operan caja; admin ve consolidado.
+    """
+    if MODO_DUENO_UNICO:
+        return bool(cash_owner_id())
+    return not is_admin_role() and bool(cash_owner_id())
+
+
+def require_cash_open(action_text="realizar esta operación"):
+    if not MODO_DUENO_UNICO and is_admin_role():
+        return False, "El administrador no registra operación de caja directa. Debe revisar el consolidado o entrar como cobrador."
+
+    if not cash_owner_id():
+        return False, "No hay cobrador activo. Cierra sesión e inicia nuevamente."
+
+    status = get_journey_status()
+    if status != "abierta":
+        return False, f"Debes abrir la caja semanal antes de {action_text}."
+    return True, "OK"
+
+
+def cash_summary_by_collector(date_iso=None):
+    start_iso, end_iso = week_bounds(date_iso)
+    owners = {}
+
+    def ensure_owner(cobrador_id, nombre=""):
+        key = str(cobrador_id or COBRADOR_ID).strip()
+        if not key:
+            key = COBRADOR_ID
+        if key not in owners:
+            owners[key] = {
+                "cobrador_id": key,
+                "nombre": nombre or key[:8],
+                "caja_inicial": 0,
+                "recaudo": 0,
+                "ingresos": 0,
+                "egresos": 0,
+                "saldo_esperado": 0,
+                "estado": "sin_abrir",
+                "pagos": 0,
+                "no_pagos": 0,
+            }
+        return owners[key]
+
+    for user in load_app_users(active_only=False):
+        if str(user.get("rol", "")).lower() == "cobrador":
+            ensure_owner(user.get("cobrador_id") or "", user.get("nombre") or user.get("usuario") or "")
 
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM cierres_caja
+        WHERE COALESCE(periodo_tipo, 'diario') = 'semanal'
+          AND COALESCE(is_deleted, 0) = 0
+          AND COALESCE(periodo_inicio, '') = ?
+    """, (start_iso,))
+    for row in cursor.fetchall():
+        r = dict(row)
+        owner = ensure_owner(r.get("cobrador_id") or COBRADOR_ID)
+        owner["caja_inicial"] = safe_int(r.get("caja_inicial", 0))
+        owner["estado"] = r.get("estado", "sin_abrir") or "sin_abrir"
+
+    cursor.execute("""
+        SELECT cobrador_id, tipo, valor
+        FROM transacciones
+        WHERE substr(COALESCE(fecha, ''), 1, 10) BETWEEN ? AND ?
+    """, (start_iso, end_iso))
+    for row in cursor.fetchall():
+        r = dict(row)
+        owner = ensure_owner(r.get("cobrador_id") or COBRADOR_ID)
+        if r.get("tipo") in ("Cuota", "Aporte"):
+            owner["recaudo"] += safe_int(r.get("valor", 0))
+            owner["pagos"] += 1
+        elif r.get("tipo") == "No Pago":
+            owner["no_pagos"] += 1
+
+    cursor.execute("""
+        SELECT cobrador_id, tipo, valor
+        FROM movimientos_caja
+        WHERE substr(COALESCE(fecha, ''), 1, 10) BETWEEN ? AND ?
+    """, (start_iso, end_iso))
+    for row in cursor.fetchall():
+        r = dict(row)
+        owner = ensure_owner(r.get("cobrador_id") or COBRADOR_ID)
+        if r.get("tipo") == "Ingreso":
+            owner["ingresos"] += safe_int(r.get("valor", 0))
+        elif r.get("tipo") == "Egreso":
+            owner["egresos"] += safe_int(r.get("valor", 0))
+
+    conn.close()
+
+    for owner in owners.values():
+        owner["saldo_esperado"] = owner["caja_inicial"] + owner["recaudo"] + owner["ingresos"] - owner["egresos"]
+
+    return sorted(owners.values(), key=lambda item: item.get("nombre", ""))
+
+
+
+
+def central_cash_movements():
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT *
+        FROM movimientos_caja
+        WHERE COALESCE(cobrador_id, '') = ?
+          AND COALESCE(is_deleted, 0) = 0
+        ORDER BY id DESC
+    """, (CENTRAL_CASH_ID,))
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def central_cash_balance():
+    balance = 0
+    for movement in central_cash_movements():
+        value = safe_int(movement.get("valor", 0))
+        if movement.get("tipo") == "Ingreso":
+            balance += value
+        elif movement.get("tipo") == "Egreso":
+            balance -= value
+    return balance
+
+
+def collector_display_name_by_id(cobrador_id):
+    for user in load_app_users(active_only=False):
+        if str(user.get("cobrador_id") or "") == str(cobrador_id or ""):
+            return user.get("nombre") or user.get("usuario") or str(cobrador_id)[:8]
+    return str(cobrador_id or "")[:8]
+
+
+def last_closed_cash_by_collector(cobrador_id):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT *
+        FROM cierres_caja
+        WHERE COALESCE(cobrador_id, '') = ?
+          AND COALESCE(periodo_tipo, 'diario') = 'semanal'
+          AND estado = 'cerrada'
+          AND COALESCE(is_deleted, 0) = 0
+        ORDER BY periodo_inicio DESC, id DESC
+        LIMIT 1
+    """, (str(cobrador_id or ""),))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def assigned_base_for_collector(cobrador_id):
+    """Última base entregada desde caja central al cobrador."""
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    pattern = f"BASE_ENTREGADA:{cobrador_id}"
+    cursor.execute("""
+        SELECT *
+        FROM movimientos_caja
+        WHERE COALESCE(cobrador_id, '') = ?
+          AND concepto = 'Base entregada a cobrador'
+          AND COALESCE(observaciones, '') LIKE ?
+          AND COALESCE(is_deleted, 0) = 0
+        ORDER BY id DESC
+        LIMIT 1
+    """, (CENTRAL_CASH_ID, f"%{pattern}%"))
+    row = cursor.fetchone()
+    conn.close()
+    return safe_int(row["valor"]) if row else 0
+
+
+def liquidated_base_for_collector(cobrador_id):
+    """Última base dejada en manos del cobrador después de liquidación."""
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    pattern = f"BASE_PROXIMA:{cobrador_id}:"
+    cursor.execute("""
+        SELECT observaciones
+        FROM movimientos_caja
+        WHERE COALESCE(cobrador_id, '') = ?
+          AND concepto = 'Liquidación cobrador'
+          AND COALESCE(observaciones, '') LIKE ?
+          AND COALESCE(is_deleted, 0) = 0
+        ORDER BY id DESC
+        LIMIT 1
+    """, (CENTRAL_CASH_ID, f"%{pattern}%"))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return 0
+    obs = str(row["observaciones"] or "")
+    try:
+        # formato: BASE_PROXIMA:<id>:<valor>
+        parts = obs.split(pattern, 1)[1]
+        value = parts.split()[0].replace(";", "").replace("|", "")
+        return safe_int(value)
+    except Exception:
+        return 0
+
+
+def suggested_opening_base_for_collector(cobrador_id):
+    """
+    Base sugerida para la próxima apertura:
+    1) Base dejada en liquidación anterior.
+    2) Base entregada por admin.
+    3) 0 si no existe.
+    """
+    liquidated = liquidated_base_for_collector(cobrador_id)
+    if liquidated > 0:
+        return liquidated
+    return assigned_base_for_collector(cobrador_id)
+
+
+def hand_base_to_collector(cobrador_id, amount, observation=""):
+    amount = safe_int(amount)
+    if amount <= 0:
+        raise ValueError("La base debe ser mayor que cero.")
+    if amount > central_cash_balance():
+        raise ValueError(f"Caja central insuficiente. Disponible: {money(central_cash_balance())}")
+
+    name = collector_display_name_by_id(cobrador_id)
+    insert_movement_db({
+        "tipo": "Egreso",
+        "concepto": "Base entregada a cobrador",
+        "valor": amount,
+        "observaciones": f"BASE_ENTREGADA:{cobrador_id} | Cobrador: {name} | {observation}",
+        "fecha": today_text(),
+        "synced": 0,
+        "cobrador_id": CENTRAL_CASH_ID,
+    })
+    insert_audit_log("Base entregada a cobrador", None, name, f"Valor: {money(amount)}. {observation}")
+    return True
+
+
+def add_central_cash(amount, observation=""):
+    amount = safe_int(amount)
+    if amount <= 0:
+        raise ValueError("El valor debe ser mayor que cero.")
+    insert_movement_db({
+        "tipo": "Ingreso",
+        "concepto": "Ingreso caja central",
+        "valor": amount,
+        "observaciones": observation or "Ingreso manual a caja central",
+        "fecha": today_text(),
+        "synced": 0,
+        "cobrador_id": CENTRAL_CASH_ID,
+    })
+    insert_audit_log("Ingreso caja central", None, "Caja central", f"Valor: {money(amount)}. {observation}")
+    return True
+
+
+def liquidate_collector_cash(cobrador_id, next_base, received_cash=None, observation=""):
+    closure = last_closed_cash_by_collector(cobrador_id)
+    if not closure:
+        raise ValueError("Este cobrador no tiene una caja cerrada para liquidar.")
+
+    expected = safe_int(closure.get("saldo_final", 0))
+    counted = safe_int(closure.get("efectivo_contado", expected))
+    next_base = safe_int(next_base)
+
+    if received_cash is None:
+        received_cash = max(counted - next_base, 0)
+    received_cash = safe_int(received_cash)
+
+    if next_base < 0 or received_cash < 0:
+        raise ValueError("Los valores no pueden ser negativos.")
+
+    # Lo que el cobrador debería entregar si se le deja esa base.
+    should_receive = max(counted - next_base, 0)
+    difference = received_cash - should_receive
+
+    name = collector_display_name_by_id(cobrador_id)
+
+    if received_cash > 0:
+        insert_movement_db({
+            "tipo": "Ingreso",
+            "concepto": "Liquidación cobrador",
+            "valor": received_cash,
+            "observaciones": (
+                f"LIQUIDACION:{cobrador_id} | BASE_PROXIMA:{cobrador_id}:{next_base} | "
+                f"Cobrador: {name} | Esperado cierre: {money(expected)} | "
+                f"Contado: {money(counted)} | Debía entregar: {money(should_receive)} | "
+                f"Entregó: {money(received_cash)} | Diferencia: {money(difference)} | {observation}"
+            ),
+            "fecha": today_text(),
+            "synced": 0,
+            "cobrador_id": CENTRAL_CASH_ID,
+        })
+    else:
+        # Registra movimiento 0 no se puede; dejar solo auditoría y base futura en meta por observación no es viable.
+        # Para conservar la base futura, registramos un ingreso técnico de 1 y un egreso técnico de 1.
+        insert_movement_db({
+            "tipo": "Ingreso",
+            "concepto": "Liquidación cobrador",
+            "valor": 1,
+            "observaciones": (
+                f"LIQUIDACION_TECNICA:{cobrador_id} | BASE_PROXIMA:{cobrador_id}:{next_base} | "
+                f"Cobrador: {name} | Sin dinero recibido | {observation}"
+            ),
+            "fecha": today_text(),
+            "synced": 0,
+            "cobrador_id": CENTRAL_CASH_ID,
+        })
+        insert_movement_db({
+            "tipo": "Egreso",
+            "concepto": "Ajuste técnico liquidación",
+            "valor": 1,
+            "observaciones": f"Compensa liquidación técnica de {name}",
+            "fecha": today_text(),
+            "synced": 0,
+            "cobrador_id": CENTRAL_CASH_ID,
+        })
+
+    insert_audit_log(
+        "Liquidación cobrador",
+        None,
+        name,
+        f"Base próxima: {money(next_base)}. Recibido: {money(received_cash)}. Diferencia: {money(difference)}. {observation}"
+    )
+    return {
+        "expected": expected,
+        "counted": counted,
+        "next_base": next_base,
+        "should_receive": should_receive,
+        "received_cash": received_cash,
+        "difference": difference,
+    }
+
+
+def get_cash_closure(date_iso=None):
+    """Obtiene la apertura/cierre semanal del cobrador activo."""
+    week_start, _ = week_bounds(date_iso)
+    owner_id = cash_owner_id() or COBRADOR_ID
+    key = cash_period_key(date_iso, owner_id)
+
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
     cursor.execute(
         """
         SELECT * FROM cierres_caja
         WHERE fecha_iso = ?
           AND COALESCE(periodo_tipo, 'diario') = 'semanal'
+          AND COALESCE(cobrador_id, '') = ?
+        ORDER BY id DESC
+        LIMIT 1
         """,
-        (week_start,),
+        (key, owner_id),
     )
     row = cursor.fetchone()
+
+    if row is None:
+        cursor.execute(
+            """
+            SELECT * FROM cierres_caja
+            WHERE fecha_iso = ?
+              AND COALESCE(periodo_tipo, 'diario') = 'semanal'
+              AND (COALESCE(cobrador_id, '') = ? OR COALESCE(cobrador_id, '') = '')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (week_start, owner_id),
+        )
+        row = cursor.fetchone()
+
     conn.close()
     return dict(row) if row else None
+
 
 
 def get_journey_status(date_iso=None):
@@ -2933,13 +3613,18 @@ def get_journey_status(date_iso=None):
 
 
 def open_cash_journey(date_iso=None, opening_cash=None, observation=""):
+    if not can_operate_cash():
+        raise ValueError("Este usuario no tiene permiso para abrir caja.")
+
     week_start, week_end = week_bounds(date_iso)
+    owner_id = cash_owner_id()
+    key = cash_period_key(date_iso, owner_id)
     existing = get_cash_closure(date_iso)
 
     if existing and existing.get("estado") in ("abierta", "cerrada"):
-        raise ValueError("La caja de esta semana ya fue abierta.")
+        raise ValueError("Este cobrador ya tiene caja semanal abierta o cerrada.")
 
-    calculated_opening = cash_balance_before_date(week_start)
+    calculated_opening = suggested_opening_base_for_collector(owner_id)
     if opening_cash is None:
         opening_cash = calculated_opening
     opening_cash = int(opening_cash)
@@ -2948,45 +3633,39 @@ def open_cash_journey(date_iso=None, opening_cash=None, observation=""):
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO cierres_caja (
-            fecha_iso, caja_inicial, recaudo, ingresos, egresos,
+            uuid, fecha_iso, caja_inicial, recaudo, ingresos, egresos,
             saldo_final, pagos, no_pagos, aplazados, estado,
             observacion_apertura, observacion_cierre,
             efectivo_contado, diferencia_caja, estado_cuadre,
             periodo_tipo, periodo_inicio, periodo_fin,
             clientes_activos, cartera_pendiente, prestamos_nuevos, desembolsos,
-            opened_at, closed_at, created_at, updated_at, synced
+            opened_at, closed_at, created_at, updated_at, synced,
+            sync_status, cobrador_id
         )
-        VALUES (?, ?, 0, 0, 0, ?, 0, 0, 0, ?, ?, '', 0, 0, 'sin_arqueo',
-                'semanal', ?, ?, 0, 0, 0, 0, ?, '', ?, ?, 0)
-        ON CONFLICT(fecha_iso) DO UPDATE SET
-            caja_inicial = excluded.caja_inicial,
-            saldo_final = excluded.saldo_final,
-            estado = excluded.estado,
-            observacion_apertura = excluded.observacion_apertura,
-            periodo_tipo = 'semanal',
-            periodo_inicio = excluded.periodo_inicio,
-            periodo_fin = excluded.periodo_fin,
-            opened_at = excluded.opened_at,
-            updated_at = excluded.updated_at,
-            synced = 0
+        VALUES (?, ?, ?, 0, 0, 0, ?, 0, 0, 0, ?, ?, '', 0, 0, 'sin_arqueo',
+                'semanal', ?, ?, 0, 0, 0, 0, ?, '', ?, ?, 0, 'pending', ?)
     """, (
-        week_start, opening_cash, opening_cash, "abierta",
+        str(uuid.uuid4()), key, opening_cash, opening_cash, "abierta",
         observation.strip(), week_start, week_end,
-        now_text(), now_text(), now_text(),
+        now_text(), now_text(), now_text(), owner_id,
     ))
     conn.commit()
     conn.close()
     return get_cash_closure(date_iso)
 
 
+
 def save_cash_closure(date_iso=None, observation="", physical_cash=None):
+    if not can_operate_cash():
+        raise ValueError("Este usuario no tiene permiso para cerrar caja.")
+
     week_start, week_end = week_bounds(date_iso)
     existing = get_cash_closure(date_iso)
 
     if not existing:
-        raise ValueError("La caja semanal debe abrirse antes de cerrarla.")
+        raise ValueError("La caja semanal del cobrador debe abrirse antes de cerrarla.")
     if existing.get("estado") != "abierta":
-        raise ValueError("El cierre de esta semana ya fue realizado.")
+        raise ValueError("El cierre de esta semana ya fue realizado para este cobrador.")
 
     metrics = weekly_metrics(date_iso)
     opening_cash = int(existing.get("caja_inicial", 0))
@@ -3015,8 +3694,9 @@ def save_cash_closure(date_iso=None, observation="", physical_cash=None):
             periodo_tipo = 'semanal', periodo_inicio = ?, periodo_fin = ?,
             clientes_activos = ?, cartera_pendiente = ?,
             prestamos_nuevos = ?, desembolsos = ?,
-            closed_at = ?, updated_at = ?, synced = 0
-        WHERE fecha_iso = ?
+            closed_at = ?, updated_at = ?, synced = 0, sync_status = 'pending',
+            cobrador_id = ?
+        WHERE id = ?
     """, (
         metrics["collected"], metrics["income"], metrics["expenses"], closing_cash,
         len(metrics["payments"]), len(metrics["no_payments"]), len(metrics["postponed"]),
@@ -3024,34 +3704,58 @@ def save_cash_closure(date_iso=None, observation="", physical_cash=None):
         reconciliation_status, week_start, week_end,
         metrics["active_clients"], metrics["outstanding_portfolio"],
         len(metrics["new_clients"]), metrics["disbursements"],
-        now_text(), now_text(), week_start,
+        now_text(), now_text(), cash_owner_id(), existing.get("id"),
     ))
     conn.commit()
     conn.close()
     return get_cash_closure(date_iso)
 
 
+
 def load_weekly_closures():
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT * FROM cierres_caja
-        WHERE COALESCE(periodo_tipo, 'diario') = 'semanal'
-        ORDER BY periodo_inicio DESC, id DESC
-    """)
+
+    owner = active_cobrador_id()
+    if owner:
+        cursor.execute("""
+            SELECT * FROM cierres_caja
+            WHERE COALESCE(periodo_tipo, 'diario') = 'semanal'
+              AND COALESCE(cobrador_id, '') = ?
+            ORDER BY periodo_inicio DESC, id DESC
+        """, (owner,))
+    else:
+        cursor.execute("""
+            SELECT * FROM cierres_caja
+            WHERE COALESCE(periodo_tipo, 'diario') = 'semanal'
+            ORDER BY periodo_inicio DESC, id DESC
+        """)
     rows = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return rows
 
 
+
 def mark_all_as_synced():
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE clientes SET synced = 1")
-    cursor.execute("UPDATE transacciones SET synced = 1")
-    cursor.execute("UPDATE movimientos_caja SET synced = 1")
-    cursor.execute("UPDATE cierres_caja SET synced = 1")
+    cursor.execute("UPDATE clientes SET synced = 1, sync_status = 'synced', last_sync_at = ?", (now_text(),))
+    cursor.execute("UPDATE transacciones SET synced = 1, sync_status = 'synced', last_sync_at = ?", (now_text(),))
+    cursor.execute("UPDATE movimientos_caja SET synced = 1, sync_status = 'synced', last_sync_at = ?", (now_text(),))
+    cursor.execute("UPDATE cierres_caja SET synced = 1, sync_status = 'synced', last_sync_at = ?", (now_text(),))
+    try:
+        cursor.execute("UPDATE auditoria_acciones SET synced = 1, sync_status = 'synced', last_sync_at = ?", (now_text(),))
+    except Exception:
+        pass
+    try:
+        cursor.execute("UPDATE configuracion_app SET synced = 1, sync_status = 'synced', last_sync_at = ?", (now_text(),))
+    except Exception:
+        pass
+    try:
+        cursor.execute("UPDATE usuarios_app SET synced = 1, sync_status = 'synced', last_sync_at = ?", (now_text(),))
+    except Exception:
+        pass
     conn.commit()
     conn.close()
     refresh_memory_from_db()
@@ -3068,8 +3772,23 @@ def count_pending_sync():
     mv = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM cierres_caja WHERE synced = 0")
     cierres = cursor.fetchone()[0]
+    try:
+        cursor.execute("SELECT COUNT(*) FROM auditoria_acciones WHERE synced = 0")
+        audit = cursor.fetchone()[0]
+    except Exception:
+        audit = 0
+    try:
+        cursor.execute("SELECT COUNT(*) FROM configuracion_app WHERE synced = 0")
+        cfg = cursor.fetchone()[0]
+    except Exception:
+        cfg = 0
+    try:
+        cursor.execute("SELECT COUNT(*) FROM usuarios_app WHERE synced = 0")
+        users = cursor.fetchone()[0]
+    except Exception:
+        users = 0
     conn.close()
-    return clientes + tx + mv + cierres
+    return clientes + tx + mv + cierres + audit + cfg + users
 
 
 
@@ -3113,6 +3832,318 @@ def get_app_meta(key, default=""):
     except Exception as error:
         print("APP META GET ERROR:", error)
         return default
+
+
+def get_config_value(key, default=""):
+    """Lee configuracion funcional del negocio desde SQLite."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS configuracion_app (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        cursor.execute("SELECT value FROM configuracion_app WHERE key = ?", (str(key),))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row and row[0] not in (None, "") else default
+    except Exception as error:
+        print("CONFIG GET ERROR:", error)
+        return default
+
+
+def set_config_value(key, value):
+    """Guarda configuracion funcional del negocio en SQLite."""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS configuracion_app (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        for name, definition in [
+            ("cobrador_id", "TEXT NOT NULL DEFAULT ''"),
+            ("synced", "INTEGER NOT NULL DEFAULT 0"),
+            ("sync_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("last_sync_at", "TEXT"),
+            ("sync_error", "TEXT"),
+        ]:
+            ensure_column(cursor, "configuracion_app", name, definition)
+        cursor.execute("""
+            INSERT INTO configuracion_app (key, value, updated_at, cobrador_id, synced, sync_status)
+            VALUES (?, ?, ?, ?, 0, 'pending')
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at,
+                cobrador_id = excluded.cobrador_id,
+                synced = 0,
+                sync_status = 'pending',
+                sync_error = ''
+        """, (str(key), str(value or "").strip(), now_text(), COBRADOR_ID))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as error:
+        print("CONFIG SET ERROR:", error)
+        return False
+
+
+def get_role_pin(role):
+    if role == "Administrador":
+        return get_config_value("pin_admin", "1234")
+    return get_config_value("pin_cobrador", "0000")
+
+
+def is_admin_role():
+    app = App.get_running_app()
+    role = str(getattr(app, "current_role", "Administrador") or "Administrador").lower()
+    return role in ("administrador", "admin")
+
+
+def active_cobrador_id():
+    """
+    ID operativo del cobrador activo.
+
+    En modo dueño único, el administrador también opera caja como cobrador.
+    Por eso no devuelve vacío para admin; devuelve su cobrador_id o el
+    DUENO_COBRADOR_ID.
+    """
+    try:
+        app = App.get_running_app()
+        current_id = str(getattr(app, "current_cobrador_id", "") or "").strip()
+
+        if MODO_DUENO_UNICO:
+            return current_id or DUENO_COBRADOR_ID or COBRADOR_ID
+
+        if is_admin_role():
+            return ""
+
+        return current_id
+    except Exception:
+        return DUENO_COBRADOR_ID if MODO_DUENO_UNICO else ""
+
+
+def active_cobrador_name():
+    try:
+        app = App.get_running_app()
+        return str(getattr(app, "current_user_name", "") or configured_collector_name()).strip()
+    except Exception:
+        return configured_collector_name()
+
+
+def normalize_username(value):
+    return str(value or "").strip().lower().replace(" ", "_")
+
+
+def load_app_users(active_only=True):
+    """Carga usuarios/cobradores guardados localmente."""
+    try:
+        conn = get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS usuarios_app (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL DEFAULT '',
+                nombre TEXT NOT NULL,
+                usuario TEXT NOT NULL UNIQUE,
+                pin TEXT NOT NULL,
+                rol TEXT NOT NULL DEFAULT 'cobrador',
+                cobrador_id TEXT NOT NULL DEFAULT '',
+                activo INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                synced INTEGER NOT NULL DEFAULT 0,
+                sync_status TEXT NOT NULL DEFAULT 'pending',
+                last_sync_at TEXT,
+                sync_error TEXT
+            )
+        """)
+        sql = "SELECT * FROM usuarios_app"
+        if active_only:
+            sql += " WHERE activo = 1"
+        sql += " ORDER BY CASE WHEN rol='administrador' THEN 0 ELSE 1 END, nombre ASC"
+        cursor.execute(sql)
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return rows
+    except Exception as error:
+        print("LOAD USERS ERROR:", error)
+        return []
+
+
+def get_app_user_by_username(usuario):
+    usuario = normalize_username(usuario)
+    for user in load_app_users(active_only=False):
+        if normalize_username(user.get("usuario")) == usuario:
+            return user
+    return None
+
+
+def save_app_user(data):
+    """Crea o actualiza usuario/cobrador."""
+    nombre = str(data.get("nombre") or "").strip()
+    usuario = normalize_username(data.get("usuario") or nombre)
+    pin = str(data.get("pin") or "").strip()
+    rol = str(data.get("rol") or "cobrador").strip().lower()
+    activo = 1 if int(data.get("activo", 1) or 0) else 0
+
+    if not nombre or not usuario or not pin:
+        raise ValueError("Nombre, usuario y PIN son obligatorios.")
+
+    if rol not in ("administrador", "cobrador"):
+        rol = "cobrador"
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = now_text()
+    existing = get_app_user_by_username(usuario)
+
+    # Importante para Supabase:
+    # en tu nube cobrador_id puede ser UUID. Por eso los cobradores nuevos
+    # reciben un UUID real y no el texto del usuario, como "juan".
+    if existing and existing.get("cobrador_id"):
+        cobrador_id = str(existing.get("cobrador_id")).strip()
+    else:
+        cobrador_id = str(data.get("cobrador_id") or uuid.uuid4()).strip()
+
+    if existing:
+        cursor.execute("""
+            UPDATE usuarios_app
+            SET nombre=?, pin=?, rol=?, cobrador_id=?, activo=?, updated_at=?, synced=0, sync_status='pending', sync_error=''
+            WHERE usuario=?
+        """, (nombre, pin, rol, cobrador_id, activo, now, usuario))
+    else:
+        cursor.execute("""
+            INSERT INTO usuarios_app (
+                uuid, nombre, usuario, pin, rol, cobrador_id, activo,
+                created_at, updated_at, synced, sync_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending')
+        """, (str(uuid.uuid4()), nombre, usuario, pin, rol, cobrador_id, activo, now, now))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def deactivate_app_user(usuario):
+    usuario = normalize_username(usuario)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE usuarios_app
+        SET activo=0, updated_at=?, synced=0, sync_status='pending'
+        WHERE usuario=? AND rol <> 'administrador'
+    """, (now_text(), usuario))
+    conn.commit()
+    conn.close()
+
+
+def load_collectors(active_only=True):
+    """Devuelve solo usuarios con rol cobrador para asignación de clientes."""
+    users = load_app_users(active_only=active_only)
+    return [u for u in users if str(u.get("rol", "")).lower() == "cobrador"]
+
+
+def collector_label(user):
+    """Etiqueta visible para seleccionar cobrador sin mostrar el UUID completo."""
+    name = str(user.get("nombre") or "Sin nombre").strip()
+    username = str(user.get("usuario") or "").strip()
+    return f"{name} ({username})"
+
+
+def collector_by_label(label):
+    for user in load_collectors(active_only=False):
+        if collector_label(user) == label:
+            return user
+    return None
+
+
+def collector_name_by_id(cobrador_id):
+    cobrador_id = str(cobrador_id or "").strip()
+    if not cobrador_id:
+        return "Sin asignar"
+    for user in load_app_users(active_only=False):
+        if str(user.get("cobrador_id") or "").strip() == cobrador_id:
+            return str(user.get("nombre") or user.get("usuario") or "Cobrador")
+    if cobrador_id == COBRADOR_ID:
+        return COBRADOR_NOMBRE
+    return "Cobrador no identificado"
+
+
+def collector_summary_data():
+    """Resumen gerencial por cobrador: clientes, cartera y recaudo de hoy."""
+    collectors = load_collectors(active_only=False)
+    summary = []
+    today_iso = iso_today()
+
+    for user in collectors:
+        cid = str(user.get("cobrador_id") or "").strip()
+        clients = [c for c in CLIENTES if str(c.get("cobrador_id") or "").strip() == cid]
+        active_clients = [c for c in clients if safe_int(c.get("saldo", 0)) > 0 and safe_int(c.get("pendientes", 0)) > 0]
+        cartera = sum(safe_int(c.get("saldo", 0)) for c in active_clients)
+        visitas_hoy = [
+            c for c in active_clients
+            if not c.get("proximo_cobro") or str(c.get("proximo_cobro", ""))[:10] <= today_iso
+        ]
+        recaudo_hoy = sum(
+            safe_int(t.get("valor", 0))
+            for t in TRANSACCIONES
+            if str(t.get("fecha", ""))[:10] == today_iso
+            and str(t.get("cobrador_id") or cid).strip() == cid
+            and t.get("tipo") in ("Cuota", "Aporte")
+        )
+        summary.append({
+            "user": user,
+            "cobrador_id": cid,
+            "clientes": len(clients),
+            "activos": len(active_clients),
+            "visitas_hoy": len(visitas_hoy),
+            "cartera": cartera,
+            "recaudo_hoy": recaudo_hoy,
+        })
+
+    return summary
+
+
+def reassign_client_to_collector(cliente_id, collector_user):
+    """Reasigna un cliente a otro cobrador y lo deja pendiente por sincronizar."""
+    if not collector_user:
+        raise ValueError("Seleccione un cobrador válido.")
+
+    new_cobrador_id = str(collector_user.get("cobrador_id") or "").strip()
+    if not new_cobrador_id:
+        raise ValueError("El cobrador seleccionado no tiene identificador interno.")
+
+    cliente = get_client_by_id(cliente_id)
+    if not cliente:
+        raise ValueError("Cliente no encontrado.")
+
+    old_cobrador_id = str(cliente.get("cobrador_id") or "").strip()
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE clientes
+        SET cobrador_id = ?, synced = 0, sync_status = 'pending', updated_at = ?
+        WHERE id = ?
+    """, (new_cobrador_id, now_text(), int(cliente_id)))
+    conn.commit()
+    conn.close()
+
+    insert_audit_log(
+        "Cliente reasignado",
+        cliente,
+        "Cambio de cobrador",
+        f"De {collector_name_by_id(old_cobrador_id)} a {collector_label(collector_user)}",
+    )
+    refresh_memory_from_db(clients=True, transactions=False, movements=False, normalize=False)
+    return True
 
 
 def register_successful_cloud_backup():
@@ -3160,16 +4191,40 @@ def cloud_backup_status_info():
 
 def current_cash_balance():
     """
-    Calcula saldo disponible en caja:
-    ingresos + recaudos de clientes - egresos.
+    Saldo disponible real de la caja semanal del cobrador activo.
+    Admin obtiene consolidado general, pero no debe registrar operaciones directas.
     """
     try:
-        ingresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Ingreso")
-        egresos = sum(int(m.get("valor", 0)) for m in MOVIMIENTOS_CAJA if m.get("tipo") == "Egreso")
-        recaudos = sum(int(t.get("valor", 0)) for t in TRANSACCIONES if t.get("tipo") in ("Cuota", "Aporte"))
-        return ingresos + recaudos - egresos
+        refresh_memory_from_db(
+            clients=False,
+            transactions=True,
+            movements=True,
+            normalize=False,
+        )
     except Exception:
+        pass
+
+    try:
+        week_start, week_end = week_bounds()
+        closure = get_cash_closure()
+
+        if closure and closure.get("estado") in ("abierta", "cerrada"):
+            opening_cash = int(closure.get("caja_inicial", 0) or 0)
+        else:
+            opening_cash = cash_balance_before_date(week_start)
+
+        transactions = records_for_period(TRANSACCIONES, week_start, week_end)
+        movements = records_for_period(MOVIMIENTOS_CAJA, week_start, week_end)
+
+        ingresos = sum(safe_int(m.get("valor", 0)) for m in movements if m.get("tipo") == "Ingreso")
+        egresos = sum(safe_int(m.get("valor", 0)) for m in movements if m.get("tipo") == "Egreso")
+        recaudos = sum(safe_int(t.get("valor", 0)) for t in transactions if t.get("tipo") in ("Cuota", "Aporte"))
+
+        return opening_cash + ingresos + recaudos - egresos
+    except Exception as error:
+        print("CURRENT CASH BALANCE ERROR:", error)
         return 0
+
 
 
 def update_due_statuses():
@@ -3257,15 +4312,37 @@ def supabase_request(table_name, payload, method="POST", query_suffix=""):
 
 
 
-def supabase_get(table_name):
+def supabase_get(table_name, filter_by_cobrador=True):
     """
-    Descarga datos desde Supabase filtrando por cobrador_id.
-    Sirve para restaurar datos en un celular nuevo.
+    Descarga datos desde Supabase respetando rol y cobrador activo.
+
+    Reglas:
+    - usuarios_app: siempre descarga todos los usuarios para que aparezcan en login.
+    - configuracion_app: descarga toda la configuración disponible.
+    - Administrador: descarga todo.
+    - Cobrador: descarga solo datos de su cobrador_id.
+    - Antes de login: descarga todo lo necesario para poder iniciar sesión.
     """
     if not supabase_configured():
         return False, "Supabase no configurado", []
 
-    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{table_name}?select=*&cobrador_id=eq.{COBRADOR_ID}"
+    no_filter_tables = {"usuarios_app", "configuracion_app"}
+    should_filter = filter_by_cobrador and table_name not in no_filter_tables
+
+    try:
+        app = App.get_running_app()
+        authenticated = bool(getattr(app, "authenticated", False))
+    except Exception:
+        authenticated = False
+
+    query = "?select=*"
+
+    if should_filter and authenticated and not is_admin_role():
+        cobrador = active_cobrador_id()
+        if cobrador:
+            query += f"&cobrador_id=eq.{urllib.parse.quote(str(cobrador), safe='')}"
+
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{table_name}{query}"
 
     headers = {
         "apikey": SUPABASE_ANON_KEY,
@@ -3290,6 +4367,7 @@ def supabase_get(table_name):
         return False, f"HTTPError {error.code}: {detail}", []
     except Exception as error:
         return False, str(error), []
+
 
 
 def repair_local_cloud_client_count():
@@ -3347,22 +4425,14 @@ def repair_local_cloud_client_count():
 
 def pull_clients_from_cloud():
     """
-    Descarga clientes de Supabase y reconcilia eliminados remotos.
-
-    Si un cliente fue eliminado en Supabase, también se elimina localmente
-    si ya estaba sincronizado. Los clientes locales pendientes synced=0
-    se conservan.
+    Descarga clientes de Supabase incluyendo campos nuevos de base de datos:
+    uuid, rutas, sync_status y soft delete.
     """
     ok, msg, rows = supabase_get("clientes")
     if not ok:
         return False, msg
 
-    # Solo las eliminaciones pendientes de subir deben bloquear
-    # temporalmente la restauración desde la nube.
-    pending_deleted_client_ids = get_deleted_ids(
-        "cliente",
-        only_pending=True,
-    )
+    pending_deleted_client_ids = get_deleted_ids("cliente", only_pending=True)
 
     all_remote_ids = {
         int(row.get("id"))
@@ -3370,16 +4440,14 @@ def pull_clients_from_cloud():
         if row.get("id") is not None
     }
 
-    obsolete_marks_removed = clear_obsolete_deleted_marks(
-        "cliente",
-        all_remote_ids,
-    )
+    obsolete_marks_removed = clear_obsolete_deleted_marks("cliente", all_remote_ids)
 
     rows = [
         row
         for row in rows
-        if int(row.get("id"))
-        not in pending_deleted_client_ids
+        if row.get("id") is not None
+        and int(row.get("id")) not in pending_deleted_client_ids
+        and int(row.get("is_deleted") or 0) == 0
     ]
 
     conn = get_connection()
@@ -3393,20 +4461,28 @@ def pull_clients_from_cloud():
 
         cursor.execute("""
             INSERT OR REPLACE INTO clientes (
-                id, documento, nombre, telefono, direccion, producto,
+                id, uuid, documento, nombre, telefono, direccion,
+                barrio, zona, ruta, orden_visita, producto,
                 valor_credito, interes, total_credito, cuota, numero_cuotas,
                 saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
                 codeudor_documento, codeudor_nombre, codeudor_movil,
                 valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-                proximo_cobro, ultima_fecha_pago, aporte_acumulado, synced
+                proximo_cobro, ultima_fecha_pago, aporte_acumulado,
+                synced, sync_status, last_sync_at, sync_error,
+                is_deleted, deleted_at, deleted_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'synced', ?, '', ?, ?, ?)
         """, (
             client_id,
+            r.get("uuid") or str(uuid.uuid4()),
             r.get("documento", ""),
             r.get("nombre", "SIN NOMBRE"),
             r.get("telefono", ""),
             r.get("direccion", ""),
+            r.get("barrio", ""),
+            r.get("zona", ""),
+            r.get("ruta", ""),
+            int(r.get("orden_visita") or 0),
             r.get("producto", "5 - CREDITO EN EFECTIVO"),
             int(r.get("valor_credito") or 0),
             float(r.get("interes") or 0),
@@ -3430,17 +4506,29 @@ def pull_clients_from_cloud():
             r.get("proximo_cobro", ""),
             r.get("ultima_fecha_pago", ""),
             int(r.get("aporte_acumulado") or 0),
-            1,
+            r.get("last_sync_at") or now_text(),
+            int(r.get("is_deleted") or 0),
+            r.get("deleted_at", "") or "",
+            r.get("deleted_reason", "") or "",
         ))
+        cursor.execute("UPDATE clientes SET cobrador_id = ? WHERE id = ?", (r.get("cobrador_id") or COBRADOR_ID, client_id))
 
-    cursor.execute("SELECT id FROM clientes WHERE synced = 1")
+    active_filter = active_cobrador_id()
+    if active_filter:
+        cursor.execute(
+            """
+            SELECT id FROM clientes
+            WHERE synced = 1
+              AND COALESCE(is_deleted, 0) = 0
+              AND COALESCE(cobrador_id, '') = ?
+            """,
+            (active_filter,),
+        )
+    else:
+        cursor.execute("SELECT id FROM clientes WHERE synced = 1 AND COALESCE(is_deleted, 0) = 0")
     local_synced_ids = {int(row[0]) for row in cursor.fetchall()}
 
-    ids_to_delete = (
-        local_synced_ids
-        - remote_ids
-        - pending_deleted_client_ids
-    )
+    ids_to_delete = local_synced_ids - remote_ids - pending_deleted_client_ids
 
     for client_id in ids_to_delete:
         cursor.execute("DELETE FROM transacciones WHERE cliente_id = ?", (client_id,))
@@ -3459,14 +4547,18 @@ def pull_clients_from_cloud():
 
 def pull_transactions_from_cloud():
     """
-    Descarga transacciones desde Supabase y reconcilia eliminados remotos.
+    Descarga transacciones desde Supabase incluyendo UUID y estado de sincronización.
     """
     ok, msg, rows = supabase_get("transacciones")
     if not ok:
         return False, msg
 
     deleted_client_ids = get_deleted_ids("cliente")
-    rows = [r for r in rows if not r.get("cliente_id") or int(r.get("cliente_id")) not in deleted_client_ids]
+    rows = [
+        r for r in rows
+        if (not r.get("cliente_id") or int(r.get("cliente_id")) not in deleted_client_ids)
+        and int(r.get("is_deleted") or 0) == 0
+    ]
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -3479,14 +4571,16 @@ def pull_transactions_from_cloud():
 
         cursor.execute("""
             INSERT OR REPLACE INTO transacciones (
-                id, cliente_id, cliente, tipo, valor, metodo, fecha,
+                id, uuid, cliente_id, cliente, tipo, valor, metodo, fecha,
                 numero_cuotas, saldo_anterior, saldo_nuevo,
                 cuotas_pagadas_total, cuotas_pendientes_total,
-                observacion, synced
+                observacion, synced, sync_status, last_sync_at, sync_error,
+                is_deleted, deleted_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'synced', ?, '', ?, ?)
         """, (
             tx_id,
+            r.get("uuid") or str(uuid.uuid4()),
             r.get("cliente_id"),
             r.get("cliente", ""),
             r.get("tipo", ""),
@@ -3499,10 +4593,24 @@ def pull_transactions_from_cloud():
             int(r.get("cuotas_pagadas_total") or 0),
             int(r.get("cuotas_pendientes_total") or 0),
             r.get("observacion", ""),
-            1,
+            r.get("last_sync_at") or now_text(),
+            int(r.get("is_deleted") or 0),
+            r.get("deleted_at", "") or "",
         ))
 
-    cursor.execute("SELECT id FROM transacciones WHERE synced = 1")
+    active_filter = active_cobrador_id()
+    if active_filter:
+        cursor.execute(
+            """
+            SELECT id FROM transacciones
+            WHERE synced = 1
+              AND COALESCE(is_deleted, 0) = 0
+              AND COALESCE(cobrador_id, '') = ?
+            """,
+            (active_filter,),
+        )
+    else:
+        cursor.execute("SELECT id FROM transacciones WHERE synced = 1 AND COALESCE(is_deleted, 0) = 0")
     local_synced_ids = {int(row[0]) for row in cursor.fetchall()}
 
     ids_to_delete = local_synced_ids - remote_ids
@@ -3519,16 +4627,13 @@ def pull_transactions_from_cloud():
 
 def pull_movements_from_cloud():
     """
-    Descarga movimientos de caja desde Supabase y reconcilia eliminados.
-
-    Si un movimiento fue eliminado directamente en Supabase, también se elimina
-    de SQLite local, siempre que ya estuviera sincronizado (synced=1).
-    Los movimientos locales pendientes (synced=0) se conservan para no perder
-    registros hechos sin internet.
+    Descarga movimientos de caja desde Supabase incluyendo UUID y estado de sincronización.
     """
     ok, msg, rows = supabase_get("movimientos_caja")
     if not ok:
         return False, msg
+
+    rows = [r for r in rows if int(r.get("is_deleted") or 0) == 0]
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -3541,23 +4646,38 @@ def pull_movements_from_cloud():
 
         cursor.execute("""
             INSERT OR REPLACE INTO movimientos_caja (
-                id, tipo, concepto, valor, observaciones, fecha, synced
+                id, uuid, tipo, concepto, valor, observaciones, fecha,
+                synced, sync_status, last_sync_at, sync_error,
+                is_deleted, deleted_at, cobrador_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'synced', ?, '', ?, ?, ?)
         """, (
             movement_id,
+            r.get("uuid") or str(uuid.uuid4()),
             r.get("tipo", ""),
             r.get("concepto", ""),
             int(r.get("valor") or 0),
             r.get("observaciones", ""),
             r.get("fecha", today_text()),
-            1,
+            r.get("last_sync_at") or now_text(),
+            int(r.get("is_deleted") or 0),
+            r.get("deleted_at", "") or "",
+            r.get("cobrador_id") or COBRADOR_ID,
         ))
 
-    # Reconciliación de eliminados remotos:
-    # si el registro local estaba sincronizado y ya no existe en Supabase,
-    # se elimina localmente.
-    cursor.execute("SELECT id FROM movimientos_caja WHERE synced = 1")
+    active_filter = active_cobrador_id()
+    if active_filter:
+        cursor.execute(
+            """
+            SELECT id FROM movimientos_caja
+            WHERE synced = 1
+              AND COALESCE(is_deleted, 0) = 0
+              AND COALESCE(cobrador_id, '') = ?
+            """,
+            (active_filter,),
+        )
+    else:
+        cursor.execute("SELECT id FROM movimientos_caja WHERE synced = 1 AND COALESCE(is_deleted, 0) = 0")
     local_synced_ids = {int(row[0]) for row in cursor.fetchall()}
 
     ids_to_delete = local_synced_ids - remote_ids
@@ -3683,10 +4803,12 @@ def delete_remote_client_bundle(cliente):
 
 
 def pull_closures_from_cloud():
-    """Descarga aperturas y cierres semanales desde Supabase."""
+    """Descarga aperturas y cierres semanales desde Supabase incluyendo UUID."""
     ok, message, rows = supabase_get("cierres_caja")
     if not ok:
         return False, message
+
+    rows = [row for row in rows if int(row.get("is_deleted") or 0) == 0]
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -3699,16 +4821,19 @@ def pull_closures_from_cloud():
 
         cursor.execute("""
             INSERT INTO cierres_caja (
-                fecha_iso, caja_inicial, recaudo, ingresos, egresos,
+                uuid, fecha_iso, caja_inicial, recaudo, ingresos, egresos,
                 saldo_final, pagos, no_pagos, aplazados, estado,
                 observacion_apertura, observacion_cierre,
                 efectivo_contado, diferencia_caja, estado_cuadre,
                 periodo_tipo, periodo_inicio, periodo_fin,
                 clientes_activos, cartera_pendiente,
                 prestamos_nuevos, desembolsos,
-                opened_at, closed_at, created_at, updated_at, synced
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                opened_at, closed_at, created_at, updated_at,
+                synced, sync_status, last_sync_at, sync_error,
+                is_deleted, deleted_at, cobrador_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'synced', ?, '', ?, ?, ?)
             ON CONFLICT(fecha_iso) DO UPDATE SET
+                uuid=excluded.uuid,
                 caja_inicial=excluded.caja_inicial,
                 recaudo=excluded.recaudo,
                 ingresos=excluded.ingresos,
@@ -3734,8 +4859,15 @@ def pull_closures_from_cloud():
                 closed_at=excluded.closed_at,
                 created_at=excluded.created_at,
                 updated_at=excluded.updated_at,
-                synced=1
+                synced=1,
+                sync_status='synced',
+                last_sync_at=excluded.last_sync_at,
+                sync_error='',
+                is_deleted=excluded.is_deleted,
+                deleted_at=excluded.deleted_at,
+                cobrador_id=excluded.cobrador_id
         """, (
+            row.get("uuid") or str(uuid.uuid4()),
             fecha_iso,
             int(row.get("caja_inicial",0) or 0),
             int(row.get("recaudo",0) or 0),
@@ -3762,6 +4894,10 @@ def pull_closures_from_cloud():
             row.get("closed_at","") or "",
             row.get("created_at",now_text()) or now_text(),
             row.get("updated_at",now_text()) or now_text(),
+            row.get("last_sync_at") or now_text(),
+            int(row.get("is_deleted") or 0),
+            row.get("deleted_at", "") or "",
+            row.get("cobrador_id") or COBRADOR_ID,
         ))
         imported += 1
 
@@ -3769,6 +4905,189 @@ def pull_closures_from_cloud():
     conn.close()
     return True, f"Cierres descargados: {imported}"
 
+
+
+def pull_audit_from_cloud():
+    """Descarga auditoría desde Supabase."""
+    ok, msg, rows = supabase_get("auditoria_acciones")
+    if not ok:
+        return False, msg
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    imported = 0
+
+    for r in rows:
+        if r.get("id") is None:
+            continue
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO auditoria_acciones (
+                id, uuid, fecha, accion, cliente_id, cliente,
+                motivo, detalle, cobrador, synced, sync_status, last_sync_at, sync_error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'synced', ?, '')
+        """, (
+            int(r.get("id")),
+            r.get("uuid") or str(uuid.uuid4()),
+            r.get("fecha", now_text()),
+            r.get("accion", ""),
+            r.get("cliente_id"),
+            r.get("cliente", ""),
+            r.get("motivo", ""),
+            r.get("detalle", ""),
+            r.get("cobrador", ""),
+            r.get("last_sync_at") or now_text(),
+        ))
+        imported += 1
+
+    conn.commit()
+    conn.close()
+    return True, f"Auditoría descargada: {imported}"
+
+
+def pull_users_from_cloud():
+    """Descarga usuarios/cobradores desde Supabase."""
+    ok, msg, rows = supabase_get("usuarios_app")
+    if not ok:
+        return False, msg
+    conn = get_connection()
+    cursor = conn.cursor()
+    imported = 0
+    for r in rows:
+        usuario = normalize_username(r.get("usuario"))
+        if not usuario:
+            continue
+        cursor.execute("""
+            INSERT INTO usuarios_app (
+                uuid, nombre, usuario, pin, rol, cobrador_id, activo,
+                created_at, updated_at, synced, sync_status, last_sync_at, sync_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'synced', ?, '')
+            ON CONFLICT(usuario) DO UPDATE SET
+                uuid=excluded.uuid,
+                nombre=excluded.nombre,
+                pin=excluded.pin,
+                rol=excluded.rol,
+                cobrador_id=excluded.cobrador_id,
+                activo=excluded.activo,
+                updated_at=excluded.updated_at,
+                synced=1,
+                sync_status='synced',
+                last_sync_at=excluded.last_sync_at,
+                sync_error=''
+        """, (
+            r.get("uuid") or str(uuid.uuid4()),
+            r.get("nombre", ""),
+            usuario,
+            str(r.get("pin", "")),
+            str(r.get("rol", "cobrador")).lower(),
+            r.get("cobrador_id") or usuario,
+            int(r.get("activo", 1) or 0),
+            r.get("created_at", now_text()) or now_text(),
+            r.get("updated_at", now_text()) or now_text(),
+            r.get("last_sync_at") or now_text(),
+        ))
+        imported += 1
+    conn.commit(); conn.close()
+    return True, f"Usuarios descargados: {imported}"
+
+
+def sync_users_to_cloud():
+    """Sube usuarios/cobradores pendientes a Supabase."""
+    if not supabase_configured():
+        return False, "Supabase no configurado"
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, uuid, nombre, usuario, pin, rol, cobrador_id, activo,
+               created_at, updated_at, sync_status, last_sync_at, sync_error
+        FROM usuarios_app
+        WHERE synced = 0
+    """)
+    rows = [dict(row) for row in cursor.fetchall()]
+    if not rows:
+        conn.close()
+        return True, "Sin usuarios pendientes"
+    for row in rows:
+        row["uuid"] = row.get("uuid") or str(uuid.uuid4())
+        row["sync_status"] = "pending"
+    ok, msg = supabase_request("usuarios_app", rows, query_suffix="?on_conflict=usuario")
+    if ok:
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(
+            f"UPDATE usuarios_app SET synced=1, sync_status='synced', last_sync_at=?, sync_error='' WHERE id IN ({placeholders})",
+            [now_text(), *ids],
+        )
+        conn.commit()
+    else:
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(
+            f"UPDATE usuarios_app SET sync_status='error', sync_error=? WHERE id IN ({placeholders})",
+            [msg, *ids],
+        )
+        conn.commit()
+    conn.close()
+    return ok, msg
+
+def pull_config_from_cloud():
+    """Descarga configuración funcional del negocio desde Supabase."""
+    ok, msg, rows = supabase_get("configuracion_app")
+    if not ok:
+        return False, msg
+
+    rows = [row for row in rows if str(row.get("cobrador_id") or COBRADOR_ID) == COBRADOR_ID]
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    imported = 0
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS configuracion_app (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    for name, definition in [
+        ("cobrador_id", "TEXT NOT NULL DEFAULT ''"),
+        ("synced", "INTEGER NOT NULL DEFAULT 0"),
+        ("sync_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("last_sync_at", "TEXT"),
+        ("sync_error", "TEXT"),
+    ]:
+        ensure_column(cursor, "configuracion_app", name, definition)
+
+    for row in rows:
+        key = str(row.get("key") or "").strip()
+        if not key:
+            continue
+        cursor.execute("""
+            INSERT INTO configuracion_app
+            (key, value, updated_at, cobrador_id, synced, sync_status, last_sync_at, sync_error)
+            VALUES (?, ?, ?, ?, 1, 'synced', ?, '')
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at,
+                cobrador_id = excluded.cobrador_id,
+                synced = 1,
+                sync_status = 'synced',
+                last_sync_at = excluded.last_sync_at,
+                sync_error = ''
+        """, (
+            key,
+            str(row.get("value") or ""),
+            str(row.get("updated_at") or now_text()),
+            str(row.get("cobrador_id") or COBRADOR_ID),
+            str(row.get("last_sync_at") or now_text()),
+        ))
+        imported += 1
+
+    conn.commit()
+    conn.close()
+    return True, f"Configuración descargada: {imported}"
 
 def pull_all_from_cloud():
     """
@@ -3783,6 +5102,9 @@ def pull_all_from_cloud():
         pull_transactions_from_cloud(),
         pull_movements_from_cloud(),
         pull_closures_from_cloud(),
+        pull_audit_from_cloud(),
+        pull_config_from_cloud(),
+        pull_users_from_cloud(),
     ]
 
     refresh_memory_from_db()
@@ -3802,12 +5124,15 @@ def sync_clients_to_cloud():
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT id, documento, nombre, telefono, direccion, producto,
+        SELECT id, uuid, documento, nombre, telefono, direccion,
+               barrio, zona, ruta, orden_visita, producto,
                valor_credito, interes, total_credito, cuota, numero_cuotas,
                saldo, pagadas, pendientes, cobro, estado, ultimo_tipo,
                codeudor_documento, codeudor_nombre, codeudor_movil,
                valor_seguro, beneficiario, obs_seguro, created_at, updated_at,
-               proximo_cobro, ultima_fecha_pago, aporte_acumulado
+               proximo_cobro, ultima_fecha_pago, aporte_acumulado,
+               sync_status, last_sync_at, sync_error,
+               is_deleted, deleted_at, deleted_reason, cobrador_id
         FROM clientes
         WHERE synced = 0
     """)
@@ -3815,30 +5140,49 @@ def sync_clients_to_cloud():
     if not rows:
         conn.close()
         return True, "Sin clientes pendientes"
+
     payload = []
     for row in rows:
-        row["cobrador_id"] = COBRADOR_ID
+        row["cobrador_id"] = row.get("cobrador_id") or active_cobrador_id() or COBRADOR_ID
+        row["uuid"] = row.get("uuid") or str(uuid.uuid4())
+        row["sync_status"] = "pending"
         payload.append(row)
+
     ok, msg = supabase_request("clientes", payload)
     if ok:
         ids = [int(row["id"]) for row in rows]
         placeholders = ",".join("?" for _ in ids)
-        cursor.execute(f"UPDATE clientes SET synced = 1 WHERE id IN ({placeholders})", ids)
+        cursor.execute(
+            f"UPDATE clientes SET synced = 1, sync_status = 'synced', last_sync_at = ?, sync_error = '' WHERE id IN ({placeholders})",
+            [now_text(), *ids],
+        )
         conn.commit()
+    else:
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(
+            f"UPDATE clientes SET sync_status = 'error', sync_error = ? WHERE id IN ({placeholders})",
+            [msg, *ids],
+        )
+        conn.commit()
+
     conn.close()
     return ok, msg
+
 
 
 def sync_transactions_to_cloud():
     if not supabase_configured():
         return False, "Supabase no configurado"
+
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT id, cliente_id, cliente, tipo, valor, metodo, fecha,
+        SELECT id, uuid, cliente_id, cliente, tipo, valor, metodo, fecha,
                numero_cuotas, saldo_anterior, saldo_nuevo,
-               cuotas_pagadas_total, cuotas_pendientes_total, observacion
+               cuotas_pagadas_total, cuotas_pendientes_total, observacion,
+               sync_status, last_sync_at, sync_error, is_deleted, deleted_at
         FROM transacciones
         WHERE synced = 0
     """)
@@ -3846,26 +5190,45 @@ def sync_transactions_to_cloud():
     if not rows:
         conn.close()
         return True, "Sin transacciones pendientes"
+
     for row in rows:
-        row["cobrador_id"] = COBRADOR_ID
+        row["cobrador_id"] = row.get("cobrador_id") or active_cobrador_id() or COBRADOR_ID
+        row["uuid"] = row.get("uuid") or str(uuid.uuid4())
+        row["sync_status"] = "pending"
+
     ok, msg = supabase_request("transacciones", rows)
     if ok:
         ids = [int(row["id"]) for row in rows]
         placeholders = ",".join("?" for _ in ids)
-        cursor.execute(f"UPDATE transacciones SET synced = 1 WHERE id IN ({placeholders})", ids)
+        cursor.execute(
+            f"UPDATE transacciones SET synced = 1, sync_status = 'synced', last_sync_at = ?, sync_error = '' WHERE id IN ({placeholders})",
+            [now_text(), *ids],
+        )
         conn.commit()
+    else:
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(
+            f"UPDATE transacciones SET sync_status = 'error', sync_error = ? WHERE id IN ({placeholders})",
+            [msg, *ids],
+        )
+        conn.commit()
+
     conn.close()
     return ok, msg
+
 
 
 def sync_movements_to_cloud():
     if not supabase_configured():
         return False, "Supabase no configurado"
+
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT id, tipo, concepto, valor, observaciones, fecha
+        SELECT id, uuid, tipo, concepto, valor, observaciones, fecha,
+               sync_status, last_sync_at, sync_error, is_deleted, deleted_at, cobrador_id
         FROM movimientos_caja
         WHERE synced = 0
     """)
@@ -3873,16 +5236,33 @@ def sync_movements_to_cloud():
     if not rows:
         conn.close()
         return True, "Sin movimientos pendientes"
+
     for row in rows:
-        row["cobrador_id"] = COBRADOR_ID
+        row["cobrador_id"] = row.get("cobrador_id") or active_cobrador_id() or COBRADOR_ID
+        row["uuid"] = row.get("uuid") or str(uuid.uuid4())
+        row["sync_status"] = "pending"
+
     ok, msg = supabase_request("movimientos_caja", rows)
     if ok:
         ids = [int(row["id"]) for row in rows]
         placeholders = ",".join("?" for _ in ids)
-        cursor.execute(f"UPDATE movimientos_caja SET synced = 1 WHERE id IN ({placeholders})", ids)
+        cursor.execute(
+            f"UPDATE movimientos_caja SET synced = 1, sync_status = 'synced', last_sync_at = ?, sync_error = '' WHERE id IN ({placeholders})",
+            [now_text(), *ids],
+        )
         conn.commit()
+    else:
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(
+            f"UPDATE movimientos_caja SET sync_status = 'error', sync_error = ? WHERE id IN ({placeholders})",
+            [msg, *ids],
+        )
+        conn.commit()
+
     conn.close()
     return ok, msg
+
 
 
 def sync_closures_to_cloud():
@@ -3894,14 +5274,15 @@ def sync_closures_to_cloud():
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT fecha_iso, caja_inicial, recaudo, ingresos, egresos,
+        SELECT id, uuid, fecha_iso, caja_inicial, recaudo, ingresos, egresos,
                saldo_final, pagos, no_pagos, aplazados, estado,
                observacion_apertura, observacion_cierre,
                efectivo_contado, diferencia_caja, estado_cuadre,
                periodo_tipo, periodo_inicio, periodo_fin,
                clientes_activos, cartera_pendiente,
                prestamos_nuevos, desembolsos,
-               opened_at, closed_at, created_at, updated_at
+               opened_at, closed_at, created_at, updated_at,
+               sync_status, last_sync_at, sync_error, is_deleted, deleted_at, cobrador_id
         FROM cierres_caja
         WHERE synced = 0
     """)
@@ -3911,7 +5292,9 @@ def sync_closures_to_cloud():
         return True, "Sin cierres pendientes"
 
     for row in rows:
-        row["cobrador_id"] = COBRADOR_ID
+        row["cobrador_id"] = row.get("cobrador_id") or active_cobrador_id() or COBRADOR_ID
+        row["uuid"] = row.get("uuid") or str(uuid.uuid4())
+        row["sync_status"] = "pending"
 
     ok, message = supabase_request(
         "cierres_caja",
@@ -3920,14 +5303,135 @@ def sync_closures_to_cloud():
     )
 
     if ok:
-        fechas=[str(row["fecha_iso"]) for row in rows]
-        placeholders=','.join('?' for _ in fechas)
-        cursor.execute(f"UPDATE cierres_caja SET synced=1 WHERE fecha_iso IN ({placeholders})", fechas)
+        ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+        placeholders = ",".join("?" for _ in ids)
+        if ids:
+            cursor.execute(
+                f"UPDATE cierres_caja SET synced = 1, sync_status = 'synced', last_sync_at = ?, sync_error = '' WHERE id IN ({placeholders})",
+                [now_text(), *ids],
+            )
+        conn.commit()
+    else:
+        ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+        placeholders = ",".join("?" for _ in ids)
+        if ids:
+            cursor.execute(
+                f"UPDATE cierres_caja SET sync_status = 'error', sync_error = ? WHERE id IN ({placeholders})",
+                [message, *ids],
+            )
         conn.commit()
 
     conn.close()
     return ok, (f"Cierres subidos: {len(rows)}" if ok else message)
 
+
+
+def sync_audit_to_cloud():
+    """Sube auditoría pendiente a Supabase."""
+    if not supabase_configured():
+        return False, "Supabase no configurado"
+
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, uuid, fecha, accion, cliente_id, cliente,
+               motivo, detalle, cobrador, sync_status, last_sync_at, sync_error
+        FROM auditoria_acciones
+        WHERE synced = 0
+    """)
+    rows = [dict(row) for row in cursor.fetchall()]
+    if not rows:
+        conn.close()
+        return True, "Sin auditoría pendiente"
+
+    for row in rows:
+        row["cobrador_id"] = COBRADOR_ID
+        row["uuid"] = row.get("uuid") or str(uuid.uuid4())
+        row["sync_status"] = "pending"
+
+    ok, msg = supabase_request("auditoria_acciones", rows)
+    if ok:
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(
+            f"UPDATE auditoria_acciones SET synced = 1, sync_status = 'synced', last_sync_at = ?, sync_error = '' WHERE id IN ({placeholders})",
+            [now_text(), *ids],
+        )
+        conn.commit()
+    else:
+        ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(
+            f"UPDATE auditoria_acciones SET sync_status = 'error', sync_error = ? WHERE id IN ({placeholders})",
+            [msg, *ids],
+        )
+        conn.commit()
+
+    conn.close()
+    return ok, msg
+
+def sync_config_to_cloud():
+    """Sube configuración funcional del negocio a Supabase."""
+    if not supabase_configured():
+        return False, "Supabase no configurado"
+
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS configuracion_app (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    for name, definition in [
+        ("cobrador_id", "TEXT NOT NULL DEFAULT ''"),
+        ("synced", "INTEGER NOT NULL DEFAULT 0"),
+        ("sync_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("last_sync_at", "TEXT"),
+        ("sync_error", "TEXT"),
+    ]:
+        ensure_column(cursor, "configuracion_app", name, definition)
+
+    cursor.execute("""
+        SELECT key, value, updated_at, cobrador_id, sync_status, last_sync_at, sync_error
+        FROM configuracion_app
+        WHERE synced = 0
+    """)
+    rows = [dict(row) for row in cursor.fetchall()]
+    if not rows:
+        conn.close()
+        return True, "Sin configuración pendiente"
+
+    payload = []
+    for row in rows:
+        row["cobrador_id"] = row.get("cobrador_id") or COBRADOR_ID
+        row["sync_status"] = "pending"
+        payload.append(row)
+
+    ok, msg = supabase_request(
+        "configuracion_app",
+        payload,
+        query_suffix="?on_conflict=cobrador_id,key",
+    )
+
+    keys = [str(row["key"]) for row in rows]
+    placeholders = ",".join("?" for _ in keys)
+    if ok:
+        cursor.execute(
+            f"UPDATE configuracion_app SET synced = 1, sync_status = 'synced', last_sync_at = ?, sync_error = '' WHERE key IN ({placeholders})",
+            [now_text(), *keys],
+        )
+    else:
+        cursor.execute(
+            f"UPDATE configuracion_app SET sync_status = 'error', sync_error = ? WHERE key IN ({placeholders})",
+            [msg, *keys],
+        )
+    conn.commit()
+    conn.close()
+    return ok, msg
 
 def sync_all_to_cloud(silent=True):
     """
@@ -3947,6 +5451,9 @@ def sync_all_to_cloud(silent=True):
             sync_transactions_to_cloud(),
             sync_movements_to_cloud(),
             sync_closures_to_cloud(),
+            sync_audit_to_cloud(),
+            sync_config_to_cloud(),
+            sync_users_to_cloud(),
         ]
 
         pull_result = pull_all_from_cloud()
@@ -4993,10 +6500,11 @@ class RoundedBox(BoxLayout):
 
 
 class Header(BoxLayout):
-    def __init__(self, title, show_back=False, on_back=None, **kwargs):
+    def __init__(self, title, show_back=False, on_back=None, show_home=True, show_menu=True, **kwargs):
         super().__init__(orientation="horizontal", size_hint_y=None, height=dp(66), **kwargs)
         self.padding = [dp(12), dp(8), dp(12), dp(8)]
         self.spacing = dp(8)
+        self.title_text = str(title or "")
 
         with self.canvas.before:
             Color(*BLUE)
@@ -5018,13 +6526,261 @@ class Header(BoxLayout):
                 back.bind(on_release=lambda *_: on_back())
             self.add_widget(back)
 
-        label = Label(text=title, color=WHITE, bold=True, font_size="17sp", halign="left", valign="middle")
+        label = Label(
+            text=title,
+            color=WHITE,
+            bold=True,
+            font_size="16sp",
+            halign="left",
+            valign="middle",
+        )
         label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
         self.add_widget(label)
+
+        try:
+            app = App.get_running_app()
+            authenticated = bool(getattr(app, "authenticated", False))
+        except Exception:
+            app = None
+            authenticated = False
+
+        # Accesos rápidos visibles en todas las pantallas internas.
+        if authenticated and show_home and self.title_text.strip().lower() != "inicio":
+            home_btn = Button(
+                text="Inicio",
+                size_hint_x=None,
+                width=dp(62),
+                background_normal="",
+                background_color=BLUE_DARK,
+                color=WHITE,
+                bold=True,
+                font_size="11sp",
+            )
+            home_btn.bind(on_release=lambda *_: app.go("inicio") if app else None)
+            self.add_widget(home_btn)
+
+        if authenticated and show_menu:
+            menu_btn = Button(
+                text="Menu",
+                size_hint_x=None,
+                width=dp(56),
+                background_normal="",
+                background_color=GOLD,
+                color=DARK,
+                bold=True,
+                font_size="11sp",
+            )
+            menu_btn.bind(on_release=self.open_quick_menu)
+            self.add_widget(menu_btn)
 
     def _update_bg(self, *args):
         self.bg.pos = self.pos
         self.bg.size = self.size
+
+    def open_quick_menu(self, *_):
+        """Menú rápido global más profesional e intuitivo."""
+        app = App.get_running_app()
+        is_admin = getattr(app, "current_role", "") == "Administrador"
+        user_name = getattr(app, "current_user_name", "") or "Usuario"
+        role = getattr(app, "current_role", "") or "Cobrador"
+
+        content = BoxLayout(
+            orientation="vertical",
+            padding=[dp(14), dp(12), dp(14), dp(12)],
+            spacing=dp(10),
+        )
+
+        popup = Popup(
+            title="",
+            content=content,
+            size_hint=(0.94, None),
+            height=dp(650) if is_admin else dp(560),
+            auto_dismiss=True,
+            separator_height=0,
+        )
+
+        def label(text_value, color=TEXT, bold=False, size="11sp", height=dp(24), halign="left", valign="middle"):
+            item = Label(
+                text=str(text_value),
+                color=color,
+                bold=bold,
+                font_size=size,
+                halign=halign,
+                valign=valign,
+                size_hint_y=None,
+                height=height,
+            )
+            item.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            return item
+
+        def go_to(screen_name):
+            popup.dismiss()
+            if screen_name == "logout":
+                app.confirm_logout()
+            else:
+                app.go(screen_name)
+
+        header = RoundedBox(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(82),
+            padding=[dp(14), dp(10), dp(14), dp(10)],
+            spacing=dp(10),
+        )
+        header.bg_color = BLUE_DARK
+
+        avatar = Label(
+            text=(user_name[:1] or "U").upper(),
+            color=WHITE,
+            bold=True,
+            font_size="20sp",
+            size_hint_x=None,
+            width=dp(54),
+            halign="center",
+            valign="middle",
+        )
+        avatar.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        with avatar.canvas.before:
+            Color(*BLUE)
+            avatar.bg = RoundedRectangle(pos=avatar.pos, size=avatar.size, radius=[dp(16)])
+        avatar.bind(pos=lambda w, *_: setattr(w.bg, "pos", w.pos))
+        avatar.bind(size=lambda w, *_: setattr(w.bg, "size", w.size))
+
+        header_text = BoxLayout(orientation="vertical", spacing=dp(2))
+        header_text.add_widget(label("Menú rápido", WHITE, True, "17sp", dp(26)))
+        header_text.add_widget(label(f"{user_name} · {role}", (0.88, 0.92, 1, 1), False, "11sp", dp(22)))
+        header_text.add_widget(label("Navega sin devolverte pantalla por pantalla.", (0.78, 0.84, 0.96, 1), False, "9.5sp", dp(22)))
+        header.add_widget(avatar)
+        header.add_widget(header_text)
+        content.add_widget(header)
+
+        scroll = ScrollView(
+            do_scroll_x=False,
+            bar_width=dp(4),
+            scroll_type=["bars", "content"],
+        )
+        body = BoxLayout(
+            orientation="vertical",
+            spacing=dp(12),
+            size_hint_y=None,
+            padding=[0, 0, 0, dp(4)],
+        )
+        body.bind(minimum_height=body.setter("height"))
+
+        def section(title_text):
+            box = BoxLayout(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(30),
+                padding=[dp(2), 0, dp(2), 0],
+            )
+            box.add_widget(label(title_text.upper(), BLUE_DARK, True, "10sp", dp(30)))
+            body.add_widget(box)
+
+        def action_card(title_text, subtitle, screen_name, bg_color, icon_text="•", danger=False):
+            card = RoundedBox(
+                orientation="horizontal",
+                size_hint_y=None,
+                height=dp(72),
+                padding=[dp(12), dp(9), dp(12), dp(9)],
+                spacing=dp(10),
+            )
+            card.bg_color = (1, 1, 1, 1) if not danger else (1.0, 0.93, 0.93, 1)
+
+            icon = Label(
+                text=icon_text,
+                color=WHITE,
+                bold=True,
+                font_size="18sp",
+                size_hint_x=None,
+                width=dp(44),
+                halign="center",
+                valign="middle",
+            )
+            icon.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            with icon.canvas.before:
+                Color(*bg_color)
+                icon.bg = RoundedRectangle(pos=icon.pos, size=icon.size, radius=[dp(12)])
+            icon.bind(pos=lambda w, *_: setattr(w.bg, "pos", w.pos))
+            icon.bind(size=lambda w, *_: setattr(w.bg, "size", w.size))
+
+            txt = BoxLayout(orientation="vertical", spacing=dp(2))
+            txt.add_widget(label(title_text, DANGER if danger else TEXT, True, "12sp", dp(24)))
+            txt.add_widget(label(subtitle, MUTED, False, "9.5sp", dp(30), valign="top"))
+
+            arrow = Label(
+                text=">",
+                color=MUTED,
+                bold=True,
+                font_size="18sp",
+                size_hint_x=None,
+                width=dp(22),
+                halign="center",
+                valign="middle",
+            )
+            arrow.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+            card.add_widget(icon)
+            card.add_widget(txt)
+            card.add_widget(arrow)
+            card.bind(on_touch_down=lambda widget, touch, target=screen_name: (
+                go_to(target) if widget.collide_point(*touch.pos) else None
+            ))
+            body.add_widget(card)
+
+        section("Principal")
+        action_card("Inicio", "Volver al tablero principal del día.", "inicio", BLUE_DARK, "I")
+        action_card("Clientes", "Buscar, cobrar o revisar clientes pendientes.", "clientes", BLUE, "C")
+        action_card("Ruta del día", "Organizar visitas por barrio, ruta y prioridad.", "ruta_dia", BLUE, "R")
+        action_card("Nuevo cliente", "Registrar cliente y préstamo nuevo.", "nuevo_cliente", SUCCESS, "+")
+
+        section("Caja y operación")
+        action_card("Caja / Resumen", "Apertura, recaudo, movimientos y cierre operativo.", "resumen", GOLD, "$")
+        action_card("Pagaron hoy", "Ver clientes cobrados durante la jornada.", "clientes_pagaron_hoy", SUCCESS, "✓")
+
+        if is_admin:
+            section("Administración")
+            action_card("Asignar clientes", "Reasignar clientes entre cobradores.", "asignar_cobradores", BLUE_DARK, "A")
+            action_card("Usuarios / cobradores", "Crear cobradores, cambiar PIN y activar cuentas.", "usuarios", BLUE, "U")
+            action_card("Configuración", "Datos del negocio, PIN e información general.", "configuracion", GOLD, "*")
+            action_card("Caja Central", "Entregar bases, liquidar cobradores y controlar saldo central.", "caja_central", GOLD, "$")
+            action_card("Auditoría", "Revisar cambios sensibles y motivos registrados.", "auditoria", (0.45, 0.48, 0.55, 1), "L")
+
+        section("Sesión")
+        action_card("Cerrar sesión", "Salir de la cuenta actual y volver al acceso con PIN.", "logout", DANGER, "X", danger=True)
+
+        scroll.add_widget(body)
+        content.add_widget(scroll)
+
+        footer = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(48),
+            spacing=dp(10),
+        )
+        close_btn = Button(
+            text="Cerrar menú",
+            background_normal="",
+            background_color=(0.45, 0.48, 0.55, 1),
+            color=WHITE,
+            bold=True,
+            font_size="12sp",
+        )
+        close_btn.bind(on_release=lambda *_: popup.dismiss())
+        home_btn = Button(
+            text="Ir a Inicio",
+            background_normal="",
+            background_color=BLUE_DARK,
+            color=WHITE,
+            bold=True,
+            font_size="12sp",
+        )
+        home_btn.bind(on_release=lambda *_: go_to("inicio"))
+        footer.add_widget(close_btn)
+        footer.add_widget(home_btn)
+        content.add_widget(footer)
+
+        popup.open()
 
 
 class FieldLabel(Label):
@@ -5200,6 +6956,219 @@ class NavItem(BoxLayout):
         return super().on_touch_down(touch)
 
 
+
+# ============================================================
+# SEGURIDAD Y CONFIGURACIÓN
+# ============================================================
+
+class LoginPinScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(name="login", **kwargs)
+        self.root = BoxLayout(orientation="vertical")
+        self.add_widget(self.root)
+
+    def on_pre_enter(self):
+        # Al llegar al login, actualizar usuarios desde Supabase.
+        # Esto permite que un cobrador creado en otro equipo o recién sincronizado
+        # aparezca sin tener que cerrar/abrir la app.
+        try:
+            if supabase_configured():
+                pull_users_from_cloud()
+                pull_config_from_cloud()
+        except Exception as error:
+            print("LOGIN USERS PULL ERROR:", error)
+        self.build()
+
+    def build(self):
+        self.root.clear_widgets()
+        self.root.add_widget(Header("Acceso seguro"))
+
+        scroll = ScrollView(do_scroll_x=False, bar_width=dp(4), scroll_type=["bars", "content"])
+        content = BoxLayout(orientation="vertical", padding=[dp(18), dp(24), dp(18), dp(24)], spacing=dp(14), size_hint_y=None)
+        content.bind(minimum_height=content.setter("height"))
+
+        card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(405), padding=[dp(18), dp(18), dp(18), dp(18)], spacing=dp(12))
+        card.bg_color = (0.98, 0.99, 1, 1)
+
+        title = Label(text=business_name(), color=BLUE_DARK, bold=True, font_size="20sp", halign="center", valign="middle", size_hint_y=None, height=dp(42))
+        title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        card.add_widget(title)
+
+        subtitle = Label(text="Ingrese usuario y PIN", color=MUTED, font_size="12sp", halign="center", valign="middle", size_hint_y=None, height=dp(34))
+        subtitle.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        card.add_widget(subtitle)
+
+        users = load_app_users(active_only=True)
+        usernames = [u.get("usuario", "") for u in users if u.get("usuario")]
+        if not usernames:
+            usernames = ["admin", "pacho"]
+
+        self.user_spinner = Spinner(text=usernames[0], values=usernames, size_hint_y=None, height=dp(46), background_normal="", background_color=(0.92, 0.94, 0.98, 1), color=TEXT, bold=True)
+        card.add_widget(self.user_spinner)
+
+        self.pin_input = AppTextInput(hint_text="PIN", multiline=False, password=True)
+        self.pin_input.input_filter = "int"
+        card.add_widget(self.pin_input)
+
+        login_btn = Button(text="Entrar", background_normal="", background_color=BLUE, color=WHITE, bold=True, size_hint_y=None, height=dp(50))
+        login_btn.bind(on_release=lambda *_: self.try_login())
+        card.add_widget(login_btn)
+
+        sync_btn = Button(text="Actualizar usuarios desde nube", background_normal="", background_color=GOLD, color=DARK, bold=True, size_hint_y=None, height=dp(46))
+        sync_btn.bind(on_release=lambda *_: self.sync_users_login())
+        card.add_widget(sync_btn)
+
+        help_label = Label(text="Inicial: admin / 1234 · pacho / 0000\nEl administrador crea nuevos cobradores.", color=MUTED, font_size="10.5sp", halign="center", valign="middle", size_hint_y=None, height=dp(52))
+        help_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        card.add_widget(help_label)
+
+        content.add_widget(card)
+        scroll.add_widget(content)
+        self.root.add_widget(scroll)
+
+    def sync_users_login(self):
+        # Primero sube usuarios pendientes y luego descarga la lista completa.
+        push_ok, push_msg = sync_users_to_cloud()
+        pull_ok, pull_msg = pull_users_from_cloud()
+        ok = push_ok and pull_ok
+        msg = f"Subida: {push_msg}\nDescarga: {pull_msg}"
+        show_popup("Usuarios", msg if ok else f"No se pudieron actualizar usuarios.\n{msg}", height=320)
+        self.build()
+
+    def try_login(self):
+        usuario = normalize_username(self.user_spinner.text)
+        pin = str(self.pin_input.text or "").strip()
+        user = get_app_user_by_username(usuario)
+        if not user or int(user.get("activo", 0) or 0) != 1:
+            show_popup("Usuario inactivo", "Este usuario no existe o está desactivado.", height=240)
+            return
+        if pin != str(user.get("pin", "")).strip():
+            show_popup("PIN incorrecto", "Verifique el PIN e intente nuevamente.", height=230)
+            return
+
+        app = App.get_running_app()
+        app.current_user = user
+        app.current_user_name = user.get("nombre", usuario)
+        app.current_username = usuario
+        app.current_role = "Administrador" if user.get("rol") == "administrador" else "Cobrador"
+
+        raw_cobrador_id = str(user.get("cobrador_id", "") or "").strip()
+        if MODO_DUENO_UNICO and not raw_cobrador_id:
+            raw_cobrador_id = DUENO_COBRADOR_ID or COBRADOR_ID
+
+        app.current_cobrador_id = raw_cobrador_id or usuario
+        app.authenticated = True
+
+        # Después de iniciar sesión, descargar datos según el rol:
+        # admin ve todo; cobrador solo ve lo suyo.
+        try:
+            pull_clients_from_cloud()
+            pull_transactions_from_cloud()
+            pull_movements_from_cloud()
+            pull_closures_from_cloud()
+        except Exception as error:
+            print("LOGIN DATA PULL ERROR:", error)
+
+        refresh_memory_from_db(normalize=False)
+        app.go("inicio")
+
+        # Aviso operativo justo después del login:
+        # solo para cobradores y solo si no han abierto caja.
+        Clock.schedule_once(
+            lambda *_: app.check_cash_opening_alert(),
+            0.8,
+        )
+
+
+class ConfiguracionScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(name="configuracion", **kwargs)
+        self.root = BoxLayout(orientation="vertical")
+        self.add_widget(self.root)
+
+    def on_pre_enter(self):
+        self.app_ref = App.get_running_app()
+        self.build()
+
+    def row_label(self, text_value):
+        lbl = Label(text=text_value, color=TEXT, bold=True, font_size="12sp", halign="left", valign="middle", size_hint_y=None, height=dp(24))
+        lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        return lbl
+
+    def build(self):
+        self.root.clear_widgets()
+        self.root.add_widget(Header("Configuración", show_back=True, on_back=lambda: self.app_ref.go("inicio")))
+        scroll = ScrollView(do_scroll_x=False, bar_width=dp(4), scroll_type=["bars", "content"])
+        content = BoxLayout(orientation="vertical", padding=[dp(14), dp(16), dp(14), dp(88)], spacing=dp(14), size_hint_y=None)
+        content.bind(minimum_height=content.setter("height"))
+
+        card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(560), padding=[dp(14), dp(14), dp(14), dp(14)], spacing=dp(9))
+        card.bg_color = (0.98, 0.99, 1, 1)
+        title = Label(text="Datos del negocio", color=BLUE_DARK, bold=True, font_size="16sp", halign="left", valign="middle", size_hint_y=None, height=dp(30))
+        title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        card.add_widget(title)
+
+        self.nombre_negocio = AppTextInput(text=get_config_value("nombre_negocio", "COBROS V12 MOBILE"), hint_text="Nombre del negocio")
+        self.nombre_cobrador = AppTextInput(text=get_config_value("nombre_cobrador", cobrador_nombre()), hint_text="Nombre del cobrador")
+        self.telefono_negocio = AppTextInput(text=get_config_value("telefono_negocio", ""), hint_text="Teléfono del negocio")
+        self.ciudad = AppTextInput(text=get_config_value("ciudad", ""), hint_text="Ciudad")
+        self.interes_default = AppTextInput(text=get_config_value("interes_default", "20"), hint_text="Interés por defecto")
+        self.pin_admin = AppTextInput(text=get_config_value("pin_admin", "1234"), hint_text="PIN administrador", password=True)
+        self.pin_cobrador = AppTextInput(text=get_config_value("pin_cobrador", "0000"), hint_text="PIN cobrador", password=True)
+        self.pin_admin.input_filter = "int"
+        self.pin_cobrador.input_filter = "int"
+
+        for label, widget in [("Nombre del negocio", self.nombre_negocio),("Nombre del cobrador", self.nombre_cobrador),("Teléfono", self.telefono_negocio),("Ciudad", self.ciudad),("Interés por defecto", self.interes_default),("PIN administrador", self.pin_admin),("PIN cobrador", self.pin_cobrador)]:
+            card.add_widget(self.row_label(label))
+            card.add_widget(widget)
+
+        save_btn = Button(text="Guardar configuración", background_normal="", background_color=SUCCESS, color=WHITE, bold=True, size_hint_y=None, height=dp(50))
+        save_btn.bind(on_release=lambda *_: self.save_config())
+        card.add_widget(save_btn)
+        content.add_widget(card)
+
+        info = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(118), padding=[dp(14), dp(12), dp(14), dp(12)], spacing=dp(6))
+        info.bg_color = (0.92, 0.96, 1, 1)
+        lbl = Label(text="Roles activos", color=BLUE_DARK, bold=True, font_size="13sp", size_hint_y=None, height=dp(24), halign="left", valign="middle")
+        lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        info.add_widget(lbl)
+        detail = Label(text="Administrador: configuración, auditoría, cierres y mantenimiento.\nCobrador: ruta, clientes, cobros y caja operativa.", color=TEXT, font_size="11sp", halign="left", valign="top")
+        detail.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        info.add_widget(detail)
+        content.add_widget(info)
+
+        assign_card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(128), padding=[dp(14), dp(12), dp(14), dp(12)], spacing=dp(8))
+        assign_card.bg_color = (0.98, 0.99, 1, 1)
+        assign_title = Label(text="Organización de cobradores", color=BLUE_DARK, bold=True, font_size="13sp", size_hint_y=None, height=dp(24), halign="left", valign="middle")
+        assign_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        assign_card.add_widget(assign_title)
+        assign_btn = Button(text="Asignar clientes a cobradores", background_normal="", background_color=BLUE, color=WHITE, bold=True, size_hint_y=None, height=dp(52))
+        assign_btn.bind(on_release=lambda *_: self.app_ref.go("asignar_cobradores"))
+        assign_card.add_widget(assign_btn)
+        content.add_widget(assign_card)
+
+        logout_card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(112), padding=[dp(14), dp(12), dp(14), dp(12)], spacing=dp(8))
+        logout_card.bg_color = (1.0, 0.95, 0.95, 1)
+        logout_title = Label(text="Sesión", color=DANGER, bold=True, font_size="13sp", size_hint_y=None, height=dp(24), halign="left", valign="middle")
+        logout_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        logout_card.add_widget(logout_title)
+        logout_btn = Button(text="Cerrar sesión", background_normal="", background_color=DANGER, color=WHITE, bold=True, size_hint_y=None, height=dp(48))
+        logout_btn.bind(on_release=lambda *_: self.app_ref.confirm_logout())
+        logout_card.add_widget(logout_btn)
+        content.add_widget(logout_card)
+
+        scroll.add_widget(content)
+        self.root.add_widget(scroll)
+
+    def save_config(self):
+        if len(str(self.pin_admin.text or "").strip()) < 4 or len(str(self.pin_cobrador.text or "").strip()) < 4:
+            show_popup("PIN inválido", "Cada PIN debe tener mínimo 4 dígitos.", height=250)
+            return
+        for key, widget in [("nombre_negocio", self.nombre_negocio),("nombre_cobrador", self.nombre_cobrador),("telefono_negocio", self.telefono_negocio),("ciudad", self.ciudad),("interes_default", self.interes_default),("pin_admin", self.pin_admin),("pin_cobrador", self.pin_cobrador)]:
+            set_config_value(key, widget.text)
+        show_popup("Configuración guardada", "Los datos del negocio y los PIN fueron actualizados.", height=260)
+
+
 class BottomNav(BoxLayout):
     def __init__(self, app, active="clientes", **kwargs):
         super().__init__(
@@ -5228,6 +7197,471 @@ class BottomNav(BoxLayout):
     def _update_bg(self, *args):
         self.bg.pos = self.pos
         self.bg.size = self.size
+
+
+
+# ============================================================
+# ASIGNACIÓN DE CLIENTES A COBRADORES
+# ============================================================
+
+class AsignacionCobradoresScreen(Screen):
+    """Panel administrativo para organizar clientes por cobrador."""
+
+    def __init__(self, **kwargs):
+        super().__init__(name="asignar_cobradores", **kwargs)
+        self.root = BoxLayout(orientation="vertical")
+        self.add_widget(self.root)
+        self.selected_collector_label = ""
+        self.query = ""
+
+    def on_pre_enter(self):
+        self.app_ref = App.get_running_app()
+        refresh_memory_from_db(clients=True, transactions=True, movements=False, normalize=False)
+        self.build()
+
+    def label(self, text, color=TEXT, bold=False, size="11sp", height=dp(24), halign="left", valign="middle"):
+        item = Label(
+            text=str(text),
+            color=color,
+            bold=bold,
+            font_size=size,
+            halign=halign,
+            valign=valign,
+            size_hint_y=None,
+            height=height,
+        )
+        item.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        return item
+
+    def build(self):
+        self.root.clear_widgets()
+        self.root.add_widget(
+            Header(
+                "Asignar clientes",
+                show_back=True,
+                on_back=lambda: self.app_ref.go("configuracion"),
+            )
+        )
+
+        scroll = ScrollView(
+            do_scroll_x=False,
+            bar_width=dp(4),
+            scroll_type=["bars", "content"],
+        )
+        self.content = BoxLayout(
+            orientation="vertical",
+            padding=[dp(14), dp(14), dp(14), dp(92)],
+            spacing=dp(14),
+            size_hint_y=None,
+        )
+        self.content.bind(minimum_height=self.content.setter("height"))
+
+        self.build_top_summary()
+        self.build_collectors_summary()
+        self.build_controls()
+        self.build_clients()
+
+        scroll.add_widget(self.content)
+        self.root.add_widget(scroll)
+
+    def metric_box(self, title, value, color=TEXT):
+        box = RoundedBox(
+            orientation="vertical",
+            padding=[dp(8), dp(7), dp(8), dp(7)],
+            spacing=dp(1),
+        )
+        box.bg_color = WHITE
+        box.add_widget(self.label(title, MUTED, True, "8.6sp", dp(18), halign="center"))
+        box.add_widget(self.label(value, color, True, "12sp", dp(26), halign="center"))
+        return box
+
+    def build_top_summary(self):
+        summary = collector_summary_data()
+        total_clients = sum(item["clientes"] for item in summary)
+        total_cartera = sum(item["cartera"] for item in summary)
+        total_today = sum(item["recaudo_hoy"] for item in summary)
+
+        card = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(178),
+            padding=[dp(14), dp(12), dp(14), dp(12)],
+            spacing=dp(10),
+        )
+        card.bg_color = (0.92, 0.96, 1, 1)
+        card.add_widget(self.label("Panel de asignación", BLUE_DARK, True, "16sp", dp(28)))
+        card.add_widget(self.label("Organiza qué clientes pertenecen a cada cobrador.", MUTED, False, "10.5sp", dp(26)))
+
+        row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(62), spacing=dp(8))
+        row.add_widget(self.metric_box("Cobradores", str(len(summary)), BLUE_DARK))
+        row.add_widget(self.metric_box("Clientes", str(total_clients), BLUE))
+        row.add_widget(self.metric_box("Cartera", money(total_cartera), DANGER if total_cartera else SUCCESS))
+        card.add_widget(row)
+        card.add_widget(self.label(f"Recaudo de hoy: {money(total_today)}", SUCCESS, True, "11.5sp", dp(26)))
+        self.content.add_widget(card)
+
+    def build_collectors_summary(self):
+        summary = collector_summary_data()
+
+        card = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(58) + max(1, min(len(summary), 8)) * dp(78),
+            padding=[dp(14), dp(12), dp(14), dp(12)],
+            spacing=dp(8),
+        )
+        card.bg_color = (0.98, 0.99, 1, 1)
+        card.add_widget(self.label("Resumen por cobrador", BLUE_DARK, True, "14sp", dp(28)))
+
+        if not summary:
+            card.add_widget(self.label("No hay cobradores activos registrados.", DANGER, True, "12sp", dp(48), halign="center"))
+            self.content.add_widget(card)
+            return
+
+        for item in summary[:8]:
+            user = item["user"]
+            row = RoundedBox(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(70),
+                padding=[dp(10), dp(7), dp(10), dp(7)],
+                spacing=dp(2),
+            )
+            row.bg_color = WHITE
+            row.add_widget(self.label(collector_label(user), TEXT, True, "11.2sp", dp(20)))
+            row.add_widget(
+                self.label(
+                    f"Clientes: {item['clientes']}  ·  Activos: {item['activos']}  ·  Visitas hoy: {item['visitas_hoy']}",
+                    MUTED,
+                    False,
+                    "9.5sp",
+                    dp(19),
+                )
+            )
+            row.add_widget(
+                self.label(
+                    f"Cartera: {money(item['cartera'])}  ·  Recaudo hoy: {money(item['recaudo_hoy'])}",
+                    BLUE_DARK,
+                    True,
+                    "9.8sp",
+                    dp(19),
+                )
+            )
+            card.add_widget(row)
+
+        if len(summary) > 8:
+            card.add_widget(self.label("Hay más cobradores. Usa la pantalla de Usuarios para verlos todos.", GOLD, True, "10sp", dp(28)))
+
+        self.content.add_widget(card)
+
+    def build_controls(self):
+        collectors = load_collectors(active_only=True)
+        labels = [collector_label(u) for u in collectors]
+        if labels and self.selected_collector_label not in labels:
+            self.selected_collector_label = labels[0]
+
+        card = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(186),
+            padding=[dp(14), dp(12), dp(14), dp(12)],
+            spacing=dp(10),
+        )
+        card.bg_color = (0.98, 0.99, 1, 1)
+        card.add_widget(self.label("1. Selecciona el cobrador destino", BLUE_DARK, True, "13.5sp", dp(26)))
+
+        self.collector_spinner = Spinner(
+            text=self.selected_collector_label or "Seleccione cobrador",
+            values=labels or ["Sin cobradores activos"],
+            size_hint_y=None,
+            height=dp(46),
+            background_normal="",
+            background_color=(0.92, 0.94, 0.98, 1),
+            color=TEXT,
+            bold=True,
+            font_size="12sp",
+        )
+        self.collector_spinner.bind(text=self.on_collector_change)
+        card.add_widget(self.collector_spinner)
+
+        card.add_widget(self.label("2. Busca el cliente que deseas mover", BLUE_DARK, True, "13.5sp", dp(24)))
+        self.search_input = AppTextInput(
+            text=self.query,
+            hint_text="Nombre, documento, teléfono, barrio o ruta",
+            multiline=False,
+        )
+        self.search_input.bind(text=self.on_query_change)
+        card.add_widget(self.search_input)
+
+        self.content.add_widget(card)
+
+    def on_collector_change(self, instance, value):
+        self.selected_collector_label = value
+        self.refresh_screen_later()
+
+    def on_query_change(self, instance, value):
+        self.query = str(value or "").strip().lower()
+        self.refresh_screen_later()
+
+    def refresh_screen_later(self):
+        Clock.schedule_once(lambda *_: self.build(), 0.08)
+
+    def client_match(self, cliente):
+        q = self.query
+        if not q:
+            return True
+        return (
+            q in str(cliente.get("nombre", "") or "").lower()
+            or q in str(cliente.get("documento", "") or "").lower()
+            or q in str(cliente.get("telefono", "") or "").lower()
+            or q in str(cliente.get("barrio", "") or "").lower()
+            or q in str(cliente.get("ruta", "") or "").lower()
+        )
+
+    def build_clients(self):
+        collector = collector_by_label(self.selected_collector_label)
+        selected_cobrador_id = str(collector.get("cobrador_id") or "").strip() if collector else ""
+
+        clients = [c for c in CLIENTES if self.client_match(c)]
+        clients.sort(key=lambda c: (collector_name_by_id(c.get("cobrador_id")), str(c.get("nombre", ""))))
+
+        header = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(84),
+            padding=[dp(14), dp(10), dp(14), dp(10)],
+            spacing=dp(4),
+        )
+        header.bg_color = (0.92, 0.96, 1, 1)
+        header.add_widget(self.label(f"Clientes encontrados: {len(clients)}", BLUE_DARK, True, "14sp", dp(26)))
+        destino = collector_label(collector) if collector else "Sin cobrador seleccionado"
+        header.add_widget(self.label(f"Destino: {destino}", MUTED, False, "10.5sp", dp(26)))
+        self.content.add_widget(header)
+
+        if not collector:
+            empty = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(110), padding=dp(14), spacing=dp(8))
+            empty.bg_color = WHITE
+            empty.add_widget(self.label("Crea primero un cobrador activo.", DANGER, True, "12sp", dp(44), halign="center"))
+            self.content.add_widget(empty)
+            return
+
+        if not clients:
+            empty = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(110), padding=dp(14), spacing=dp(8))
+            empty.bg_color = WHITE
+            empty.add_widget(self.label("No hay clientes para mostrar con ese filtro.", MUTED, False, "12sp", dp(44), halign="center"))
+            self.content.add_widget(empty)
+            return
+
+        for cliente in clients[:80]:
+            cid = str(cliente.get("cobrador_id") or "").strip()
+            assigned = cid == selected_cobrador_id
+
+            card = RoundedBox(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(128),
+                padding=[dp(12), dp(10), dp(12), dp(10)],
+                spacing=dp(7),
+            )
+            card.bg_color = (0.90, 0.98, 0.92, 1) if assigned else WHITE
+
+            top = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(34), spacing=dp(8))
+            name_box = BoxLayout(orientation="vertical", spacing=dp(1))
+            name_box.add_widget(self.label(cliente.get("nombre", "SIN NOMBRE"), TEXT, True, "12sp", dp(18)))
+            name_box.add_widget(self.label(f"Actual: {collector_name_by_id(cid)}", BLUE if assigned else MUTED, False, "9.5sp", dp(16)))
+
+            btn = Button(
+                text="Ya asignado" if assigned else "Asignar",
+                size_hint_x=None,
+                width=dp(104),
+                background_normal="",
+                background_color=(0.72, 0.78, 0.74, 1) if assigned else BLUE,
+                color=WHITE,
+                bold=True,
+                font_size="10.5sp",
+            )
+            btn.disabled = assigned
+            btn.bind(on_release=lambda _, c=cliente, u=collector: self.confirm_assign(c, u))
+
+            top.add_widget(name_box)
+            top.add_widget(btn)
+            card.add_widget(top)
+
+            details = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(46), spacing=dp(8))
+            details.add_widget(self.metric_box("Saldo", money(cliente.get("saldo", 0)), DANGER if safe_int(cliente.get("saldo", 0)) > 0 else SUCCESS))
+            details.add_widget(self.metric_box("Barrio", str(cliente.get("barrio", "") or "Sin barrio")[:18], BLUE_DARK))
+            details.add_widget(self.metric_box("Ruta", str(cliente.get("ruta", "") or "Sin ruta")[:18], BLUE))
+            card.add_widget(details)
+
+            doc_tel = f"Doc: {cliente.get('documento','') or 'N/R'}  ·  Tel: {cliente.get('telefono','') or 'N/R'}"
+            card.add_widget(self.label(doc_tel, MUTED, False, "9.5sp", dp(20)))
+
+            self.content.add_widget(card)
+
+        if len(clients) > 80:
+            note = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(72), padding=dp(12), spacing=dp(6))
+            note.bg_color = (1.0, 0.97, 0.88, 1)
+            note.add_widget(self.label("Mostrando 80 clientes.", GOLD, True, "11sp", dp(24)))
+            note.add_widget(self.label("Usa el buscador para encontrar uno específico.", MUTED, False, "10sp", dp(24)))
+            self.content.add_widget(note)
+
+    def confirm_assign(self, cliente, collector):
+        confirm_popup(
+            "Reasignar cliente",
+            f"¿Asignar a {cliente.get('nombre', 'este cliente')} al cobrador {collector_label(collector)}?",
+            lambda: self.assign_client(cliente, collector),
+        )
+
+    def assign_client(self, cliente, collector):
+        try:
+            reassign_client_to_collector(cliente.get("id"), collector)
+            sync_clients_to_cloud()
+            show_popup("Cliente reasignado", "El cliente quedó asignado y pendiente/sincronizado con Supabase.", height=260)
+            self.build()
+        except Exception as error:
+            show_popup("No se pudo reasignar", str(error), height=300)
+
+# ============================================================
+# USUARIOS / COBRADORES
+# ============================================================
+
+class UsuariosScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(name="usuarios", **kwargs)
+        self.root = BoxLayout(orientation="vertical")
+        self.add_widget(self.root)
+
+    def on_pre_enter(self):
+        self.app_ref = App.get_running_app()
+        # Admin: refrescar lista de usuarios desde Supabase antes de pintar.
+        try:
+            if supabase_configured():
+                pull_users_from_cloud()
+        except Exception as error:
+            print("USERS SCREEN PULL ERROR:", error)
+        self.build()
+
+    def input_box(self, hint, text="", password=False):
+        box = AppTextInput(hint_text=hint, text=str(text or ""), multiline=False, password=password)
+        return box
+
+    def build(self):
+        self.root.clear_widgets()
+        self.root.add_widget(Header("Usuarios / Cobradores", show_back=True, on_back=lambda: self.app_ref.go("configuracion")))
+
+        scroll = ScrollView(do_scroll_x=False, bar_width=dp(4), scroll_type=["bars", "content"])
+        content = BoxLayout(orientation="vertical", padding=[dp(14), dp(14), dp(14), dp(88)], spacing=dp(14), size_hint_y=None)
+        content.bind(minimum_height=content.setter("height"))
+
+        form = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(390), padding=[dp(14), dp(14), dp(14), dp(14)], spacing=dp(8))
+        form.bg_color = (0.98, 0.99, 1, 1)
+        title = Label(text="Nuevo / editar cobrador", color=BLUE_DARK, bold=True, font_size="15sp", halign="left", size_hint_y=None, height=dp(28))
+        title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        form.add_widget(title)
+
+        self.nombre_input = self.input_box("Nombre del cobrador")
+        self.usuario_input = self.input_box("Usuario. Ej: juan")
+        self.pin_input = self.input_box("PIN", password=True)
+        self.pin_input.input_filter = "int"
+        self.rol_spinner = Spinner(text="cobrador", values=["cobrador", "administrador"], size_hint_y=None, height=dp(44), background_normal="", background_color=(0.92,0.94,0.98,1), color=TEXT, bold=True)
+        self.activo_spinner = Spinner(text="Activo", values=["Activo", "Inactivo"], size_hint_y=None, height=dp(44), background_normal="", background_color=(0.92,0.94,0.98,1), color=TEXT, bold=True)
+
+        for w in [self.nombre_input, self.usuario_input, self.pin_input, self.rol_spinner, self.activo_spinner]:
+            form.add_widget(w)
+
+        save_btn = Button(text="Guardar usuario", background_normal="", background_color=SUCCESS, color=WHITE, bold=True, size_hint_y=None, height=dp(48))
+        save_btn.bind(on_release=lambda *_: self.save_user())
+        form.add_widget(save_btn)
+        content.add_widget(form)
+
+        users = load_app_users(active_only=False)
+        list_height = max(dp(360), dp(76 + (len(users) * 66)))
+        list_card = RoundedBox(orientation="vertical", size_hint_y=None, height=list_height, padding=[dp(14), dp(14), dp(14), dp(14)], spacing=dp(8))
+        list_card.bg_color = (0.98, 0.99, 1, 1)
+        list_title = Label(text="Usuarios registrados", color=BLUE_DARK, bold=True, font_size="15sp", halign="left", size_hint_y=None, height=dp(28))
+        list_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        list_card.add_widget(list_title)
+
+        sync_btn = Button(
+            text="Actualizar lista desde Supabase",
+            background_normal="",
+            background_color=GOLD,
+            color=DARK,
+            bold=True,
+            size_hint_y=None,
+            height=dp(44),
+        )
+        sync_btn.bind(on_release=lambda *_: self.refresh_users_from_cloud())
+        list_card.add_widget(sync_btn)
+
+        if not users:
+            list_card.add_widget(Label(text="No hay usuarios.", color=MUTED, size_hint_y=None, height=dp(36)))
+        for user in users:
+            row = RoundedBox(orientation="horizontal", size_hint_y=None, height=dp(58), padding=[dp(10), dp(8), dp(10), dp(8)], spacing=dp(8))
+            row.bg_color = WHITE
+            label = Label(text=f"{user.get('nombre')}\n{user.get('usuario')} · {user.get('rol')} · {'Activo' if int(user.get('activo',0) or 0) else 'Inactivo'}", color=TEXT, font_size="11sp", halign="left", valign="middle")
+            label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            edit_btn = Button(text="Editar", size_hint_x=None, width=dp(76), background_normal="", background_color=BLUE, color=WHITE, bold=True, font_size="11sp")
+            edit_btn.bind(on_release=lambda _, u=user: self.load_user(u))
+            row.add_widget(label)
+            row.add_widget(edit_btn)
+            list_card.add_widget(row)
+        content.add_widget(list_card)
+
+        scroll.add_widget(content)
+        self.root.add_widget(scroll)
+
+    def refresh_users_from_cloud(self):
+        try:
+            push_ok, push_msg = sync_users_to_cloud()
+            pull_ok, pull_msg = pull_users_from_cloud()
+            self.build()
+            show_popup(
+                "Usuarios actualizados",
+                f"Subida: {push_msg}\nDescarga: {pull_msg}",
+                height=310,
+            )
+        except Exception as error:
+            show_popup("Error", str(error), height=280)
+
+    def load_user(self, user):
+        self.nombre_input.text = user.get("nombre", "")
+        self.usuario_input.text = user.get("usuario", "")
+        self.pin_input.text = user.get("pin", "")
+        self.rol_spinner.text = user.get("rol", "cobrador")
+        self.activo_spinner.text = "Activo" if int(user.get("activo", 0) or 0) else "Inactivo"
+
+    def save_user(self):
+        try:
+            data = {
+                "nombre": self.nombre_input.text,
+                "usuario": self.usuario_input.text,
+                "pin": self.pin_input.text,
+                "rol": self.rol_spinner.text,
+                "activo": 1 if self.activo_spinner.text == "Activo" else 0,
+            }
+            save_app_user(data)
+            ok, msg = sync_users_to_cloud()
+            try:
+                pull_users_from_cloud()
+            except Exception as error:
+                print("PULL USERS AFTER SAVE ERROR:", error)
+
+            self.nombre_input.text = ""
+            self.usuario_input.text = ""
+            self.pin_input.text = ""
+            self.rol_spinner.text = "cobrador"
+            self.activo_spinner.text = "Activo"
+
+            show_popup(
+                "Usuario guardado",
+                "El usuario/cobrador quedó guardado.\n"
+                + ("También quedó sincronizado con Supabase." if ok else f"Quedó local, pero falta sincronizar.\n{msg}"),
+                height=320,
+            )
+            self.build()
+        except Exception as error:
+            show_popup("No se pudo guardar", str(error), height=290)
 
 
 # ============================================================
@@ -5411,6 +7845,20 @@ class InicioDashboardScreen(Screen):
         btn.bind(on_release=lambda *_: self.app_ref.go(screen))
         return btn
 
+    def logout_button(self):
+        btn = Button(
+            text="Cerrar sesión",
+            background_normal="",
+            background_color=DANGER,
+            color=WHITE,
+            bold=True,
+            font_size="12sp",
+            size_hint_y=None,
+            height=dp(48),
+        )
+        btn.bind(on_release=lambda *_: self.app_ref.confirm_logout())
+        return btn
+
     def build(self):
         self.root.clear_widgets()
         self.root.add_widget(Header("Inicio"))
@@ -5489,7 +7937,7 @@ class InicioDashboardScreen(Screen):
         actions = RoundedBox(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(214),
+            height=dp(394),
             padding=[dp(14), dp(12), dp(14), dp(12)],
             spacing=dp(10),
         )
@@ -5510,6 +7958,26 @@ class InicioDashboardScreen(Screen):
         row_c.add_widget(self.action_button("Riesgo", "clientes_riesgo", DANGER))
         row_c.add_widget(self.action_button("Pagaron hoy", "clientes_pagaron_hoy", SUCCESS))
         actions.add_widget(row_c)
+
+        row_d = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50))
+        row_d.add_widget(self.action_button("Configuración", "configuracion", (0.36, 0.40, 0.48, 1)))
+        row_d.add_widget(self.action_button("Auditoría", "auditoria", BLUE_DARK))
+        actions.add_widget(row_d)
+
+        if is_admin_role():
+            row_admin_cash = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50))
+            row_admin_cash.add_widget(self.action_button("Caja Central", "caja_central", GOLD))
+            row_admin_cash.add_widget(self.action_button("Resumen Caja", "resumen", BLUE_DARK))
+            actions.add_widget(row_admin_cash)
+
+        row_e = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50))
+        row_e.add_widget(self.action_button("Asignar clientes", "asignar_cobradores", BLUE))
+        row_e.add_widget(self.action_button("Usuarios", "usuarios", (0.36, 0.40, 0.48, 1)))
+        actions.add_widget(row_e)
+
+        row_f = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50))
+        row_f.add_widget(self.logout_button())
+        actions.add_widget(row_f)
 
         content.add_widget(actions)
 
@@ -5632,6 +8100,16 @@ class ClientesScreen(Screen):
 
     def on_pre_enter(self):
         self.app_ref = App.get_running_app()
+
+        # Garantiza que la lista esté alineada con Supabase.
+        # Admin descarga todo; cobrador descarga solo su cartera.
+        try:
+            if supabase_configured():
+                sync_clients_to_cloud()
+                pull_clients_from_cloud()
+        except Exception as error:
+            print("CLIENTES SYNC ON ENTER ERROR:", error)
+
         refresh_clients_cache()
 
         # Cada vez que se vuelve a la lista principal, limpiar la búsqueda.
@@ -7688,11 +10166,12 @@ class CuotaScreen(Screen):
         Segunda barrera de seguridad:
         el usuario revisa los efectos del pago antes de guardar definitivamente.
         """
-        if get_journey_status() != "abierta":
+        ok_cash, msg_cash = require_cash_open("registrar cobros")
+        if not ok_cash:
             show_popup(
-                "Jornada no abierta",
-                "Debes abrir la jornada antes de registrar cobros.",
-                height=260,
+                "Caja no abierta",
+                msg_cash,
+                height=290,
             )
             return
 
@@ -8635,73 +11114,51 @@ class NuevoClienteScreen(Screen):
 
     def calculate_existing_status(self):
         """
-        Calcula automáticamente el estado económico del cartón viejo.
+        Calcula automáticamente el estado económico de una cartulina vieja.
 
-        Cuotas pendientes:
-            cuotas totales - cuotas pagadas
-
-        Total pagado acumulado:
-            cuotas pagadas * valor de cuota + aporte parcial
-
-        Saldo actual:
-            total del crédito - total pagado acumulado
+        Regla:
+        - Las cuotas pagadas se descuentan del total.
+        - El aporte acumulado también baja el saldo.
+        - Si el aporte acumulado completa una o más cuotas, se reconocen como
+          cuotas pagadas adicionales y solo queda como aporte el sobrante.
+        - Este cálculo NO mueve caja, porque el dinero ya fue entregado antes.
         """
-        total_installments = max(
-            to_int(self.numero_cuotas.text, 0),
-            0,
-        )
-        paid_installments = max(
-            to_int(self.cuotas_pagadas_existente.text, 0),
-            0,
-        )
-        installment_value = max(
-            to_int(self.valor_cuota.text, 0),
-            0,
-        )
-        total_credit = max(
-            to_int(self.total_credito.text, 0),
-            0,
-        )
-        partial_contribution = max(
-            to_int(self.aporte_existente.text, 0),
-            0,
-        )
+        total_installments = max(to_int(self.numero_cuotas.text, 0), 0)
+        paid_entered = max(to_int(self.cuotas_pagadas_existente.text, 0), 0)
+        installment_value = max(to_int(self.valor_cuota.text, 0), 0)
+        total_credit = max(to_int(self.total_credito.text, 0), 0)
+        contribution_entered = max(to_int(self.aporte_existente.text, 0), 0)
 
-        # Evitar mostrar valores incoherentes mientras se escribe.
-        paid_installments_for_calculation = min(
-            paid_installments,
+        paid_base = min(paid_entered, total_installments)
+        remaining_slots = max(total_installments - paid_base, 0)
+
+        extra_installments = 0
+        if installment_value > 0 and remaining_slots > 0:
+            extra_installments = min(
+                contribution_entered // installment_value,
+                remaining_slots,
+            )
+
+        effective_paid_installments = min(
+            paid_base + extra_installments,
             total_installments,
         )
 
         pending_installments = max(
-            total_installments - paid_installments,
+            total_installments - effective_paid_installments,
             0,
-        )
-
-        paid_by_installments = (
-            paid_installments_for_calculation
-            * installment_value
         )
 
         total_paid = min(
-            paid_by_installments + partial_contribution,
+            (paid_base * installment_value) + contribution_entered,
             total_credit,
         )
 
-        current_balance = max(
-            total_credit - total_paid,
-            0,
-        )
+        current_balance = max(total_credit - total_paid, 0)
 
-        self.cuotas_pendientes_existente.text = str(
-            pending_installments
-        )
-        self.total_pagado_existente.text = format_thousands(
-            total_paid
-        )
-        self.saldo_existente.text = format_thousands(
-            current_balance
-        )
+        self.cuotas_pendientes_existente.text = str(pending_installments)
+        self.total_pagado_existente.text = format_thousands(total_paid)
+        self.saldo_existente.text = format_thousands(current_balance)
 
 
     def open_existing_date_calendar(self, target_input):
@@ -9073,14 +11530,9 @@ class NuevoClienteScreen(Screen):
             self.build()
 
     def create_client(self):
-        if get_journey_status() != "abierta":
-            show_popup(
-                "Jornada no abierta",
-                "Debes abrir la jornada antes de crear un préstamo.",
-                height=260,
-            )
-            return
-
+        # La caja solo es obligatoria para préstamo nuevo.
+        # Las cartulinas/préstamos existentes son migración de cartera:
+        # no generan desembolso y no deben mover caja.
         self.calculate_credit()
 
         nombre = normalize_client_name(self.nombre.text)
@@ -9120,6 +11572,10 @@ class NuevoClienteScreen(Screen):
 
         existing_loan = self.is_existing_loan()
 
+        pagadas_digitadas = 0
+        cuotas_por_aporte = 0
+        total_pagado_acumulado = 0
+
         if existing_loan:
             fecha_inicio_iso = normalize_date_input(
                 self.fecha_inicio_existente.text
@@ -9127,19 +11583,12 @@ class NuevoClienteScreen(Screen):
             proximo_cobro_iso = normalize_date_input(
                 self.proximo_cobro_existente.text
             )
-            pagadas = max(
+
+            pagadas_digitadas = max(
                 to_int(self.cuotas_pagadas_existente.text, 0),
                 0,
             )
-            pendientes = max(numero_cuotas - pagadas, 0)
-            self.calculate_existing_status()
-
-            saldo_actual = to_int(self.saldo_existente.text, 0)
-            total_pagado_acumulado = to_int(
-                self.total_pagado_existente.text,
-                0,
-            )
-            aporte_acumulado = max(
+            aporte_digitado = max(
                 to_int(self.aporte_existente.text, 0),
                 0,
             )
@@ -9151,6 +11600,53 @@ class NuevoClienteScreen(Screen):
                 )
                 return
 
+            if pagadas_digitadas > numero_cuotas:
+                show_popup(
+                    "Cuotas inválidas",
+                    "Las cuotas pagadas no pueden superar el total de cuotas.",
+                    height=270,
+                )
+                return
+
+            # Conversión automática del aporte acumulado en cuotas completas.
+            # Ejemplo: cuota 20.000 y aporte 25.000 => 1 cuota adicional
+            # y 5.000 quedan como aporte parcial.
+            cupos_pendientes = max(numero_cuotas - pagadas_digitadas, 0)
+            aporte_acumulado = aporte_digitado
+
+            if cuota > 0 and cupos_pendientes > 0:
+                cuotas_por_aporte = min(
+                    aporte_digitado // cuota,
+                    cupos_pendientes,
+                )
+                aporte_acumulado = max(
+                    aporte_digitado - (cuotas_por_aporte * cuota),
+                    0,
+                )
+
+            pagadas = min(
+                pagadas_digitadas + cuotas_por_aporte,
+                numero_cuotas,
+            )
+            pendientes = max(numero_cuotas - pagadas, 0)
+
+            total_pagado_acumulado = min(
+                (pagadas * cuota) + aporte_acumulado,
+                total_credito,
+            )
+            saldo_actual = max(
+                total_credito - total_pagado_acumulado,
+                0,
+            )
+
+            # Actualizar campos visibles para que el usuario vea exactamente
+            # lo que se guardará.
+            self.cuotas_pendientes_existente.text = str(pendientes)
+            self.total_pagado_existente.text = format_thousands(
+                total_pagado_acumulado
+            )
+            self.saldo_existente.text = format_thousands(saldo_actual)
+
             if not proximo_cobro_iso and pendientes > 0:
                 show_popup(
                     "Próxima fecha requerida",
@@ -9158,26 +11654,10 @@ class NuevoClienteScreen(Screen):
                 )
                 return
 
-            if pagadas > numero_cuotas:
-                show_popup(
-                    "Cuotas inválidas",
-                    "Las cuotas pagadas no pueden superar el total.",
-                )
-                return
-
             if saldo_actual < 0 or saldo_actual > total_credito:
                 show_popup(
                     "Saldo inválido",
                     "El saldo actual debe estar entre cero y el total del crédito.",
-                )
-                return
-
-            if aporte_acumulado >= cuota and cuota > 0:
-                show_popup(
-                    "Aporte acumulado inválido",
-                    "El aporte parcial debe ser menor que una cuota. "
-                    "Las cuotas completas deben registrarse como pagadas.",
-                    height=290,
                 )
                 return
 
@@ -9193,8 +11673,6 @@ class NuevoClienteScreen(Screen):
                     "%Y-%m-%d",
                 ).date()
 
-                # Si la fecha ya llegó, aparece amarillo.
-                # Si es futura, queda oculto hasta ese día.
                 estado = (
                     "pendiente"
                     if next_date <= today
@@ -9209,6 +11687,11 @@ class NuevoClienteScreen(Screen):
 
         else:
             refresh_memory_from_db()
+            ok_cash, msg_cash = require_cash_open("crear préstamo nuevo")
+            if not ok_cash:
+                show_popup("Caja no abierta", msg_cash, height=290)
+                return
+
             saldo_caja = current_cash_balance()
 
             if valor_credito > saldo_caja:
@@ -9216,8 +11699,8 @@ class NuevoClienteScreen(Screen):
                     "Saldo insuficiente",
                     f"No se puede crear el préstamo.\n"
                     f"Valor a prestar: {money(valor_credito)}\n"
-                    f"Saldo en caja: {money(saldo_caja)}\n\n"
-                    f"Primero registre un INGRESO o CAJA INICIAL.",
+                    f"Saldo disponible en caja: {money(saldo_caja)}\n\n"
+                    f"Revise que la caja esté abierta y que el saldo inicial haya quedado guardado.",
                 )
                 return
 
@@ -9291,6 +11774,7 @@ class NuevoClienteScreen(Screen):
 
         if existing_loan:
             # Registro inicial para que el historial explique cómo entró.
+            # Valor 0 para que no afecte caja ni recaudo.
             insert_transaction_db({
                 "cliente_id": cliente_id,
                 "cliente": nombre,
@@ -9304,12 +11788,14 @@ class NuevoClienteScreen(Screen):
                 "cuotas_pagadas_total": pagadas,
                 "cuotas_pendientes_total": pendientes,
                 "observacion": (
-                    "Préstamo existente cargado al sistema. "
-                    f"Fecha original: "
-                    f"{self.fecha_inicio_existente.text}. "
-                    f"Total pagado acumulado: "
-                    f"{money(total_pagado_acumulado)}. "
-                    "No generó egreso de caja."
+                    "Préstamo existente/cartulina cargado al sistema. "
+                    f"Fecha original: {self.fecha_inicio_existente.text}. "
+                    f"Cuotas digitadas: {pagadas_digitadas}. "
+                    f"Cuotas reconocidas por aporte: {cuotas_por_aporte}. "
+                    f"Cuotas pagadas finales: {pagadas}. "
+                    f"Aporte parcial restante: {money(aporte_acumulado)}. "
+                    f"Total pagado acumulado: {money(total_pagado_acumulado)}. "
+                    "No generó egreso de caja ni descontó dinero del cobrador."
                 ),
                 "synced": 0,
             })
@@ -9325,6 +11811,12 @@ class NuevoClienteScreen(Screen):
                 "synced": 0,
             })
 
+        try:
+            sync_clients_to_cloud()
+            pull_clients_from_cloud()
+        except Exception as error:
+            print("SYNC AFTER CLIENT CREATE ERROR:", error)
+
         refresh_memory_from_db()
         App.get_running_app().request_auto_sync()
 
@@ -9332,8 +11824,9 @@ class NuevoClienteScreen(Screen):
 
         if existing_loan:
             message = (
-                "Préstamo existente cargado correctamente.\n"
-                "No se descontó dinero de la caja."
+                "Préstamo existente/cartulina cargado correctamente.\n"
+                "No se descontó dinero de caja.\n"
+                f"Saldo actual registrado: {money(saldo_actual)}"
             )
         else:
             message = (
@@ -9344,7 +11837,7 @@ class NuevoClienteScreen(Screen):
         show_popup(
             "Registro completado",
             message,
-            height=280,
+            height=300,
         )
         Clock.schedule_once(
             lambda *_: self.app_ref.go("clientes"),
@@ -9618,6 +12111,11 @@ class RenovarPrestamoScreen(Screen):
             return
 
         refresh_memory_from_db()
+        ok_cash, msg_cash = require_cash_open("renovar préstamo")
+        if not ok_cash:
+            show_popup("Caja no abierta", msg_cash, height=290)
+            return
+
         available_cash = current_cash_balance()
 
         if principal > available_cash:
@@ -10087,11 +12585,12 @@ class MovimientosScreen(Screen):
         self.ingreso.background_color = GOLD if self.ingreso.state == "down" else (0.88, 0.90, 0.94, 1)
 
     def save_movement(self):
-        if get_journey_status() != "abierta":
+        ok_cash, msg_cash = require_cash_open("registrar movimientos")
+        if not ok_cash:
             show_popup(
-                "Jornada no abierta",
-                "Debes abrir la jornada antes de registrar movimientos.",
-                height=260,
+                "Caja no abierta",
+                msg_cash,
+                height=290,
             )
             return
 
@@ -10127,6 +12626,193 @@ class MovimientosScreen(Screen):
         self.obs.text = ""
         self.concepto.text = "Seleccione concepto"
         show_popup("Movimiento guardado", f"{tipo} registrado por {money(valor)}.")
+
+
+
+# ============================================================
+# CAJA CENTRAL / ADMINISTRADOR
+# ============================================================
+
+class CajaCentralScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(name="caja_central", **kwargs)
+        self.root = BoxLayout(orientation="vertical")
+        self.add_widget(self.root)
+
+    def on_pre_enter(self):
+        self.app_ref = App.get_running_app()
+        refresh_daily_cache()
+        self.build()
+
+    def label(self, text_value, color=TEXT, bold=False, size="11sp", height=dp(24), halign="left"):
+        lbl = Label(
+            text=str(text_value),
+            color=color,
+            bold=bold,
+            font_size=size,
+            halign=halign,
+            valign="middle",
+            size_hint_y=None,
+            height=height,
+        )
+        lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        return lbl
+
+    def build(self):
+        self.root.clear_widgets()
+        self.root.add_widget(Header("Caja Central", show_back=True, on_back=lambda: self.app_ref.go("resumen")))
+
+        if not is_admin_role():
+            self.root.add_widget(Label(text="Solo administrador", color=WHITE))
+            return
+
+        scroll = ScrollView(do_scroll_x=False, bar_width=dp(4), scroll_type=["bars", "content"])
+        content = BoxLayout(orientation="vertical", padding=[dp(14), dp(14), dp(14), dp(90)], spacing=dp(14), size_hint_y=None)
+        content.bind(minimum_height=content.setter("height"))
+
+        balance = central_cash_balance()
+        summary = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(150), padding=dp(14), spacing=dp(8))
+        summary.bg_color = BLUE_DARK
+        summary.add_widget(self.label("SALDO CAJA CENTRAL", WHITE, True, "15sp", dp(30), "center"))
+        summary.add_widget(self.label(money(balance), GOLD if balance > 0 else WHITE, True, "25sp", dp(48), "center"))
+        summary.add_widget(self.label("Aquí se controla el dinero que administra el negocio y las bases entregadas a cobradores.", (0.88,0.92,1,1), False, "10.5sp", dp(44), "center"))
+        content.add_widget(summary)
+
+        add_card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(205), padding=dp(14), spacing=dp(8))
+        add_card.bg_color = (0.98,0.99,1,1)
+        add_card.add_widget(self.label("Ingresar dinero a caja central", BLUE_DARK, True, "14sp", dp(28)))
+        self.central_amount = MoneyTextInput(hint_text="Ej: 5.000.000")
+        self.central_obs = AppTextInput(hint_text="Observación. Ej: capital inicial", multiline=True)
+        self.central_obs.height = dp(58)
+        add_card.add_widget(self.central_amount)
+        add_card.add_widget(self.central_obs)
+        btn_add = Button(text="Guardar ingreso central", background_normal="", background_color=SUCCESS, color=WHITE, bold=True, size_hint_y=None, height=dp(44))
+        btn_add.bind(on_release=lambda *_: self.save_central_income())
+        add_card.add_widget(btn_add)
+        content.add_widget(add_card)
+
+        hand_card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(275), padding=dp(14), spacing=dp(8))
+        hand_card.bg_color = (0.98,0.99,1,1)
+        hand_card.add_widget(self.label("Entregar base a cobrador", BLUE_DARK, True, "14sp", dp(28)))
+
+        collectors = [u for u in load_app_users(active_only=True) if str(u.get("rol","")).lower() == "cobrador"]
+        self.collector_map = {f"{u.get('nombre') or u.get('usuario')}": u for u in collectors}
+        names = list(self.collector_map.keys()) or ["Sin cobradores"]
+        self.collector_spinner = Spinner(text=names[0], values=names, size_hint_y=None, height=dp(44), background_normal="", background_color=WHITE, color=TEXT)
+        self.base_amount = MoneyTextInput(hint_text="Base. Ej: 1.000.000")
+        self.base_obs = AppTextInput(hint_text="Observación de entrega", multiline=True)
+        self.base_obs.height = dp(58)
+        hand_card.add_widget(self.collector_spinner)
+        hand_card.add_widget(self.base_amount)
+        hand_card.add_widget(self.base_obs)
+        btn_hand = Button(text="Entregar base", background_normal="", background_color=GOLD, color=DARK, bold=True, size_hint_y=None, height=dp(44))
+        btn_hand.bind(on_release=lambda *_: self.save_base_to_collector())
+        hand_card.add_widget(btn_hand)
+        content.add_widget(hand_card)
+
+        liquidation_card = RoundedBox(orientation="vertical", size_hint_y=None, height=dp(335), padding=dp(14), spacing=dp(8))
+        liquidation_card.bg_color = (0.98,0.99,1,1)
+        liquidation_card.add_widget(self.label("Liquidar cobrador cerrado", BLUE_DARK, True, "14sp", dp(28)))
+        self.liq_collector_spinner = Spinner(text=names[0], values=names, size_hint_y=None, height=dp(44), background_normal="", background_color=WHITE, color=TEXT)
+        self.next_base = MoneyTextInput(hint_text="Base que conserva para próxima jornada")
+        self.received_cash = MoneyTextInput(hint_text="Dinero que entrega al admin")
+        self.liq_obs = AppTextInput(hint_text="Observación de liquidación", multiline=True)
+        self.liq_obs.height = dp(58)
+        liquidation_card.add_widget(self.liq_collector_spinner)
+        liquidation_card.add_widget(self.next_base)
+        liquidation_card.add_widget(self.received_cash)
+        liquidation_card.add_widget(self.liq_obs)
+        btn_liq = Button(text="Liquidar cobrador", background_normal="", background_color=BLUE, color=WHITE, bold=True, size_hint_y=None, height=dp(44))
+        btn_liq.bind(on_release=lambda *_: self.save_liquidation())
+        liquidation_card.add_widget(btn_liq)
+        content.add_widget(liquidation_card)
+
+        overview = RoundedBox(orientation="vertical", size_hint_y=None, padding=dp(14), spacing=dp(8))
+        overview.bind(minimum_height=overview.setter("height"))
+        overview.bg_color = (0.92,0.96,1,1)
+        overview.add_widget(self.label("Control por cobrador", BLUE_DARK, True, "14sp", dp(28)))
+        for item in cash_summary_by_collector():
+            cid = item.get("cobrador_id")
+            suggested = suggested_opening_base_for_collector(cid)
+            close = last_closed_cash_by_collector(cid)
+            counted = safe_int(close.get("efectivo_contado", 0)) if close else 0
+            row_text = (
+                f"{item.get('nombre')} · {str(item.get('estado')).upper()}\\n"
+                f"Saldo esperado: {money(item.get('saldo_esperado', 0))} · "
+                f"Último contado: {money(counted)} · "
+                f"Base sugerida próxima: {money(suggested)}"
+            )
+            overview.add_widget(self.label(row_text, TEXT, False, "10.5sp", dp(54)))
+        content.add_widget(overview)
+
+        movements = central_cash_movements()[:8]
+        mov_card = RoundedBox(orientation="vertical", size_hint_y=None, padding=dp(14), spacing=dp(8))
+        mov_card.bind(minimum_height=mov_card.setter("height"))
+        mov_card.bg_color = WHITE
+        mov_card.add_widget(self.label("Últimos movimientos caja central", BLUE_DARK, True, "14sp", dp(28)))
+        if not movements:
+            mov_card.add_widget(self.label("No hay movimientos en caja central.", MUTED, False, "11sp", dp(40)))
+        for mov in movements:
+            mov_card.add_widget(self.label(f"{mov.get('fecha')} · {mov.get('tipo')} · {mov.get('concepto')} · {money(mov.get('valor',0))}", TEXT, False, "10sp", dp(34)))
+        content.add_widget(mov_card)
+
+        scroll.add_widget(content)
+        self.root.add_widget(scroll)
+
+    def save_central_income(self):
+        try:
+            add_central_cash(to_int(self.central_amount.text, 0), self.central_obs.text)
+            sync_movements_to_cloud()
+            self.central_amount.text = ""
+            self.central_obs.text = ""
+            show_popup("Caja central", "Ingreso registrado correctamente.", height=240)
+            self.build()
+        except Exception as error:
+            show_popup("No se pudo guardar", str(error), height=290)
+
+    def selected_collector_id(self, spinner):
+        user = self.collector_map.get(spinner.text)
+        if not user:
+            raise ValueError("Seleccione un cobrador válido.")
+        return user.get("cobrador_id")
+
+    def save_base_to_collector(self):
+        try:
+            cid = self.selected_collector_id(self.collector_spinner)
+            hand_base_to_collector(cid, to_int(self.base_amount.text, 0), self.base_obs.text)
+            sync_movements_to_cloud()
+            self.base_amount.text = ""
+            self.base_obs.text = ""
+            show_popup("Base entregada", "La base quedó registrada y descontada de caja central.", height=280)
+            self.build()
+        except Exception as error:
+            show_popup("No se pudo entregar base", str(error), height=320)
+
+    def save_liquidation(self):
+        try:
+            cid = self.selected_collector_id(self.liq_collector_spinner)
+            result = liquidate_collector_cash(
+                cid,
+                to_int(self.next_base.text, 0),
+                to_int(self.received_cash.text, 0),
+                self.liq_obs.text,
+            )
+            sync_movements_to_cloud()
+            self.next_base.text = ""
+            self.received_cash.text = ""
+            self.liq_obs.text = ""
+            show_popup(
+                "Liquidación guardada",
+                f"Debe entregar: {money(result['should_receive'])}\\n"
+                f"Entregó: {money(result['received_cash'])}\\n"
+                f"Base próxima: {money(result['next_base'])}\\n"
+                f"Diferencia: {money(result['difference'])}",
+                height=340,
+            )
+            self.build()
+        except Exception as error:
+            show_popup("No se pudo liquidar", str(error), height=340)
+
 
 
 # ============================================================
@@ -11317,7 +14003,7 @@ class ResumenScreen(Screen):
 
     def build(self):
         self.root.clear_widgets()
-        self.root.add_widget(Header("::V12:: Resumen y Caja Semanal", show_back=True, on_back=lambda: self.app_ref.go("clientes")))
+        self.root.add_widget(Header("::V12:: Caja / Resumen", show_back=True, on_back=lambda: self.app_ref.go("clientes")))
 
         scroll = ScrollView()
         content = BoxLayout(orientation="vertical", padding=[dp(12), dp(12), dp(12), dp(22)], spacing=dp(12), size_hint_y=None)
@@ -11541,6 +14227,55 @@ class ResumenScreen(Screen):
         report.add_widget(MetricRow("Cartera en la calle", money(cartera_total), highlight=True))
         content.add_widget(report)
 
+        if is_admin_role():
+            admin_cash = cash_summary_by_collector()
+            admin_card = RoundedBox(
+                orientation="vertical",
+                spacing=dp(7),
+                padding=[dp(12), dp(12), dp(12), dp(12)],
+                size_hint_y=None,
+            )
+            admin_card.bind(minimum_height=admin_card.setter("height"))
+            admin_title = Label(
+                text="CONSOLIDADO DE CAJA POR COBRADOR",
+                color=BLUE_DARK,
+                bold=True,
+                font_size="14sp",
+                halign="left",
+                valign="middle",
+                size_hint_y=None,
+                height=dp(28),
+            )
+            admin_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            admin_card.add_widget(admin_title)
+
+            total_inicial = sum(safe_int(x.get("caja_inicial", 0)) for x in admin_cash)
+            total_recaudo = sum(safe_int(x.get("recaudo", 0)) for x in admin_cash)
+            total_ingresos = sum(safe_int(x.get("ingresos", 0)) for x in admin_cash)
+            total_egresos = sum(safe_int(x.get("egresos", 0)) for x in admin_cash)
+            total_saldo = sum(safe_int(x.get("saldo_esperado", 0)) for x in admin_cash)
+
+            for left, right in [
+                ("Caja inicial total", money(total_inicial)),
+                ("Recaudo total", money(total_recaudo)),
+                ("Ingresos total", money(total_ingresos)),
+                ("Egresos total", money(total_egresos)),
+                ("Saldo esperado total", money(total_saldo)),
+            ]:
+                admin_card.add_widget(MetricRow(left, right, highlight=(left == "Saldo esperado total")))
+
+            for item in admin_cash:
+                label = f"{item.get('nombre', 'Cobrador')} · {str(item.get('estado', 'sin_abrir')).upper()}"
+                value = (
+                    f"Base {money(item.get('caja_inicial', 0))} | "
+                    f"Rec {money(item.get('recaudo', 0))} | "
+                    f"Egr {money(item.get('egresos', 0))} | "
+                    f"Saldo {money(item.get('saldo_esperado', 0))}"
+                )
+                admin_card.add_widget(MetricRow(label, value))
+
+            content.add_widget(admin_card)
+
         actions = RoundedBox(
             orientation="vertical",
             size_hint_y=None,
@@ -11618,9 +14353,16 @@ class ResumenScreen(Screen):
             height=dp(46),
         )
 
-        if journey_status == "sin_abrir":
+        if is_admin_role():
             close_button = PillButton(
-                "Abrir Semana",
+                "Admin: Consolidado",
+                bg_color=(0.45, 0.48, 0.55, 1),
+            )
+            close_button.disabled = True
+
+        elif journey_status == "sin_abrir":
+            close_button = PillButton(
+                "Abrir mi caja",
                 bg_color=SUCCESS,
             )
             close_button.bind(
@@ -11629,7 +14371,7 @@ class ResumenScreen(Screen):
 
         elif journey_status == "abierta":
             close_button = PillButton(
-                "Cerrar Semana",
+                "Cerrar mi caja",
                 bg_color=GOLD,
             )
             close_button.bind(
@@ -11638,7 +14380,7 @@ class ResumenScreen(Screen):
 
         else:
             close_button = PillButton(
-                "Semana Cerrada",
+                "Caja cerrada",
                 bg_color=(0.45, 0.48, 0.55, 1),
             )
             close_button.disabled = True
@@ -11712,35 +14454,65 @@ class ResumenScreen(Screen):
         self.root.add_widget(scroll)
 
     def confirm_open_day(self):
+        if is_admin_role() and not MODO_DUENO_UNICO:
+            show_popup(
+                "Consolidado administrativo",
+                "El administrador no abre caja propia. Cada cobrador debe abrir su caja desde su usuario.",
+                height=290,
+            )
+            return
+
         week_start, week_end = week_bounds()
-        calculated_opening = cash_balance_before_date(week_start)
+        suggested_base = suggested_opening_base_for_collector(cash_owner_id())
 
         content = BoxLayout(
             orientation="vertical",
             padding=dp(14),
-            spacing=dp(12),
+            spacing=dp(10),
         )
 
         info = Label(
             text=(
                 f"Semana: {display_week_range()}\n"
-                "Escribe la base con la que inicia la semana.\n"
-                f"Sugerencia automática: {money(calculated_opening)}"
+                f"Base sugerida por sistema/admin: {money(suggested_base)}\n"
+                "Confirma la base física con la que inicia el cobrador."
             ),
             color=WHITE,
-            font_size="14sp",
+            font_size="13sp",
             halign="center",
             valign="middle",
             size_hint_y=None,
-            height=dp(78),
+            height=dp(86),
         )
         info.bind(size=lambda instance, value: setattr(instance, "text_size", value))
 
-        base_label = FieldLabel("Caja inicial / base de la semana")
+        base_label = FieldLabel("Caja inicial / base física recibida")
         base_input = MoneyTextInput(
-            text=format_thousands(calculated_opening),
+            text=format_thousands(suggested_base),
             hint_text="Ej: 100.000",
         )
+
+        motive_label = FieldLabel("Motivo si la base es diferente o no fue asignada")
+        motive_input = AppTextInput(
+            hint_text="Ej: el admin entregó una base distinta / base manual autorizada",
+            multiline=True,
+        )
+        motive_input.height = dp(70)
+
+        warning = Label(
+            text=(
+                "Regla: si la base digitada es diferente a la sugerida, o si no hay base sugerida, "
+                "debes escribir un motivo. Quedará en auditoría."
+            ),
+            color=GOLD,
+            bold=True,
+            font_size="10.5sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(54),
+        )
+        warning.bind(size=lambda instance, value: setattr(instance, "text_size", value))
 
         buttons = BoxLayout(
             orientation="horizontal",
@@ -11757,7 +14529,7 @@ class ResumenScreen(Screen):
             bold=True,
         )
         accept = Button(
-            text="Abrir Semana",
+            text="Abrir mi caja",
             background_normal="",
             background_color=SUCCESS,
             color=WHITE,
@@ -11770,35 +14542,72 @@ class ResumenScreen(Screen):
         content.add_widget(info)
         content.add_widget(base_label)
         content.add_widget(base_input)
+        content.add_widget(motive_label)
+        content.add_widget(motive_input)
+        content.add_widget(warning)
         content.add_widget(buttons)
 
         popup = Popup(
-            title="Abrir Jornada",
+            title="Apertura de caja",
             content=content,
-            size_hint=(0.90, None),
-            height=dp(310),
+            size_hint=(0.92, None),
+            height=dp(480),
             auto_dismiss=False,
         )
 
         cancel.bind(on_release=popup.dismiss)
-        accept.bind(
-            on_release=lambda *_: self.open_day(
+
+        def validate_open(*_):
+            base_value = to_int(base_input.text, 0)
+            motive = str(motive_input.text or "").strip()
+
+            if base_value <= 0:
+                show_popup("Base inválida", "La base inicial debe ser mayor que cero.", height=240)
+                return
+
+            needs_motive = (suggested_base <= 0) or (base_value != suggested_base)
+
+            if needs_motive and not motive:
+                show_popup(
+                    "Motivo obligatorio",
+                    "La base digitada no coincide con la base sugerida, o no existe base asignada.\n\n"
+                    "Escribe el motivo para abrir caja.",
+                    height=330,
+                )
+                return
+
+            self.open_day(
                 popup,
-                to_int(base_input.text, calculated_opening),
+                base_value,
+                motive,
+                suggested_base,
             )
-        )
+
+        accept.bind(on_release=validate_open)
         popup.open()
 
-    def open_day(self, popup=None, opening_cash=None):
+    def open_day(self, popup=None, opening_cash=None, motive="", suggested_base=None):
         try:
-            journey = open_cash_journey(opening_cash=opening_cash)
+            suggested_base = suggested_base if suggested_base is not None else suggested_opening_base_for_collector(cash_owner_id())
+            opening_cash = safe_int(opening_cash)
+            motive = str(motive or "").strip()
+
+            if suggested_base <= 0 or opening_cash != suggested_base:
+                insert_audit_log(
+                    "Apertura con base diferente",
+                    None,
+                    cash_owner_label(),
+                    f"Base sugerida: {money(suggested_base)}. Base digitada: {money(opening_cash)}. Motivo: {motive}"
+                )
+
+            journey = open_cash_journey(opening_cash=opening_cash, observation=motive)
 
             if popup is not None:
                 popup.dismiss()
 
             show_popup(
-                "Jornada abierta",
-                "La caja semanal fue abierta correctamente.\n\n"
+                "Caja abierta",
+                "La caja semanal del cobrador fue abierta correctamente.\n\n"
                 f"Caja inicial: {money(journey['caja_inicial'])}",
                 height=280,
             )
@@ -11813,6 +14622,14 @@ class ResumenScreen(Screen):
             )
 
     def confirm_close_day(self):
+        if is_admin_role() and not MODO_DUENO_UNICO:
+            show_popup(
+                "Consolidado administrativo",
+                "El administrador no cierra caja propia. Cada cobrador debe cerrar su caja desde su usuario.",
+                height=290,
+            )
+            return
+
         status = get_journey_status()
 
         if status == "sin_abrir":
@@ -11844,9 +14661,57 @@ class ResumenScreen(Screen):
 
         outer = BoxLayout(
             orientation="vertical",
-            padding=[dp(12), dp(10), dp(12), dp(10)],
+            padding=[dp(10), dp(8), dp(10), dp(8)],
             spacing=dp(8),
         )
+
+        # Encabezado fijo, compacto.
+        header = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(82),
+            padding=[dp(12), dp(8), dp(12), dp(8)],
+            spacing=dp(3),
+        )
+        header.bg_color = (0.10, 0.18, 0.34, 1)
+
+        title = Label(
+            text="Cierre semanal de caja",
+            color=WHITE,
+            bold=True,
+            font_size="17sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(28),
+        )
+        title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        subtitle = Label(
+            text=f"{cash_owner_label()}  •  {display_week_range()}",
+            color=(0.86, 0.92, 1, 1),
+            font_size="11sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(22),
+        )
+        subtitle.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+        status_line = Label(
+            text="Cuenta el efectivo físico y confirma el resultado.",
+            color=(0.76, 0.86, 1, 1),
+            font_size="10.5sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(20),
+        )
+        status_line.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+        header.add_widget(title)
+        header.add_widget(subtitle)
+        header.add_widget(status_line)
+        outer.add_widget(header)
 
         scroll = ScrollView(
             do_scroll_x=False,
@@ -11857,359 +14722,340 @@ class ResumenScreen(Screen):
             orientation="vertical",
             spacing=dp(10),
             size_hint_y=None,
-            padding=[dp(2), dp(2), dp(2), dp(8)],
+            padding=[dp(2), dp(2), dp(2), dp(18)],
         )
         content.bind(minimum_height=content.setter("height"))
 
-        # Encabezado
-        header = RoundedBox(
-            orientation="vertical",
-            size_hint_y=None,
-            height=dp(90),
-            padding=[dp(12), dp(10), dp(12), dp(10)],
-            spacing=dp(4),
-        )
-        header.bg_color = (0.94, 0.97, 1, 1)
-        header_title = Label(
-            text="Arqueo y cierre semanal",
-            color=BLUE,
-            bold=True,
-            font_size="17sp",
-            halign="left",
-            valign="middle",
-            size_hint_y=None,
-            height=dp(28),
-        )
-        header_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        header_text = Label(
-            text=(
-                "Sigue estos 3 pasos: 1) revisa toda la semana, 2) escribe el dinero en mano, "
-                "3) confirma si la caja cuadra."
-            ),
-            color=MUTED,
-            font_size="11sp",
-            halign="left",
-            valign="middle",
-        )
-        header_text.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        header.add_widget(header_title)
-        header.add_widget(header_text)
-        content.add_widget(header)
-
-        # Paso 1: Resumen del sistema
-        system_box = RoundedBox(
-            orientation="vertical",
-            size_hint_y=None,
-            height=dp(300),
-            padding=[dp(12), dp(10), dp(12), dp(10)],
-            spacing=dp(6),
-        )
-
-        step1_title = Label(
-            text="Paso 1. Resumen acumulado de la semana",
-            color=DARK,
-            bold=True,
-            font_size="14sp",
-            halign="left",
-            valign="middle",
-            size_hint_y=None,
-            height=dp(24),
-        )
-        step1_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        system_box.add_widget(step1_title)
-
-        system_box.add_widget(DetailRow("Periodo", display_week_range()))
-        system_box.add_widget(DetailRow("Caja inicial", money(opening_cash)))
-        system_box.add_widget(DetailRow("Recaudo semanal", money(metrics["collected"])))
-        system_box.add_widget(DetailRow("Ingresos de la semana", money(metrics["income"])))
-        system_box.add_widget(DetailRow("Egresos de la semana", money(metrics["expenses"])))
-        system_box.add_widget(DetailRow("Pendientes de nube", str(pending_cloud)))
-
+        # Tarjeta principal: dinero esperado.
         expected_card = RoundedBox(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(76),
-            padding=[dp(12), dp(10), dp(12), dp(10)],
-            spacing=dp(2),
+            height=dp(110),
+            padding=[dp(14), dp(10), dp(14), dp(10)],
+            spacing=dp(4),
         )
-        expected_card.bg_color = (0.99, 0.97, 0.88, 1)
-        expected_lbl_1 = Label(
-            text="Dinero que deberías tener",
+        expected_card.bg_color = (0.96, 0.99, 1, 1)
+
+        expected_label = Label(
+            text="Saldo esperado en caja",
             color=MUTED,
             font_size="11sp",
             halign="center",
             valign="middle",
             size_hint_y=None,
-            height=dp(20),
+            height=dp(22),
         )
-        expected_lbl_1.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        expected_lbl_2 = Label(
+        expected_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+        expected_value = Label(
             text=money(expected_cash),
-            color=DARK,
+            color=BLUE_DARK,
             bold=True,
-            font_size="22sp",
+            font_size="28sp",
             halign="center",
             valign="middle",
+            size_hint_y=None,
+            height=dp(46),
         )
-        expected_lbl_2.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        expected_card.add_widget(expected_lbl_1)
-        expected_card.add_widget(expected_lbl_2)
-        system_box.add_widget(expected_card)
-        content.add_widget(system_box)
+        expected_value.bind(size=lambda instance, value: setattr(instance, "text_size", value))
 
-        # Paso 2: Arqueo físico
+        expected_help = Label(
+            text="Caja inicial + recaudos + ingresos - egresos",
+            color=MUTED,
+            font_size="10sp",
+            halign="center",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(22),
+        )
+        expected_help.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+        expected_card.add_widget(expected_label)
+        expected_card.add_widget(expected_value)
+        expected_card.add_widget(expected_help)
+        content.add_widget(expected_card)
+
+        # Resumen compacto.
+        summary_box = RoundedBox(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(178),
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(4),
+        )
+        summary_box.bg_color = (0.98, 0.99, 1, 1)
+
+        summary_title = Label(
+            text="Resumen del periodo",
+            color=DARK,
+            bold=True,
+            font_size="13sp",
+            halign="left",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(24),
+        )
+        summary_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        summary_box.add_widget(summary_title)
+
+        summary_box.add_widget(DetailRow("Caja inicial", money(opening_cash)))
+        summary_box.add_widget(DetailRow("Recaudo", money(metrics["collected"])))
+        summary_box.add_widget(DetailRow("Ingresos", money(metrics["income"])))
+        summary_box.add_widget(DetailRow("Egresos", money(metrics["expenses"])))
+        summary_box.add_widget(DetailRow("Pendientes nube", str(pending_cloud)))
+        content.add_widget(summary_box)
+
+        # Campo de conteo.
         count_box = RoundedBox(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(168),
+            height=dp(150),
             padding=[dp(12), dp(10), dp(12), dp(10)],
-            spacing=dp(6),
+            spacing=dp(7),
         )
-        count_box.bg_color = (0.99, 0.98, 0.94, 1)
+        count_box.bg_color = (1, 0.99, 0.94, 1)
 
-        step2_title = Label(
-            text="Paso 2. Dinero físico contado",
+        count_title = Label(
+            text="Dinero físico contado",
             color=DARK,
             bold=True,
             font_size="14sp",
             halign="left",
             valign="middle",
             size_hint_y=None,
-            height=dp(24),
+            height=dp(25),
         )
-        step2_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        step2_help = Label(
-            text="Cuenta el dinero físico real y escríbelo aquí antes de cerrar.",
+        count_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+        count_help = Label(
+            text="Escribe el efectivo real que tienes en la mano.",
             color=MUTED,
-            font_size="11sp",
+            font_size="10.5sp",
             halign="left",
             valign="middle",
             size_hint_y=None,
-            height=dp(32),
+            height=dp(24),
         )
-        step2_help.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        count_box.add_widget(step2_title)
-        count_box.add_widget(step2_help)
+        count_help.bind(size=lambda instance, value: setattr(instance, "text_size", value))
 
         physical_cash_input = MoneyTextInput(
-            hint_text="Ej: 2.080.000",
+            hint_text="Ej: 3.510.000",
             text=format_thousands(expected_cash),
         )
+        physical_cash_input.font_size = "22sp"
+        physical_cash_input.halign = "center"
+        physical_cash_input.size_hint_y = None
+        physical_cash_input.height = dp(54)
+
+        count_box.add_widget(count_title)
+        count_box.add_widget(count_help)
         count_box.add_widget(physical_cash_input)
         content.add_widget(count_box)
 
-        # Paso 3: Resultado de comparación
+        # Resultado visual.
         result_box = RoundedBox(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(222),
+            height=dp(160),
             padding=[dp(12), dp(10), dp(12), dp(10)],
             spacing=dp(6),
         )
+        result_box.bg_color = (0.94, 0.98, 0.95, 1)
 
-        step3_title = Label(
-            text="Paso 3. Resultado del arqueo",
+        result_title = Label(
+            text="Resultado del arqueo",
             color=DARK,
             bold=True,
-            font_size="14sp",
-            halign="left",
+            font_size="13sp",
+            halign="center",
             valign="middle",
             size_hint_y=None,
             height=dp(24),
         )
-        step3_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        result_box.add_widget(step3_title)
+        result_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
 
-        comparison_card = RoundedBox(
-            orientation="vertical",
-            size_hint_y=None,
-            height=dp(76),
-            padding=[dp(10), dp(8), dp(10), dp(8)],
-            spacing=dp(4),
-        )
-        comparison_card.bg_color = (0.94, 0.97, 1, 1)
         comparison_label = Label(
-            text="",
-            color=TEXT,
+            text="CAJA CUADRADA",
+            color=SUCCESS,
             bold=True,
-            font_size="16sp",
+            font_size="19sp",
+            halign="center",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(34),
+        )
+        comparison_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+        difference_label = Label(
+            text="Diferencia: $ 0",
+            color=MUTED,
+            bold=True,
+            font_size="13sp",
             halign="center",
             valign="middle",
             size_hint_y=None,
             height=dp(26),
         )
-        comparison_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        difference_label = Label(
-            text="",
-            color=MUTED,
-            font_size="12sp",
+        difference_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
+        result_help = Label(
+            text="El dinero físico coincide con el sistema.",
+            color=SUCCESS,
+            font_size="11sp",
             halign="center",
             valign="middle",
-        )
-        difference_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        comparison_card.add_widget(comparison_label)
-        comparison_card.add_widget(difference_label)
-        result_box.add_widget(comparison_card)
-
-        recap_box = RoundedBox(
-            orientation="vertical",
             size_hint_y=None,
-            height=dp(82),
-            padding=[dp(10), dp(8), dp(10), dp(8)],
-            spacing=dp(2),
+            height=dp(34),
         )
-        recap_box.bg_color = (0.97, 0.98, 1, 1)
-        recap_expected = Label(text="", color=TEXT, font_size="11sp", halign="left", valign="middle", size_hint_y=None, height=dp(20))
-        recap_counted = Label(text="", color=TEXT, font_size="11sp", halign="left", valign="middle", size_hint_y=None, height=dp(20))
-        recap_diff = Label(text="", color=TEXT, font_size="11sp", halign="left", valign="middle", size_hint_y=None, height=dp(20))
-        for lbl in (recap_expected, recap_counted, recap_diff):
-            lbl.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-            recap_box.add_widget(lbl)
-        result_box.add_widget(recap_box)
+        result_help.bind(size=lambda instance, value: setattr(instance, "text_size", value))
 
-        observation_label = FieldLabel(
-            "Observación obligatoria si falta o sobra dinero"
-        )
-        observation_input = AppTextInput(
-            hint_text="Ej: faltante pendiente de verificar",
-            multiline=True,
-        )
-        observation_input.height = dp(56)
-        result_box.add_widget(observation_label)
-        result_box.add_widget(observation_input)
+        result_box.add_widget(result_title)
+        result_box.add_widget(comparison_label)
+        result_box.add_widget(difference_label)
+        result_box.add_widget(result_help)
         content.add_widget(result_box)
 
-        def refresh_comparison(*_):
-            physical = to_int(physical_cash_input.text, 0)
-            difference = physical - expected_cash
-
-            recap_expected.text = f"Dinero esperado: {money(expected_cash)}"
-            recap_counted.text = f"Dinero físico contado: {money(physical)}"
-            recap_diff.text = f"Diferencia: {money(abs(difference)) if difference != 0 else money(0)}"
-
-            if difference == 0:
-                comparison_label.text = "CAJA CUADRADA"
-                comparison_label.color = SUCCESS
-                difference_label.text = "El dinero físico coincide con el sistema."
-                difference_label.color = SUCCESS
-                comparison_card.bg_color = (0.93, 0.98, 0.93, 1)
-            elif difference > 0:
-                comparison_label.text = "HAY SOBRANTE"
-                comparison_label.color = BLUE
-                difference_label.text = f"Sobran {money(difference)} frente al sistema."
-                difference_label.color = BLUE
-                comparison_card.bg_color = (0.92, 0.97, 1, 1)
-            else:
-                comparison_label.text = "HAY FALTANTE"
-                comparison_label.color = DANGER
-                difference_label.text = f"Faltan {money(abs(difference))} frente al sistema."
-                difference_label.color = DANGER
-                comparison_card.bg_color = (1.0, 0.94, 0.94, 1)
-
-        physical_cash_input.bind(text=refresh_comparison)
-        Clock.schedule_once(refresh_comparison, 0)
-
-        # Aviso de sincronización
-        notice = RoundedBox(
+        # Observación opcional.
+        obs_box = RoundedBox(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(70),
-            padding=dp(10),
+            height=dp(132),
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(6),
         )
-        notice.bg_color = (1.0, 0.95, 0.95, 1) if pending_cloud > 0 else (0.93, 0.98, 0.93, 1)
-        notice_text = (
-            "Hay registros pendientes de sincronizar. Recomendación: ejecuta Carga Completa antes del cierre."
-            if pending_cloud > 0
-            else "Todo está sincronizado. Si el efectivo cuadra, puedes confirmar el cierre."
-        )
-        notice_label = Label(
-            text=notice_text,
-            color=TEXT,
-            font_size="11sp",
+        obs_box.bg_color = (0.98, 0.98, 1, 1)
+
+        obs_title = Label(
+            text="Observación del cierre",
+            color=DARK,
+            bold=True,
+            font_size="13sp",
             halign="left",
             valign="middle",
+            size_hint_y=None,
+            height=dp(24),
         )
-        notice_label.bind(size=lambda instance, value: setattr(instance, "text_size", value))
-        notice.add_widget(notice_label)
-        content.add_widget(notice)
+        obs_title.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        observation_input = AppTextInput(
+            hint_text="Opcional. Ej: faltante justificado, sobrante, novedad del día...",
+            multiline=True,
+        )
+        observation_input.size_hint_y = None
+        observation_input.height = dp(78)
+
+        obs_box.add_widget(obs_title)
+        obs_box.add_widget(observation_input)
+        content.add_widget(obs_box)
 
         scroll.add_widget(content)
         outer.add_widget(scroll)
 
+        # Botones fijos inferiores. Siempre visibles.
+        footer = BoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(104),
+            spacing=dp(7),
+        )
+
+        footer_info = Label(
+            text="Revisa el resultado antes de confirmar. Este cierre quedará guardado.",
+            color=(0.86, 0.92, 1, 1),
+            font_size="10.5sp",
+            halign="center",
+            valign="middle",
+            size_hint_y=None,
+            height=dp(24),
+        )
+        footer_info.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+
         buttons = BoxLayout(
             orientation="horizontal",
-            spacing=dp(8),
             size_hint_y=None,
-            height=dp(48),
+            height=dp(54),
+            spacing=dp(9),
         )
-        cancel = Button(
-            text="Seguir revisando",
+
+        cancel_btn = Button(
+            text="Cancelar",
             background_normal="",
-            background_color=(0.56, 0.60, 0.66, 1),
+            background_color=(0.55, 0.58, 0.63, 1),
             color=WHITE,
             bold=True,
         )
-        confirm = Button(
+        close_btn = Button(
             text="Confirmar cierre",
             background_normal="",
-            background_color=DANGER,
+            background_color=SUCCESS,
             color=WHITE,
             bold=True,
         )
-        buttons.add_widget(cancel)
-        buttons.add_widget(confirm)
-        outer.add_widget(buttons)
+
+        buttons.add_widget(cancel_btn)
+        buttons.add_widget(close_btn)
+        footer.add_widget(footer_info)
+        footer.add_widget(buttons)
+        outer.add_widget(footer)
 
         popup = Popup(
-            title="Cierre Semanal de Caja",
+            title="",
             content=outer,
-            size_hint=(0.94, 0.94),
+            size_hint=(0.96, 0.94),
             auto_dismiss=False,
         )
-        cancel.bind(on_release=popup.dismiss)
 
-        def validate_and_close(*_):
-            physical = to_int(physical_cash_input.text, -1)
-            difference = physical - expected_cash
-            observation = observation_input.text.strip()
+        def update_comparison(*_):
+            counted = to_int(physical_cash_input.text, expected_cash)
+            difference = counted - expected_cash
 
-            if physical < 0:
-                show_popup(
-                    "Monto requerido",
-                    "Escribe cuánto dinero tienes físicamente en mano.",
+            if difference == 0:
+                result_box.bg_color = (0.92, 0.98, 0.94, 1)
+                comparison_label.text = "CAJA CUADRADA"
+                comparison_label.color = SUCCESS
+                difference_label.text = "Diferencia: $ 0"
+                difference_label.color = MUTED
+                result_help.text = "El dinero físico coincide con el sistema."
+                result_help.color = SUCCESS
+                close_btn.background_color = SUCCESS
+            elif difference > 0:
+                result_box.bg_color = (1, 0.97, 0.88, 1)
+                comparison_label.text = "SOBRANTE EN CAJA"
+                comparison_label.color = GOLD
+                difference_label.text = f"Sobrante: {money(difference)}"
+                difference_label.color = GOLD
+                result_help.text = "Hay más dinero físico que el calculado por el sistema."
+                result_help.color = GOLD
+                close_btn.background_color = GOLD
+            else:
+                result_box.bg_color = (1, 0.94, 0.94, 1)
+                comparison_label.text = "FALTANTE EN CAJA"
+                comparison_label.color = DANGER
+                difference_label.text = f"Faltante: {money(abs(difference))}"
+                difference_label.color = DANGER
+                result_help.text = "Hay menos dinero físico que el esperado."
+                result_help.color = DANGER
+                close_btn.background_color = DANGER
+
+        def scroll_to_input(instance, focus):
+            if focus:
+                Clock.schedule_once(
+                    lambda *_: scroll.scroll_to(count_box, padding=dp(90), animate=True),
+                    0.25,
                 )
-                return
 
-            pending_sync = count_pending_sync()
-            if pending_sync > 0:
-                show_popup(
-                    "Sincronización pendiente",
-                    f"No se recomienda cerrar caja con {pending_sync} registro(s) pendiente(s) por subir.\n\n"
-                    "Conéctate a internet y sincroniza antes de cerrar para proteger la información.",
-                    height=340,
-                )
-                return
+        physical_cash_input.bind(text=update_comparison)
+        physical_cash_input.bind(focus=scroll_to_input)
 
-            if difference != 0 and not observation:
-                show_popup(
-                    "Observación requerida",
-                    "La caja presenta una diferencia. Escribe una observación antes de cerrar.",
-                    height=270,
-                )
-                return
+        cancel_btn.bind(on_release=popup.dismiss)
+        close_btn.bind(
+            on_release=lambda *_: self.close_day(
+                to_int(physical_cash_input.text, expected_cash),
+                observation_input.text,
+                popup,
+            )
+        )
 
-            if difference != 0:
-                insert_audit_log(
-                    "Cerrar caja con diferencia",
-                    None,
-                    "Faltante" if difference < 0 else "Sobrante",
-                    observation,
-                )
-
-            popup.dismiss()
-            self.close_day(physical, observation)
-
-        confirm.bind(on_release=validate_and_close)
+        update_comparison()
         popup.open()
 
     def close_day(self, physical_cash=None, observation=""):
@@ -13312,6 +16158,12 @@ class ClientesRiesgoScreen(Screen):
 class CobrosV12App(App):
     selected_client = None
     cloud_restore_done = False
+    authenticated = False
+    current_role = "Administrador"
+    current_user = None
+    current_username = ""
+    current_user_name = ""
+    current_cobrador_id = ""
 
     # Estado offline-first
     sync_in_progress = False
@@ -13323,7 +16175,7 @@ class CobrosV12App(App):
     route_check_interval_seconds = 900
 
     def build(self):
-        self.title = "Cobros V12 Mobile"
+        self.title = "Cobros V12 Pacho Admin"
         try:
             init_database()
             refresh_memory_from_db(normalize=True)
@@ -13341,6 +16193,7 @@ class CobrosV12App(App):
 
         self.sm = ScreenManager(transition=NoTransition(), size_hint=size_hint, width=width)
 
+        self.sm.add_widget(LoginPinScreen())
         self.sm.add_widget(InicioDashboardScreen())
         self.sm.add_widget(ClientesScreen())
         self.sm.add_widget(TodosClientesScreen())
@@ -13355,12 +16208,16 @@ class CobrosV12App(App):
         self.sm.add_widget(CierresSemanalesScreen())
         self.sm.add_widget(CarteraCalleScreen())
         self.sm.add_widget(ResumenScreen())
+        self.sm.add_widget(CajaCentralScreen())
         self.sm.add_widget(AuditoriaScreen())
         self.sm.add_widget(ClientesRiesgoScreen())
         self.sm.add_widget(RutaDiaScreen())
+        self.sm.add_widget(ConfiguracionScreen())
+        self.sm.add_widget(AsignacionCobradoresScreen())
+        self.sm.add_widget(UsuariosScreen())
 
         self.shell.add_widget(self.sm)
-        self.sm.current = "inicio"
+        self.sm.current = "login"
         Window.bind(size=self.update_mobile_width)
 
         return self.shell
@@ -13435,15 +16292,85 @@ class CobrosV12App(App):
         )
 
     def check_cash_opening_alert(self):
-        """Muestra aviso solo si la jornada/caja aún no está abierta."""
+        """Muestra aviso después del login solo si el cobrador no tiene caja abierta."""
         try:
-            if get_journey_status() != "abierta":
-                show_popup(
-                    "Apertura de caja pendiente",
-                    "Antes de cobrar, abre la caja desde Caja / Resumen.\n\n"
-                    "Esto protege el control del dinero recibido durante la jornada.",
-                    height=310,
+            if not getattr(self, "authenticated", False):
+                return
+
+            # En modo dueño único, el administrador también opera caja.
+            # En modo multiusuario normal, el admin solo ve consolidado.
+            if is_admin_role() and not MODO_DUENO_UNICO:
+                return
+
+            # Si ya abrió caja, no mostrar nada.
+            if get_journey_status() == "abierta":
+                return
+
+            content = BoxLayout(
+                orientation="vertical",
+                padding=dp(14),
+                spacing=dp(12),
+            )
+
+            msg = Label(
+                text=(
+                    "No se ha realizado apertura de caja para este cobrador.\n\n"
+                    "Antes de cobrar, prestar, renovar o registrar movimientos, abre la caja."
+                ),
+                color=WHITE,
+                font_size="13sp",
+                halign="center",
+                valign="middle",
+            )
+            msg.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+            content.add_widget(msg)
+
+            buttons = BoxLayout(
+                orientation="horizontal",
+                size_hint_y=None,
+                height=dp(48),
+                spacing=dp(10),
+            )
+
+            popup = Popup(
+                title="Apertura de caja pendiente",
+                content=content,
+                size_hint=(0.92, None),
+                height=dp(340),
+                auto_dismiss=False,
+            )
+
+            later = Button(
+                text="Más tarde",
+                background_normal="",
+                background_color=(0.55, 0.58, 0.63, 1),
+                color=WHITE,
+                bold=True,
+            )
+            open_now = Button(
+                text="Abrir caja ahora",
+                background_normal="",
+                background_color=SUCCESS,
+                color=WHITE,
+                bold=True,
+            )
+
+            later.bind(on_release=popup.dismiss)
+
+            def go_open_cash(*_):
+                popup.dismiss()
+                self.go("resumen")
+                Clock.schedule_once(
+                    lambda *_: self.sm.get_screen("resumen").confirm_open_day(),
+                    0.35,
                 )
+
+            open_now.bind(on_release=go_open_cash)
+            buttons.add_widget(later)
+            buttons.add_widget(open_now)
+            content.add_widget(buttons)
+            popup.open()
+
         except Exception as error:
             print("CASH OPENING ALERT ERROR:", error)
 
@@ -13585,7 +16512,55 @@ class CobrosV12App(App):
             print("ERROR REFRESH POST SYNC:", error)
 
 
+    def confirm_logout(self):
+        confirm_popup(
+            "Cerrar sesión",
+            "¿Deseas salir de esta cuenta y volver al acceso con usuario y PIN?",
+            self.logout,
+        )
+
+    def logout(self):
+        """Cierra la sesión activa y vuelve a la pantalla de acceso."""
+        self.authenticated = False
+        self.selected_client = None
+        self.current_user = None
+        self.current_username = ""
+        self.current_user_name = ""
+        self.current_cobrador_id = ""
+        self.current_role = ""
+
+        try:
+            refresh_memory_from_db(normalize=False)
+        except Exception as error:
+            print("LOGOUT REFRESH ERROR:", error)
+
+        if hasattr(self, "sm"):
+            self.sm.current = "login"
+
     def go(self, screen_name):
+        if screen_name != "login" and not getattr(self, "authenticated", False):
+            self.sm.current = "login"
+            return
+
+        admin_only = {
+            "configuracion",
+            "auditoria",
+            "cierres_semanales",
+            "cartera_calle",
+            "clientes_riesgo",
+            "caja_central",
+            "usuarios",
+            "asignar_cobradores",
+        }
+
+        if screen_name in admin_only and getattr(self, "current_role", "Administrador") != "Administrador":
+            show_popup(
+                "Acceso restringido",
+                "Esta sección requiere rol Administrador.",
+                height=240,
+            )
+            return
+
         self.sm.current = screen_name
 
 
