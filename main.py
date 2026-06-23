@@ -136,6 +136,49 @@ MOVIMIENTOS_CAJA = []
 # UTILIDADES
 # ============================================================
 
+def is_payment_type(value):
+    """
+    Normaliza los tipos que deben contar como recaudo/cobro.
+
+    Versiones anteriores o datos migrados pueden tener:
+    - Cuota
+    - Pago
+    - Abono
+    - Aporte
+
+    Todos estos deben sumar al cobrado del día, productividad,
+    caja y cierre.
+    """
+    tipo = str(value or "").strip().lower()
+    return tipo in ("cuota", "pago", "abono", "aporte")
+
+
+def audit_value(value, max_len=900):
+    """Convierte valores complejos a texto corto para auditoría técnica."""
+    try:
+        if isinstance(value, (dict, list, tuple)):
+            raw = json.dumps(value, ensure_ascii=False, default=str)
+        else:
+            raw = str(value or "")
+    except Exception:
+        raw = str(value or "")
+    raw = raw.replace("\n", " ").strip()
+    return raw[:max_len]
+
+
+def compact_diff(before, after, keys):
+    """Retorna solo los cambios relevantes entre dos diccionarios."""
+    before = before or {}
+    after = after or {}
+    changes = {}
+    for key in keys:
+        old = before.get(key)
+        new = after.get(key)
+        if str(old) != str(new):
+            changes[key] = {"antes": old, "despues": new}
+    return changes
+
+
 def today_text():
     return datetime.now().strftime("%d/%m/%Y")
 
@@ -217,10 +260,7 @@ def cash_balance_before_date(date_iso=None):
     recaudos = sum(
         int(transaction.get("valor", 0))
         for transaction in TRANSACCIONES
-        if transaction.get("tipo") in (
-            "Cuota",
-            "Aporte",
-        )
+        if is_payment_type(transaction.get("tipo"))
         and record_date_iso(
             transaction.get("fecha", "")
         ) < date_iso
@@ -248,10 +288,7 @@ def daily_metrics(date_iso=None):
     payments = [
         transaction
         for transaction in transactions
-        if transaction.get("tipo") in (
-            "Cuota",
-            "Aporte",
-        )
+        if is_payment_type(transaction.get("tipo"))
     ]
 
     no_payments = [
@@ -353,7 +390,7 @@ def productivity_metrics(date_iso=None):
 
     paid_records = [
         tx for tx in transactions
-        if str(tx.get("tipo", "") or "") in ("Cuota", "Aporte")
+        if is_payment_type(tx.get("tipo"))
         and safe_int(tx.get("valor", 0)) > 0
     ]
     no_payment_records = [
@@ -653,7 +690,7 @@ def weekly_metrics(date_iso=None):
 
     payments = [
         transaction for transaction in transactions
-        if transaction.get("tipo") in ("Cuota", "Aporte")
+        if is_payment_type(transaction.get("tipo"))
     ]
     no_payments = [
         transaction for transaction in transactions
@@ -1081,7 +1118,7 @@ def latest_payment_today_for_client(cliente):
 
     for tx in TRANSACCIONES:
         tipo = str(tx.get("tipo", "") or "")
-        if tipo not in ("Cuota", "Aporte"):
+        if not is_payment_type(tipo):
             continue
 
         if record_date_iso(tx.get("fecha", "")) != today:
@@ -2596,6 +2633,45 @@ def normalize_clients_with_latest_transactions():
         print("NORMALIZE CLIENTS ERROR:", error)
 
 
+def repair_runtime_integrity():
+    """
+    Reparaciones ligeras para mantener coherencia entre pantallas.
+
+    No borra datos. Solo normaliza campos críticos locales:
+    - transacciones sin cobrador_id,
+    - movimientos sin cobrador_id,
+    - auditoría sin cobrador_id,
+    - tipos de cobro reconocibles.
+    """
+    try:
+        owner_id = active_cobrador_id() or COBRADOR_ID
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            UPDATE transacciones
+            SET cobrador_id = ?
+            WHERE cobrador_id IS NULL OR cobrador_id = ''
+        """, (owner_id,))
+
+        cursor.execute("""
+            UPDATE movimientos_caja
+            SET cobrador_id = ?
+            WHERE cobrador_id IS NULL OR cobrador_id = ''
+        """, (owner_id,))
+
+        cursor.execute("""
+            UPDATE auditoria_acciones
+            SET cobrador_id = ?
+            WHERE cobrador_id IS NULL OR cobrador_id = ''
+        """, (owner_id,))
+
+        conn.commit()
+        conn.close()
+    except Exception as error:
+        print("RUNTIME INTEGRITY ERROR:", error)
+
+
 def refresh_memory_from_db(
     *,
     clients=True,
@@ -2609,6 +2685,7 @@ def refresh_memory_from_db(
     La normalización global es costosa, por eso solo se ejecuta al iniciar
     la app o después de una sincronización completa con Supabase.
     """
+    repair_runtime_integrity()
     update_due_statuses()
 
     if clients:
@@ -2722,7 +2799,16 @@ def insert_client_db(cliente):
 
 def update_client_db(cliente):
     conn = get_connection()
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
+
+    previous_client = None
+    try:
+        cursor.execute("SELECT * FROM clientes WHERE id = ?", (int(cliente.get("id", 0)),))
+        previous_row = cursor.fetchone()
+        previous_client = dict(previous_row) if previous_row else None
+    except Exception:
+        previous_client = None
 
     cursor.execute("""
         UPDATE clientes
@@ -2773,6 +2859,24 @@ def update_client_db(cliente):
 
     conn.commit()
     conn.close()
+
+    cambios = compact_diff(
+        previous_client,
+        cliente,
+        [
+            "nombre", "telefono", "direccion", "barrio", "ruta",
+            "saldo", "pagadas", "pendientes", "estado", "ultimo_tipo",
+            "proximo_cobro", "ultima_fecha_pago", "aporte_acumulado",
+            "cobrador_id",
+        ],
+    )
+    if cambios:
+        insert_audit_log(
+            "Cliente actualizado",
+            cliente,
+            "Cambio de datos/saldo/estado",
+            cambios,
+        )
 
 
 def mark_deleted_local(entidad, entidad_id):
@@ -2973,7 +3077,17 @@ def reset_client_status_db(cliente_id):
 
 
 def insert_audit_log(accion, cliente=None, motivo="", detalle=""):
-    """Registra acciones sensibles para control interno y trazabilidad."""
+    """
+    Registra acciones sensibles y técnicas para control interno.
+
+    Este registro sirve para que el ingeniero/administrador sepa:
+    - qué acción se ejecutó,
+    - sobre qué cliente o módulo,
+    - quién la hizo,
+    - cuándo ocurrió,
+    - qué valores cambiaron,
+    - y si está pendiente de sincronización.
+    """
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -2991,24 +3105,47 @@ def insert_audit_log(accion, cliente=None, motivo="", detalle=""):
             )
         """)
 
+        for name, definition in [
+            ("uuid", "TEXT NOT NULL DEFAULT ''"),
+            ("sync_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("last_sync_at", "TEXT"),
+            ("sync_error", "TEXT"),
+            ("cobrador_id", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            ensure_column(cursor, "auditoria_acciones", name, definition)
+
         cliente_id = None
         cliente_nombre = ""
         if cliente:
-            cliente_id = cliente.get("id")
-            cliente_nombre = cliente.get("nombre", "")
+            try:
+                cliente_id = cliente.get("id")
+                cliente_nombre = cliente.get("nombre", "") or cliente.get("cliente", "")
+            except Exception:
+                cliente_id = None
+                cliente_nombre = ""
+
+        owner_id = active_cobrador_id() or cash_owner_id() or COBRADOR_ID
+        try:
+            usuario = active_cobrador_name() or cobrador_nombre()
+        except Exception:
+            usuario = cobrador_nombre()
 
         cursor.execute("""
-            INSERT INTO auditoria_acciones
-            (fecha, accion, cliente_id, cliente, motivo, detalle, cobrador, synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            INSERT INTO auditoria_acciones (
+                uuid, fecha, accion, cliente_id, cliente, motivo, detalle,
+                cobrador, synced, sync_status, last_sync_at, sync_error, cobrador_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', '', '', ?)
         """, (
+            str(uuid.uuid4()),
             now_text(),
-            str(accion),
+            audit_value(accion, 180),
             cliente_id,
-            cliente_nombre,
-            str(motivo or "").strip(),
-            str(detalle or "").strip(),
-            cobrador_nombre(),
+            audit_value(cliente_nombre, 180),
+            audit_value(motivo, 320),
+            audit_value(detalle, 1400),
+            audit_value(usuario, 180),
+            str(owner_id or ""),
         ))
         conn.commit()
         conn.close()
@@ -3035,7 +3172,8 @@ def load_audit_logs(limit=100):
             )
         """)
         cursor.execute("""
-            SELECT id, fecha, accion, cliente_id, cliente, motivo, detalle, cobrador
+            SELECT id, fecha, accion, cliente_id, cliente, motivo, detalle, cobrador,
+                   cobrador_id, sync_status, last_sync_at, sync_error
             FROM auditoria_acciones
             ORDER BY id DESC
             LIMIT ?
@@ -3117,9 +3255,9 @@ def insert_transaction_db(transaccion):
             cliente_id, cliente, tipo, valor, metodo, fecha,
             numero_cuotas, saldo_anterior, saldo_nuevo,
             cuotas_pagadas_total, cuotas_pendientes_total,
-            observacion, synced
+            observacion, synced, cobrador_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         transaccion.get("cliente_id"),
         transaccion.get("cliente", ""),
@@ -3134,6 +3272,7 @@ def insert_transaction_db(transaccion):
         int(transaccion.get("cuotas_pendientes_total", 0)),
         transaccion.get("observacion", ""),
         int(transaccion.get("synced", 0)),
+        transaccion.get("cobrador_id") or active_cobrador_id() or COBRADOR_ID,
     ))
 
     new_id = cursor.lastrowid
@@ -3146,6 +3285,23 @@ def insert_transaction_db(transaccion):
     """, (str(uuid.uuid4()), active_cobrador_id() or COBRADOR_ID, new_id))
     conn.commit()
     conn.close()
+
+    insert_audit_log(
+        "Transacción registrada",
+        {"id": transaccion.get("cliente_id"), "nombre": transaccion.get("cliente", "")},
+        transaccion.get("tipo", ""),
+        {
+            "tx_id": new_id,
+            "valor": int(transaccion.get("valor", 0)),
+            "fecha": transaccion.get("fecha", now_text()),
+            "saldo_anterior": int(transaccion.get("saldo_anterior", 0)),
+            "saldo_nuevo": int(transaccion.get("saldo_nuevo", 0)),
+            "cuotas_pagadas_total": int(transaccion.get("cuotas_pagadas_total", 0)),
+            "cuotas_pendientes_total": int(transaccion.get("cuotas_pendientes_total", 0)),
+            "cobrador_id": transaccion.get("cobrador_id") or active_cobrador_id() or COBRADOR_ID,
+            "cuenta_como_recaudo": is_payment_type(transaccion.get("tipo", "")),
+        },
+    )
     return new_id
 
 
@@ -3180,6 +3336,20 @@ def insert_movement_db(movimiento):
 
     conn.commit()
     conn.close()
+
+    insert_audit_log(
+        "Movimiento de caja registrado",
+        None,
+        movimiento.get("tipo", ""),
+        {
+            "movimiento_id": new_id,
+            "concepto": movimiento.get("concepto", ""),
+            "valor": int(movimiento.get("valor", 0)),
+            "fecha": movimiento.get("fecha", today_text()),
+            "cobrador_id": owner_id,
+            "observaciones": movimiento.get("observaciones", ""),
+        },
+    )
     return new_id
 
 
@@ -3301,7 +3471,7 @@ def cash_summary_by_collector(date_iso=None):
     for row in cursor.fetchall():
         r = dict(row)
         owner = ensure_owner(r.get("cobrador_id") or COBRADOR_ID)
-        if r.get("tipo") in ("Cuota", "Aporte"):
+        if is_payment_type(r.get("tipo")):
             owner["recaudo"] += safe_int(r.get("valor", 0))
             owner["pagos"] += 1
         elif r.get("tipo") == "No Pago":
@@ -4096,7 +4266,7 @@ def collector_summary_data():
             for t in TRANSACCIONES
             if str(t.get("fecha", ""))[:10] == today_iso
             and str(t.get("cobrador_id") or cid).strip() == cid
-            and t.get("tipo") in ("Cuota", "Aporte")
+            and is_payment_type(t.get("tipo"))
         )
         summary.append({
             "user": user,
@@ -4218,7 +4388,7 @@ def current_cash_balance():
 
         ingresos = sum(safe_int(m.get("valor", 0)) for m in movements if m.get("tipo") == "Ingreso")
         egresos = sum(safe_int(m.get("valor", 0)) for m in movements if m.get("tipo") == "Egreso")
-        recaudos = sum(safe_int(t.get("valor", 0)) for t in transactions if t.get("tipo") in ("Cuota", "Aporte"))
+        recaudos = sum(safe_int(t.get("valor", 0)) for t in transactions if is_payment_type(t.get("tipo")))
 
         return opening_cash + ingresos + recaudos - egresos
     except Exception as error:
@@ -4575,9 +4745,9 @@ def pull_transactions_from_cloud():
                 numero_cuotas, saldo_anterior, saldo_nuevo,
                 cuotas_pagadas_total, cuotas_pendientes_total,
                 observacion, synced, sync_status, last_sync_at, sync_error,
-                is_deleted, deleted_at
+                is_deleted, deleted_at, cobrador_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'synced', ?, '', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'synced', ?, '', ?, ?, ?)
         """, (
             tx_id,
             r.get("uuid") or str(uuid.uuid4()),
@@ -4596,6 +4766,7 @@ def pull_transactions_from_cloud():
             r.get("last_sync_at") or now_text(),
             int(r.get("is_deleted") or 0),
             r.get("deleted_at", "") or "",
+            str(r.get("cobrador_id") or active_cobrador_id() or COBRADOR_ID),
         ))
 
     active_filter = active_cobrador_id()
@@ -4924,9 +5095,10 @@ def pull_audit_from_cloud():
         cursor.execute("""
             INSERT OR REPLACE INTO auditoria_acciones (
                 id, uuid, fecha, accion, cliente_id, cliente,
-                motivo, detalle, cobrador, synced, sync_status, last_sync_at, sync_error
+                motivo, detalle, cobrador, synced, sync_status, last_sync_at, sync_error,
+                cobrador_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'synced', ?, '')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'synced', ?, '', ?)
         """, (
             int(r.get("id")),
             r.get("uuid") or str(uuid.uuid4()),
@@ -4938,6 +5110,7 @@ def pull_audit_from_cloud():
             r.get("detalle", ""),
             r.get("cobrador", ""),
             r.get("last_sync_at") or now_text(),
+            str(r.get("cobrador_id") or active_cobrador_id() or COBRADOR_ID),
         ))
         imported += 1
 
@@ -5182,7 +5355,8 @@ def sync_transactions_to_cloud():
         SELECT id, uuid, cliente_id, cliente, tipo, valor, metodo, fecha,
                numero_cuotas, saldo_anterior, saldo_nuevo,
                cuotas_pagadas_total, cuotas_pendientes_total, observacion,
-               sync_status, last_sync_at, sync_error, is_deleted, deleted_at
+               sync_status, last_sync_at, sync_error, is_deleted, deleted_at,
+               cobrador_id
         FROM transacciones
         WHERE synced = 0
     """)
@@ -5346,7 +5520,7 @@ def sync_audit_to_cloud():
         return True, "Sin auditoría pendiente"
 
     for row in rows:
-        row["cobrador_id"] = COBRADOR_ID
+        row["cobrador_id"] = row.get("cobrador_id") or active_cobrador_id() or COBRADOR_ID
         row["uuid"] = row.get("uuid") or str(uuid.uuid4())
         row["sync_status"] = "pending"
 
@@ -5458,10 +5632,25 @@ def sync_all_to_cloud(silent=True):
 
         pull_result = pull_all_from_cloud()
 
-        refresh_memory_from_db()
+        # Recalcular memoria sin normalización pesada para no congelar la interfaz.
+        refresh_memory_from_db(normalize=False)
 
         all_ok = all(item[0] for item in push_results) and pull_result[0]
         message = " | ".join(item[1] for item in push_results + [pull_result])
+
+        # No registrar auditoría en cada sincronización automática porque crea
+        # registros pendientes nuevos y puede hacer lenta la app. Solo auditar
+        # sincronizaciones manuales o explícitas.
+        if not silent:
+            insert_audit_log(
+                "Sincronización ejecutada",
+                None,
+                "Manual",
+                {
+                    "ok": all_ok,
+                    "resultado": message,
+                },
+            )
 
         return all_ok, message
     except ssl.SSLCertVerificationError as error:
@@ -7831,19 +8020,54 @@ class InicioDashboardScreen(Screen):
         box.add_widget(self.make_label(value, color, True, "14sp", dp(28), halign="center"))
         return box
 
-    def action_button(self, text_value, screen, color):
+    def go_fast(self, screen_name):
+        """
+        Navegación con respuesta visual inmediata.
+
+        Se programa para el siguiente ciclo de Kivy, evitando que el botón
+        parezca congelado cuando la pantalla destino tiene que reconstruir
+        tablas o listas.
+        """
+        Clock.schedule_once(lambda *_: self.app_ref.go(screen_name), 0)
+
+    def action_button(self, text_value, screen, color, subtitle="", icon_text=""):
+        btn_text = text_value if not icon_text else f"{icon_text}  {text_value}"
         btn = Button(
-            text=text_value,
+            text=btn_text,
             background_normal="",
             background_color=color,
             color=WHITE if color != GOLD else DARK,
             bold=True,
-            font_size="12sp",
+            font_size="11.5sp",
             size_hint_y=None,
-            height=dp(48),
+            height=dp(58),
+            halign="center",
+            valign="middle",
         )
-        btn.bind(on_release=lambda *_: self.app_ref.go(screen))
+        btn.bind(size=lambda instance, value: setattr(instance, "text_size", value))
+        btn.bind(on_release=lambda *_: self.go_fast(screen))
         return btn
+
+    def section_label(self, text_value):
+        return self.make_label(
+            text_value.upper(),
+            MUTED,
+            True,
+            "10sp",
+            dp(20),
+            halign="left",
+        )
+
+    def action_row(self, *buttons):
+        row = BoxLayout(
+            orientation="horizontal",
+            spacing=dp(8),
+            size_hint_y=None,
+            height=dp(60),
+        )
+        for btn in buttons:
+            row.add_widget(btn)
+        return row
 
     def logout_button(self):
         btn = Button(
@@ -7854,9 +8078,9 @@ class InicioDashboardScreen(Screen):
             bold=True,
             font_size="12sp",
             size_hint_y=None,
-            height=dp(48),
+            height=dp(54),
         )
-        btn.bind(on_release=lambda *_: self.app_ref.confirm_logout())
+        btn.bind(on_release=lambda *_: Clock.schedule_once(lambda __: self.app_ref.confirm_logout(), 0))
         return btn
 
     def build(self):
@@ -7937,47 +8161,59 @@ class InicioDashboardScreen(Screen):
         actions = RoundedBox(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(394),
+            height=dp(566) if is_admin_role() else dp(420),
             padding=[dp(14), dp(12), dp(14), dp(12)],
-            spacing=dp(10),
+            spacing=dp(8),
         )
         actions.bg_color = (0.98, 0.99, 1, 1)
-        actions.add_widget(self.make_label("Acciones", DARK, True, "14sp", dp(26)))
 
-        row_a = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50))
-        row_a.add_widget(self.action_button("Iniciar ruta", "ruta_dia", BLUE_DARK))
-        row_a.add_widget(self.action_button("Cobrar cliente", "clientes", BLUE))
-        actions.add_widget(row_a)
+        actions_header = BoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(34),
+            spacing=dp(8),
+        )
+        actions_title = self.make_label("Acciones rápidas", DARK, True, "15sp", dp(30))
+        actions_hint = self.make_label("Toca una opción para continuar", MUTED, False, "9.5sp", dp(30), halign="right")
+        actions_header.add_widget(actions_title)
+        actions_header.add_widget(actions_hint)
+        actions.add_widget(actions_header)
 
-        row_b = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50))
-        row_b.add_widget(self.action_button("Caja", "resumen", GOLD))
-        row_b.add_widget(self.action_button("Cierre", "cierres_semanales", (0.36, 0.40, 0.48, 1)))
-        actions.add_widget(row_b)
+        # Operación principal
+        actions.add_widget(self.section_label("Operación diaria"))
+        actions.add_widget(self.action_row(
+            self.action_button("Ruta", "ruta_dia", BLUE_DARK, icon_text="→"),
+            self.action_button("Cobrar", "clientes", BLUE, icon_text="$"),
+        ))
+        actions.add_widget(self.action_row(
+            self.action_button("Nuevo crédito", "nuevo_cliente", SUCCESS, icon_text="+"),
+            self.action_button("Caja", "resumen", GOLD, icon_text="□"),
+        ))
 
-        row_c = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50))
-        row_c.add_widget(self.action_button("Riesgo", "clientes_riesgo", DANGER))
-        row_c.add_widget(self.action_button("Pagaron hoy", "clientes_pagaron_hoy", SUCCESS))
-        actions.add_widget(row_c)
-
-        row_d = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50))
-        row_d.add_widget(self.action_button("Configuración", "configuracion", (0.36, 0.40, 0.48, 1)))
-        row_d.add_widget(self.action_button("Auditoría", "auditoria", BLUE_DARK))
-        actions.add_widget(row_d)
+        # Control
+        actions.add_widget(self.section_label("Control y seguimiento"))
+        actions.add_widget(self.action_row(
+            self.action_button("Cierre caja", "cierres_semanales", (0.36, 0.40, 0.48, 1), icon_text="✓"),
+            self.action_button("Pagaron hoy", "clientes_pagaron_hoy", SUCCESS, icon_text="●"),
+        ))
+        actions.add_widget(self.action_row(
+            self.action_button("Clientes riesgo", "clientes_riesgo", DANGER, icon_text="!"),
+            self.action_button("Auditoría", "auditoria", BLUE_DARK, icon_text="L"),
+        ))
 
         if is_admin_role():
-            row_admin_cash = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50))
-            row_admin_cash.add_widget(self.action_button("Caja Central", "caja_central", GOLD))
-            row_admin_cash.add_widget(self.action_button("Resumen Caja", "resumen", BLUE_DARK))
-            actions.add_widget(row_admin_cash)
+            actions.add_widget(self.section_label("Administración"))
+            actions.add_widget(self.action_row(
+                self.action_button("Caja Central", "caja_central", GOLD, icon_text="$"),
+                self.action_button("Configuración", "configuracion", (0.36, 0.40, 0.48, 1), icon_text="⚙"),
+            ))
+            actions.add_widget(self.action_row(
+                self.action_button("Asignar clientes", "asignar_cobradores", BLUE, icon_text="A"),
+                self.action_button("Usuarios", "usuarios", (0.36, 0.40, 0.48, 1), icon_text="U"),
+            ))
 
-        row_e = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50))
-        row_e.add_widget(self.action_button("Asignar clientes", "asignar_cobradores", BLUE))
-        row_e.add_widget(self.action_button("Usuarios", "usuarios", (0.36, 0.40, 0.48, 1)))
-        actions.add_widget(row_e)
-
-        row_f = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(50))
-        row_f.add_widget(self.logout_button())
-        actions.add_widget(row_f)
+        actions.add_widget(self.section_label("Sesión"))
+        actions.add_widget(self.logout_button())
 
         content.add_widget(actions)
 
@@ -10179,7 +10415,7 @@ class CuotaScreen(Screen):
         tipo = self.selected_tipo()
         pago = to_int(self.valor_pagar.text, 0)
 
-        if tipo in ("Cuota", "Aporte") and pago <= 0:
+        if is_payment_type(tipo) and pago <= 0:
             show_popup("Valor inválido", "Ingrese un valor mayor que cero.")
             return
 
@@ -10853,7 +11089,7 @@ class CuotaScreen(Screen):
                     "La cuota continúa pendiente."
                 )
 
-        if tipo in ("Cuota", "Aporte"):
+        if is_payment_type(tipo):
             self.cliente["ultima_fecha_pago"] = iso_today()
 
             if (
@@ -10936,7 +11172,7 @@ class CuotaScreen(Screen):
 
         App.get_running_app().request_auto_sync()
 
-        if tipo in ("Aporte", "Cuota"):
+        if is_payment_type(tipo):
             self.show_payment_success_actions(receipt)
 
         elif tipo in ("No Pago", "Siguiente Día"):
@@ -10955,7 +11191,7 @@ class CuotaScreen(Screen):
                 "La novedad fue guardada correctamente.",
             )
 
-        if tipo not in ("Cuota", "Aporte"):
+        if not is_payment_type(tipo):
             Clock.schedule_once(
                 lambda *_: self.app_ref.go("clientes"),
                 0.9,
@@ -16478,7 +16714,7 @@ class CobrosV12App(App):
         donde el usuario pueda estar escribiendo.
         """
         try:
-            refresh_memory_from_db(normalize=True)
+            refresh_memory_from_db(normalize=False)
 
             if not hasattr(self, "sm"):
                 return
@@ -16538,6 +16774,15 @@ class CobrosV12App(App):
             self.sm.current = "login"
 
     def go(self, screen_name):
+        if getattr(self, "_navigating_to", "") == screen_name:
+            return
+        self._navigating_to = screen_name
+
+        def clear_nav_flag(*_):
+            self._navigating_to = ""
+
+        Clock.schedule_once(clear_nav_flag, 0.35)
+
         if screen_name != "login" and not getattr(self, "authenticated", False):
             self.sm.current = "login"
             return
